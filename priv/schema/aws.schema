@@ -1,0 +1,152 @@
+% ===============================
+% AWS section
+% ===============================
+
+%% @doc Whether or not to prefer EC2 IMDSv2 when querying instance metadata service.
+%% The setting defaults to true. When true, instance metadata will first be attempted using EC2 IMDSv2
+%% and will fall back to EC2 IMDSv1 upon failure.
+%% When false, EC2 IMDSv1 will be used first and no attempt will be made to use EC2 IMDSv2.
+%% See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html.
+
+%% NOTE:
+%% This duplicates what is in the rabbitmq_aws project
+%%
+{mapping, "aws.prefer_imdsv2", "rabbitmq_aws.aws_prefer_imdsv2",
+    [{datatype, {enum, [true, false]}}]}.
+
+%% @doc IAM role ARN to assume before fetching resources from S3
+{mapping, "aws.arns.assume_role_arn", "aws.arn_config.assume_role_arn",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% rabbit
+%%
+{mapping, "aws.arns.ssl_options.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.ssl_options.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.ssl_options.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% rabbitmq_management plugin
+%%
+{mapping, "aws.arns.management.ssl.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.management.ssl.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.management.ssl.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.management.oauth_client_secret", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% rabbitmq_auth_backend_http
+%%
+{mapping, "aws.arns.auth_http.ssl_options.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_http.ssl_options.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_http.ssl_options.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% rabbitmq_auth_backend_ldap
+%%
+{mapping, "aws.arns.auth_ldap.ssl_options.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_ldap.ssl_options.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_ldap.ssl_options.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_ldap.dn_lookup_bind.password", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_ldap.other_bind.password", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% rabbitmq_auth_backend_oauth2
+%%
+%% @doc Fetch cacertfile from Amazon S3 and pass to auth_oauth2.https.cacertfile
+{mapping, "aws.arns.auth_oauth2.https.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.auth_oauth2.oauth_providers.$name.https.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% misc
+%%
+%% @doc Custom headers for AWS STS calls. Header name should be the exact case-sensitive headername
+%% as defined by aws docs such as aws.sts.custom_headers.X-Amz-Algorithm
+%%
+{mapping, "aws.sts.custom_headers.$header", "aws.sts.custom_headers",
+    [{datatype, string}]}.
+
+{translation, "aws.sts.custom_headers",
+ fun(Conf) ->
+     Settings = cuttlefish_variable:filter_by_prefix("aws.sts.custom_headers", Conf),
+     maps:from_list([{lists:last(Key), Value} || {Key, Value} <- Settings])
+ end}.
+
+{translation, "aws.arn_config.arns",
+fun(Conf) ->
+    OAuth2Map = maps:from_list(
+        [{list_to_binary(Idx), list_to_binary(Arn)} ||
+            {["aws","arns","auth_oauth2","oauth_providers", Idx, "https", "cacertfile"], Arn}
+                <- cuttlefish_variable:filter_by_prefix("aws.arns.auth_oauth2.oauth_providers", Conf)]),
+
+    F = fun({"aws.arns.auth_oauth2.oauth_providers.https.cacertfile"=Key,
+            aws_arn_config_oauth2=Mod,
+            providers_https_cacertfile=ConfigKey}, Acc) ->
+                if
+                    map_size(OAuth2Map) > 0 ->
+                        % Note: Key is used twice because, in the list,
+                        % it is an argument to Mod:run
+                        [{Mod, undefined, Key, [Key, ConfigKey, OAuth2Map]} | Acc];
+                    true ->
+                        Acc
+                end;
+           ({Key, Mod, ConfigKey}, Acc) ->
+                case cuttlefish:conf_get(Key, Conf, undefined) of
+                    undefined ->
+                        Acc;
+                    Arn ->
+                        [{Mod, Arn, Key, [Key, ConfigKey]} | Acc]
+                end;
+           ({Key, Mod, ConfigKey, ConfigSubKey}, Acc) ->
+                case cuttlefish:conf_get(Key, Conf, undefined) of
+                    undefined ->
+                        Acc;
+                    Arn ->
+                        [{Mod, Arn, Key, [Key, ConfigKey, ConfigSubKey]} | Acc]
+                end
+        end,
+    lists:foldl(F, [], [
+        %% rabbit
+        {"aws.arns.ssl_options.cacertfile", aws_arn_config_rabbit, ssl_options, cacertfile},
+        {"aws.arns.ssl_options.certfile",   aws_arn_config_rabbit, ssl_options, certfile},
+        {"aws.arns.ssl_options.keyfile",    aws_arn_config_rabbit, ssl_options, keyfile},
+
+        %% rabbitmq_management
+        {"aws.arns.management.ssl.cacertfile",          aws_arn_config_management, ssl_options, cacertfile},
+        {"aws.arns.management.ssl.certfile",            aws_arn_config_management, ssl_options, certfile},
+        {"aws.arns.management.ssl.keyfile",             aws_arn_config_management, ssl_options, keyfile},
+        {"aws.arns.management.ssl.oauth_client_secret", aws_arn_config_management, oauth_client_secret},
+
+        %% rabbitmq_auth_backend_http
+        {"aws.arns.auth_http.ssl_options.cacertfile", aws_arn_config_http, ssl_options, cacertfile},
+        {"aws.arns.auth_http.ssl_options.certfile",   aws_arn_config_http, ssl_options, certfile},
+        {"aws.arns.auth_http.ssl_options.keyfile",    aws_arn_config_http, ssl_options, keyfile},
+
+        %% rabbitmq_auth_backend_ldap
+        {"aws.arns.auth_ldap.ssl_options.cacertfile",  aws_arn_config_ldap, ssl_options, cacertfile},
+        {"aws.arns.auth_ldap.ssl_options.keyfile",     aws_arn_config_ldap, ssl_options, keyfile},
+        {"aws.arns.auth_ldap.ssl_options.certfile",    aws_arn_config_ldap, ssl_options, certfile},
+        {"aws.arns.auth_ldap.dn_lookup_bind.password", aws_arn_config_ldap, dn_lookup_bind, password},
+        {"aws.arns.auth_ldap.other_bind.password",     aws_arn_config_ldap, other_bind, password},
+
+        %% rabbitmq_auth_backend_oauth2
+        {"aws.arns.auth_oauth2.https.cacertfile", aws_arn_config_oauth2, https, cacertfile},
+        {"aws.arns.auth_oauth2.oauth_providers.https.cacertfile", aws_arn_config_oauth2, providers_https_cacertfile}
+    ])
+end}.
