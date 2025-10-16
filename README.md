@@ -7,6 +7,15 @@ While this project lives in the `amazon-mq` GitHub organization, it's designed f
 welcome contributions that help the community run RabbitMQ on AWS. The best features are ones that solve problems many users face when
 deploying RabbitMQ on AWS infrastructure.
 
+## Code Formatting
+
+This project uses [erlfmt](https://github.com/WhatsApp/erlfmt) for consistent Erlang code formatting. All code must pass `erlfmt -c` checks before merging. PRs that fail erlfmt checks will not be merged.
+
+To format your code before submitting:
+```bash
+erlfmt -w .
+```
+
 ## Security
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
