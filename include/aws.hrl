@@ -1,3 +1,6 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+
 -include_lib("kernel/include/logger.hrl").
 
 -define(AWS_LOG_DEBUG(Arg),
