@@ -16,9 +16,25 @@ To format your code before submitting:
 erlfmt -w .
 ```
 
-## Security
+## Contributing
 
 See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
+
+## Build
+
+```
+git clone https://github.com/rabbitmq/rabbitmq-server.git
+cd rabbitmq-server
+git clone https://github.com/amazon-mq/rabbitmq-aws.git deps/aws
+make -C deps/aws
+```
+
+## Run
+
+```
+cd path/to/rabbitmq-server
+make PLUGINS='rabbitmq_management aws' run-broker
+```
 
 ## License
 

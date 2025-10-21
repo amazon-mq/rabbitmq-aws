@@ -1,0 +1,71 @@
+_*
+.eunit
+*.o
+log
+cobertura.xml
+test/*xml
+
+# Editor/OS temporary and unwanted files.
+*~
+\#*
+.#*
+.sw?
+.*.sw?
+*.orig
+*.tmp
+.idea/
+.tool-versions
+.vscode/
+.DS_Store
+
+# Erlang.mk temporary files and outputs.
+*.plt
+*.d
+.erlang.mk/
+cover/
+docs/*.html
+ebin/
+logs/
+**/test/*.beam
+**/test/ct.cover.spec
+ct.set-*.spec
+
+elvis
+
+# Rebar3/Elixir temporary files and outputs.
+.rebar3/
+_build/
+_checkouts/
+rebar3.crashdump
+
+# Automatically generated rebar.config files.
+rebar.config
+!/deps/amqp10_common/rebar.config
+!/rebar.config
+
+# Erlang/OTP unwanted files.
+.erlang.cookie
+erl_crash.dump
+MnesiaCore.*
+Mnesia.rmq-ct-*
+
+# RabbitMQ Makefiles temporary files and outputs.
+*.lock
+escript/
+plugins/
+sbin/
+
+# Trace tools output.
+*-ttb
+*.ti
+*.lz4*
+traces*
+callgrind.out*
+callgraph.dot*
+
+# Unknown. If you know in which category this belongs to,
+# please move it there. Thank you.
+.envrc
+.exrc
+.ignore
+/genhtml/
