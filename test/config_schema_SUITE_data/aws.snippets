@@ -1,0 +1,71 @@
+[
+    {aws_arn_config_arns_ssl_options_cacertfile,
+        "aws.arns.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_rabbit,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.ssl_options.cacertfile",
+                    ["aws.arns.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_oauth2_cacertfile,
+        "aws.arns.auth_oauth2.https.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_oauth2,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.auth_oauth2.https.cacertfile",
+                    ["aws.arns.auth_oauth2.https.cacertfile", https, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_ldap_cacertfile,
+        "aws.arns.auth_ldap.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_ldap,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.auth_ldap.ssl_options.cacertfile",
+                    ["aws.arns.auth_ldap.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_all_cacertfile_options,
+        "aws.arns.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem
+         aws.arns.auth_oauth2.https.cacertfile = arn:aws:s3:::private-ca-43/cacertfile.pem
+         aws.arns.auth_ldap.ssl_options.cacertfile = arn:aws:s3:::private-ca-44/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_rabbit,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.ssl_options.cacertfile",
+                    ["aws.arns.ssl_options.cacertfile", ssl_options, cacertfile]},
+                    {aws_arn_config_oauth2,
+                    "arn:aws:s3:::private-ca-43/cacertfile.pem",
+                    "aws.arns.auth_oauth2.https.cacertfile",
+                    ["aws.arns.auth_oauth2.https.cacertfile", https, cacertfile]},
+                    {aws_arn_config_ldap,
+                    "arn:aws:s3:::private-ca-44/cacertfile.pem",
+                    "aws.arns.auth_ldap.ssl_options.cacertfile",
+                    ["aws.arns.auth_ldap.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]}
+].
