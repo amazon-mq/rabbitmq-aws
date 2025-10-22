@@ -1,5 +1,7 @@
 ## RabbitMQ AWS infrastructure Plugin
 
+[![CI](https://github.com/amazon-mq/rabbitmq-aws/actions/workflows/build-test.yaml/badge.svg)](https://github.com/amazon-mq/rabbitmq-aws/actions/workflows/build-test.yaml)
+
 This plugin is specifically for RabbitMQ features that integrate with AWS infrastructure services. If a feature doesn't require AWS services,
 it belongs in [rabbitmq-server](https://github.com/rabbitmq/rabbitmq-server) or other appropriate repositories instead.
 
