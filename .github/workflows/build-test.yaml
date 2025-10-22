@@ -1,0 +1,43 @@
+name: CI
+
+on: [push, pull_request]
+
+permissions:
+  contents: read
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: '27'
+          elixir-version: '1.18'
+      - id: latest-rmq-tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "tag=$(gh release list --repo rabbitmq/rabbitmq-server --limit 1 --json tagName --jq '.[].tagName')" >> $GITHUB_OUTPUT
+      - id: cache-rabbitmq-server
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server
+          key: ${{ runner.os }}-v0-rabbitmq-server-${{ steps.latest-rmq-tag.outputs.tag }}
+      - id: clone-rabbitmq-server
+        if: steps.cache-rabbitmq-server.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch ${{ steps.latest-rmq-tag.outputs.tag }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
+      - id: build-rabbitmq-server
+        if: steps.cache-rabbitmq-server.outputs.cache-hit != 'true'
+        run: |
+          make -C ${{ github.workspace }}/rabbitmq-server FULL=1 && echo 'built=true' >> $GITHUB_OUTPUT
+      - uses: actions/cache/save@v4
+        if: steps.build-rabbitmq-server.outputs.built == 'true'
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server
+          key: ${{ runner.os }}-v0-rabbitmq-server-${{ steps.latest-rmq-tag.outputs.tag }}
+      - uses: actions/checkout@v5
+        with:
+          path: rabbitmq-server/deps/aws
+      - run: |
+          make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
