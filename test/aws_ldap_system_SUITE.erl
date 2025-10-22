@@ -1,3 +1,8 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
 -module(aws_ldap_system_SUITE).
 
 -compile([export_all]).

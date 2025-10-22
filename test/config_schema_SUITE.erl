@@ -4,6 +4,8 @@
 %%
 %% Copyright (c) 2007-2025 Broadcom. All Rights Reserved. The term “Broadcom” refers to Broadcom Inc. and/or its subsidiaries. All rights reserved.
 %%
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
 
 -module(config_schema_SUITE).
 
