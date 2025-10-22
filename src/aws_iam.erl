@@ -14,7 +14,9 @@
     {no_match, make_request/2}
 ]).
 
--spec assume_role(string()) -> ok | {error, term()}.
+-spec assume_role(string() | binary()) -> ok | {error, term()}.
+assume_role(RoleArn) when is_binary(RoleArn) ->
+    assume_role(binary_to_list(RoleArn));
 assume_role(RoleArn) ->
     SessionName = "rabbitmq-aws-" ++ integer_to_list(erlang:system_time(second)),
     Body =
