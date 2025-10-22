@@ -6,7 +6,7 @@
 -include_lib("kernel/include/logger.hrl").
 
 -define(AWS_LOG_DEBUG(Arg),
-    ?LOG_DEBUG("~tp: ~tp", [?MODULE, Arg])
+    ?LOG_DEBUG(?MODULE_STRING ": ~tp", [Arg])
 ).
 
 -define(AWS_LOG_DEBUG(Fmt, Args),
