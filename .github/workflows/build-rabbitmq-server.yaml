@@ -1,7 +1,8 @@
 name: Build-RMQ
 
 on:
-  schedule:
+  - workflow_dispatch
+  - schedule:
     - cron: '0 0 * * 1' # Runs weekly on Monday 00:00 UTC
 
 permissions:
