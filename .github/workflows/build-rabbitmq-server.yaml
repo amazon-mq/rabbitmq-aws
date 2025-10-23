@@ -1,0 +1,37 @@
+name: Build-RMQ
+
+on:
+  schedule:
+    - cron: '0 0 * * 1' # Runs weekly on Monday 00:00 UTC
+
+permissions:
+  contents: read
+
+jobs:
+  build-cache-rabbitmq-server:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rmq-version: ['3.13.7', 'v4.2.x', 'main']
+        include:
+          - rmq-version: 'main'
+            otp-version: 28
+          - rmq-version: 'v4.2.x'
+            otp-version: 27
+          - rmq-version: '3.13.7'
+            otp-version: 27
+    steps:
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          elixir-version: '1.18'
+      - id: clone-rabbitmq-server
+        run: |
+          git clone --branch ${{ matrix.rmq-version }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
+      - id: build-rabbitmq-server
+        run: |
+          make -C ${{ github.workspace }}/rabbitmq-server
+      - uses: actions/cache/save@v4
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server
+          key: ${{ runner.os }}-v0-rabbitmq-server-${{ matrix.rmq-version }}
