@@ -8,34 +8,32 @@ permissions:
 jobs:
   build-test:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        rmq-version: ['3.13.7', 'v4.2.x', 'main']
+        include:
+          - rmq-version: 'main'
+            otp-version: 28
+          - rmq-version: 'v4.2.x'
+            otp-version: 27
+          - rmq-version: '3.13.7'
+            otp-version: 27
     steps:
-      - uses: erlef/setup-beam@v1
-        with:
-          otp-version: '27'
-          elixir-version: '1.18'
-      - id: latest-rmq-tag
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "tag=$(gh release list --repo rabbitmq/rabbitmq-server --limit 1 --json tagName --jq '.[].tagName')" >> $GITHUB_OUTPUT
-      - id: cache-rabbitmq-server
+      - id: restore-rabbitmq-server-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/rabbitmq-server
-          key: ${{ runner.os }}-v0-rabbitmq-server-${{ steps.latest-rmq-tag.outputs.tag }}
-      - id: clone-rabbitmq-server
-        if: steps.cache-rabbitmq-server.outputs.cache-hit != 'true'
-        run: |
-          git clone --branch ${{ steps.latest-rmq-tag.outputs.tag }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
-      - id: build-rabbitmq-server
-        if: steps.cache-rabbitmq-server.outputs.cache-hit != 'true'
-        run: |
-          make -C ${{ github.workspace }}/rabbitmq-server FULL=1 && echo 'built=true' >> $GITHUB_OUTPUT
-      - uses: actions/cache/save@v4
-        if: steps.build-rabbitmq-server.outputs.built == 'true'
+          key: ${{ runner.os }}-v0-rabbitmq-server-${{ matrix.rmq-version }}
+      - id: maybe-fail-rabbitmq-server-miss
+        if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
+        uses: actions/github-script@v8
         with:
-          path: ${{ github.workspace }}/rabbitmq-server
-          key: ${{ runner.os }}-v0-rabbitmq-server-${{ steps.latest-rmq-tag.outputs.tag }}
+          script: |
+            core.setFailed('could not restore cached rabbitmq-server build');
+      - uses: erlef/setup-beam@v1
+        with:
+          otp-version: ${{ matrix.otp-version }}
+          elixir-version: '1.18'
       - uses: actions/checkout@v5
         with:
           path: rabbitmq-server/deps/aws
