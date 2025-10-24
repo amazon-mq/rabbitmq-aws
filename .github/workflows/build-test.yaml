@@ -39,3 +39,5 @@ jobs:
           path: rabbitmq-server/deps/aws
       - run: |
           make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
+      - run: |
+          make -C ${{ github.workspace }}/rabbitmq-server/deps/aws tests

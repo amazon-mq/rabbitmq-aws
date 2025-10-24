@@ -22,7 +22,7 @@
 %% @end
 process_arns() ->
     try
-        ok = application:ensure_started(rabbitmq_aws),
+        _ = application:ensure_all_started(rabbitmq_aws),
         case process_arn_config({handle_env_arn_config, application:get_env(aws, arn_config)}) of
             {ok, {iam_role_result, assumed}} ->
                 ?AWS_LOG_INFO("success"),
