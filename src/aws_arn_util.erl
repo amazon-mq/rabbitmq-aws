@@ -8,7 +8,7 @@
 -ifdef(TEST).
 -compile(export_all).
 -else.
--export([resolve_arn/1]).
+-export([resolve_arn/1, parse_arn/1]).
 -endif.
 
 -spec resolve_arn(string()) -> {ok, binary()} | {error, term()}.
@@ -44,7 +44,7 @@ parse_arn(Arn) ->
                     resource => Resource
                 }};
             UnexpectedMatch ->
-                {error, {invalid_arn_format, UnexpectedMatch}}
+                {error, {invalid_arn_format, rabbit_data_coercion:to_utf8_binary(UnexpectedMatch)}}
         end
     catch
         Class:Reason ->
