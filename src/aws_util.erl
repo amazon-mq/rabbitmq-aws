@@ -9,4 +9,4 @@
 
 -spec reset_aws_credentials() -> ok.
 reset_aws_credentials() ->
-    ok = rabbitmq_aws:refresh_credentials().
+    ok = rabbitmq_aws:set_credentials(undefined, undefined, undefined).
