@@ -28,7 +28,7 @@ jobs:
       - uses: erlef/setup-beam@v1
         with:
           otp-version: ${{ matrix.otp-version }}
-          elixir-version: '1.18'
+          elixir-version: ${{ matrix.elixir-version }}
       - id: clone-rabbitmq-server
         run: |
           git clone --branch ${{ matrix.rmq-version }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
