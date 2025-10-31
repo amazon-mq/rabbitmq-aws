@@ -10,7 +10,7 @@ jobs:
     runs-on: ubuntu-latest
     strategy:
       matrix:
-        rmq-version: ['3.13.7', 'v4.2.x', 'main']
+        rmq-version: ['v3.13.7', 'v4.2.x', 'main']
         include:
           - rmq-version: 'main'
             otp-version: 28
