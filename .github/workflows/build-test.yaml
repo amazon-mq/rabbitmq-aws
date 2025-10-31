@@ -17,7 +17,7 @@ jobs:
           - rmq-version: 'v4.2.x'
             otp-version: 27
           - rmq-version: 'v3.13.7'
-            otp-version: 27
+            otp-version: 26
     steps:
       - id: restore-rabbitmq-server-cache
         uses: actions/cache/restore@v4

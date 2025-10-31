@@ -17,10 +17,13 @@ jobs:
         include:
           - rmq-version: 'main'
             otp-version: 28
+            elixir-version: '1.18'
           - rmq-version: 'v4.2.x'
             otp-version: 27
+            elixir-version: '1.18'
           - rmq-version: 'v3.13.7'
-            otp-version: 27
+            otp-version: 26
+            elixir-version: '1.17'
     steps:
       - uses: erlef/setup-beam@v1
         with:
