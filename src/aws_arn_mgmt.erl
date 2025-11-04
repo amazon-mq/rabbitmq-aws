@@ -46,46 +46,50 @@ accept_content(Req0, Context) ->
     {ok, Region} = rabbitmq_aws_config:region(),
     ok = rabbitmq_aws:set_region(Region),
     F = fun(_Values, BodyMap, Req1) ->
-        try
-            {ok, AssumeRoleResult} = maybe_assume_role({map, BodyMap}),
-            {ok, Results} = maybe_process_arns({map, BodyMap}),
-            Body = rabbit_json:encode(rabbit_mgmt_format:format_nulls(Results)),
-            Headers = #{<<"content-type">> => <<"application/json">>},
-            Req2 = cowboy_req:reply(200, Headers, Body, Req1),
-            ok = maybe_reset_credentials(AssumeRoleResult),
-            {stop, Req2, Context}
-        catch
-            throw:{bad_request, ErrMsg0} ->
-                rabbit_mgmt_util:bad_request(ErrMsg0, Req1, Context);
-            throw:{unprocessable_entity, ErrMsg} ->
-                aws_mgmt_util:unprocessable_entity(ErrMsg, Req1, Context);
-            Class:Reason:Stacktrace ->
-                ?AWS_LOG_ERROR("~tp", [{Class, Reason}]),
-                ?AWS_LOG_ERROR("~tp", [Stacktrace]),
-                rabbit_mgmt_util:bad_request({Class, Reason}, Req1, Context)
-        end
+        process_content(BodyMap, Req1, Context)
     end,
     rabbit_mgmt_util:with_decode([], Req0, Context, F).
 
-maybe_assume_role({map, BodyMap}) when is_map_key(assume_role_arn, BodyMap) ->
+process_content(BodyMap, Req, Context) ->
+    handle_assume_role(maybe_assume_role(BodyMap), BodyMap, Req, Context).
+
+handle_assume_role({ok, AssumeRoleResult}, BodyMap, Req0, Context) ->
+    try
+        {ok, Results} = maybe_process_arns({map, BodyMap}),
+        Body = rabbit_json:encode(rabbit_mgmt_format:format_nulls(Results)),
+        Headers = #{<<"content-type">> => <<"application/json">>},
+        Req1 = cowboy_req:reply(200, Headers, Body, Req0),
+        ok = maybe_reset_credentials(AssumeRoleResult),
+        {stop, Req1, Context}
+    catch
+        throw:{unprocessable_entity, ErrMsg} ->
+            aws_mgmt_util:unprocessable_entity(ErrMsg, Req0, Context);
+        Class:Reason:Stacktrace ->
+            ?AWS_LOG_ERROR("~tp", [{Class, Reason}]),
+            ?AWS_LOG_ERROR("~tp", [Stacktrace]),
+            rabbit_mgmt_util:bad_request({Class, Reason}, Req0, Context)
+    after
+        maybe_reset_credentials(AssumeRoleResult)
+    end;
+handle_assume_role({error, Error}, _BodyMap, Req, Context) ->
+    rabbit_mgmt_util:bad_request(Error, Req, Context).
+
+maybe_assume_role(BodyMap) when is_map(BodyMap) andalso is_map_key(assume_role_arn, BodyMap) ->
     AssumeRoleArn = maps:get(assume_role_arn, BodyMap),
     maybe_assume_role({assume_role_arn, AssumeRoleArn});
-maybe_assume_role({map, BodyMap}) when not is_map_key(assume_role_arn, BodyMap) ->
-    %% Note: not assuming role
+maybe_assume_role(BodyMap) when is_map(BodyMap) andalso not is_map_key(assume_role_arn, BodyMap) ->
     {ok, not_assumed};
 maybe_assume_role({assume_role_arn, AssumeRoleArn}) ->
     maybe_assume_role({validate_arn_result, validate_arn(AssumeRoleArn)});
 maybe_assume_role({validate_arn_result, {ok, AssumeRoleArn}}) ->
     case aws_iam:assume_role(AssumeRoleArn) of
-        {error, Error} ->
-            throw({bad_request, {assume_role_failed, Error}});
+        {error, _} = Error ->
+            Error;
         ok ->
             {ok, assumed}
     end;
-maybe_assume_role({validate_arn_result, Error}) ->
-    throw({bad_request, Error});
-maybe_assume_role(_) ->
-    throw({bad_request, "unknown error processing assume role ARN"}).
+maybe_assume_role({validate_arn_result, {error, _} = Error}) ->
+    Error.
 
 maybe_reset_credentials(assumed) ->
     aws_util:reset_aws_credentials();
