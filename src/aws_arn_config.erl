@@ -14,7 +14,6 @@
 -endif.
 
 % TODO: remove after we fix the rabbitmq_aws:api_post_request's return type
-% the current return type is type result() but what it actuall
 -dialyzer({no_match, maybe_assume_role/1}).
 
 -spec process_arns() -> ok.

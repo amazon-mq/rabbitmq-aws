@@ -8,7 +8,6 @@
 -export([fetch_secret/2]).
 
 % TODO: remove after we fix the rabbitmq_aws:api_post_request's return type
-% the current return type is type result() but what it actuall
 -dialyzer({no_match, make_request/2}).
 
 -spec fetch_secret(string(), string()) -> {ok, binary()} | {error, term()}.

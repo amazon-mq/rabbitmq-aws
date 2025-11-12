@@ -8,7 +8,6 @@
 -export([assume_role/1]).
 
 % TODO: remove after we fix the rabbitmq_aws:api_post_request's return type
-% the current return type is type result() but what it actuall
 -dialyzer([
     {no_unused, parse_assume_role_response/1},
     {no_match, make_request/2}
@@ -28,7 +27,6 @@ assume_role(RoleArn) ->
         {"content-type", "application/x-www-form-urlencoded"},
         {"accept", "application/json"}
     ],
-
 
     Headers = aws_sts:add_custom_headers(BaseHeaders),
     make_request(Body, Headers).

@@ -69,7 +69,6 @@ handle_oauth2_providers_config({ok, Map0}, Key, CaCertsDerEncoded) when is_map_k
     Config0 = maps:get(Key, Map0),
     case proplists:get_value(https, Config0) of
         undefined ->
-            % TODO: warn?
             ok;
         HttpsProplist0 ->
             HttpsProplist1 = proplists:delete(cacertfile, HttpsProplist0),
