@@ -37,4 +37,4 @@ jobs:
       - uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/rabbitmq-server
-          key: ${{ runner.os }}-rabbitmq-server-${{ matrix.rmq-version }}
+          key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
