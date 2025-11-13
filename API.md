@@ -1,7 +1,5 @@
 # `aws` plugin API
 
-Note: this documentation will be migrated to `edoc` as time allows.
-
 ## ARN validation HTTP API
 
 This plugin provides the following HTTP endpoint to validate that AWS ARNs can
