@@ -21,19 +21,19 @@ jobs:
         include:
           - rmq-version: 'main'
             otp-version: 28
-            elixir-version: '1.19'
+            elixir-version: 1.18
           - rmq-version: 'v4.2.x'
             otp-version: 27
-            elixir-version: '1.18'
+            elixir-version: 1.18
           - rmq-version: 'v3.13.7'
             otp-version: 26
-            elixir-version: '1.16'
+            elixir-version: 1.16
     steps:
       - id: restore-rabbitmq-server-cache
         uses: actions/cache/restore@v4
         with:
           path: ${{ github.workspace }}/rabbitmq-server
-          key: ${{ runner.os }}-rabbitmq-server-${{ matrix.rmq-version }}
+          key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
       - id: maybe-fail-rabbitmq-server-miss
         if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
         uses: actions/github-script@v8
