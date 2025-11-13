@@ -1,8 +1,11 @@
 name: erlfmt
 
 on:
+  push:
+    branches:
+      - main
   pull_request:
-    branches: [ main ]
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -11,20 +14,13 @@ jobs:
   format-check:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Setup Erlang
-        uses: erlef/setup-beam@v1
+      - uses: actions/checkout@v5
+      - uses: erlef/setup-beam@v1
         with:
-          otp-version: '26'
-          rebar3-version: '3.23'
-
-      - name: Install erlfmt
-        run: |
-          git clone https://github.com/WhatsApp/erlfmt.git
-          cd erlfmt
-          rebar3 as release escriptize
-          sudo cp _build/release/bin/erlfmt /usr/local/bin/
-
+          otp-version: 26
+          rebar3-version: 3.22
+      - run: |
+          git clone https://github.com/WhatsApp/erlfmt.git ${{ github.workspace }}/erlfmt
+          cd ${{ github.workspace }}/erlfmt && rebar3 as release escriptize
       - name: Run erlfmt check
-        run: erlfmt -c
+        run: ${{ github.workspace }}/erlfmt/_build/release/bin/erlfmt -c
