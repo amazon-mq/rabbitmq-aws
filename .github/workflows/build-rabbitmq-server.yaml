@@ -33,9 +33,8 @@ jobs:
         run: |
           git clone --branch ${{ matrix.rmq-version }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
       - id: build-rabbitmq-server
-        run: |
-          make -C ${{ github.workspace }}/rabbitmq-server
+        run: make -C ${{ github.workspace }}/rabbitmq-server
       - uses: actions/cache/save@v4
         with:
           path: ${{ github.workspace }}/rabbitmq-server
-          key: ${{ runner.os }}-v0-rabbitmq-server-${{ matrix.rmq-version }}
+          key: ${{ runner.os }}-rabbitmq-server-${{ matrix.rmq-version }}
