@@ -24,7 +24,7 @@ git checkout main
 git pull origin main
 git remote prune origin
 git branch -d "rabbitmq-aws-$VER"
-git tag --annotate --sign --local-user=GPGKEYID --message="rabbitmq-aws $VER" "$VER"
+git tag --annotate --sign --local-user="$GPG_KEY_ID" --message="rabbitmq-aws $VER" "$VER"
 git push --tags
 ```
 
@@ -33,9 +33,12 @@ git push --tags
 ```
 git clone --branch v4.2.0 https://github.com/rabbitmq/rabbitmq-server.git rabbitmq-server_4.2.0
 cd rabbitmq-server_4.2.0
-git clone --branch "$VER" git@github.com:amazon-mq/rabbitmq-aws.git deps/aws
+git clone --branch "$VER" https://github.com/amazon-mq/rabbitmq-aws.git deps/aws
 make
 make -C deps/aws
 make -C DIST_AS_EZS deps/aws dist
-gh release create "$VER" --verify-tag --title "$VER" --latest --generate-notes path/to/*.ez
+cd deps/aws
+gh release create "$VER" --verify-tag --title "rabbitmq-aws $VER" --latest --generate-notes "./plugins/aws-$VER.ez"
 ```
+
+* (Optional) Update generated release on GitHub to add GitHub milestone
