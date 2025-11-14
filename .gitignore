@@ -4,6 +4,7 @@ _*
 log
 cobertura.xml
 test/*xml
+*.bak
 
 # Editor/OS temporary and unwanted files.
 *~
