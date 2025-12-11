@@ -25,7 +25,7 @@ jobs:
             otp-version: 26
             elixir-version: 1.16
     steps:
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
         with:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
@@ -34,7 +34,7 @@ jobs:
           git clone --branch ${{ matrix.rmq-version }} https://github.com/rabbitmq/rabbitmq-server.git ${{ github.workspace }}/rabbitmq-server
       - id: build-rabbitmq-server
         run: make -C ${{ github.workspace }}/rabbitmq-server
-      - uses: actions/cache/save@v4
+      - uses: actions/cache/save@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
         with:
           path: ${{ github.workspace }}/rabbitmq-server
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
