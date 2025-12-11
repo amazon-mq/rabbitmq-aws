@@ -30,21 +30,21 @@ jobs:
             elixir-version: 1.16
     steps:
       - id: restore-rabbitmq-server-cache
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@a7833574556fa59680c1b7cb190c1735db73ebf0 # v5.0.0
         with:
           path: ${{ github.workspace }}/rabbitmq-server
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
       - id: maybe-fail-rabbitmq-server-miss
         if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
             core.setFailed('could not restore cached rabbitmq-server build');
-      - uses: erlef/setup-beam@v1
+      - uses: erlef/setup-beam@e6d7c94229049569db56a7ad5a540c051a010af9 # v1.20.4
         with:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
         with:
           path: rabbitmq-server/deps/aws
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
