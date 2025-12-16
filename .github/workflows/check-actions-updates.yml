@@ -21,7 +21,6 @@ jobs:
         run: ${{ github.workspace }}/.github/scripts/check-actions-updates.sh
       - if: steps.actions-check.outputs.has-updates == 'true'
         run: |
-          echo "::error:: Found ${{ steps.actions-check.outputs.update-count }} outdated GitHub Actions. Please update them before merging."
-          echo "You can update them by running: npx actions-up"
-          echo "Or manually update the versions in your workflows."
+          echo "::error:: Found ${{ steps.actions-check.outputs.update-count }} outdated GitHub Actions!"
+          echo "::info:: You can update them by running: "npx actions-up --yes" and opening a PR."
           exit 1
