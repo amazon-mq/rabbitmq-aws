@@ -72,7 +72,8 @@ handle_assume_role({ok, AssumeRoleResult}, BodyMap, Req0, Context) ->
         maybe_reset_credentials(AssumeRoleResult)
     end;
 handle_assume_role({error, Error}, _BodyMap, Req, Context) ->
-    rabbit_mgmt_util:bad_request(Error, Req, Context).
+    Reason = rabbit_data_coercion:to_utf8_binary(io_lib:format("~tp", [Error])),
+    rabbit_mgmt_util:bad_request(Reason, Req, Context).
 
 maybe_assume_role(BodyMap) when is_map(BodyMap) andalso is_map_key(assume_role_arn, BodyMap) ->
     AssumeRoleArn = maps:get(assume_role_arn, BodyMap),
