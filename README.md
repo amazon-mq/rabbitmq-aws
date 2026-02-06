@@ -61,6 +61,12 @@ instead of literal values:
 - `aws.arns.ssl_options.cacertfile`
 - `aws.arns.ssl_options.certfile`
 - `aws.arns.ssl_options.keyfile`
+- `aws.arns.amqp_client.ssl_options.cacertfile`
+- `aws.arns.amqp_client.ssl_options.certfile`
+- `aws.arns.amqp_client.ssl_options.keyfile`
+- `aws.arns.amqp10_client.ssl_options.cacertfile`
+- `aws.arns.amqp10_client.ssl_options.certfile`
+- `aws.arns.amqp10_client.ssl_options.keyfile`
 - `aws.arns.management.ssl.cacertfile`
 - `aws.arns.management.ssl.certfile`
 - `aws.arns.management.ssl.keyfile`

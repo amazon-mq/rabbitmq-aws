@@ -17,6 +17,36 @@
         ],
         [aws_arn_config]},
 
+    {aws_arn_config_arns_amqp_client_ssl_options_cacertfile,
+        "aws.arns.amqp_client.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp_client,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.amqp_client.ssl_options.cacertfile",
+                    ["aws.arns.amqp_client.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
+    {aws_arn_config_arns_amqp10_client_ssl_options_cacertfile,
+        "aws.arns.amqp10_client.ssl_options.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
+        [{aws, [
+            {arn_config, [
+                {arns, [
+                    {aws_arn_config_amqp10_client,
+                    "arn:aws:s3:::private-ca-42/cacertfile.pem",
+                    "aws.arns.amqp10_client.ssl_options.cacertfile",
+                    ["aws.arns.amqp10_client.ssl_options.cacertfile", ssl_options, cacertfile]}
+                ]}
+            ]}
+         ]}
+        ],
+        [aws_arn_config]},
+
     {aws_arn_config_arns_oauth2_cacertfile,
         "aws.arns.auth_oauth2.https.cacertfile = arn:aws:s3:::private-ca-42/cacertfile.pem",
         [{aws, [
