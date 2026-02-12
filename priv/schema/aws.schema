@@ -31,6 +31,26 @@
     [{datatype, string}]}.
 
 %%--------------------------------------------------------------------------------------------------
+%% amqp_client
+%%
+{mapping, "aws.arns.amqp_client.ssl_options.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.amqp_client.ssl_options.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.amqp_client.ssl_options.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
+%% amqp10_client
+%%
+{mapping, "aws.arns.amqp10_client.ssl_options.cacertfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.amqp10_client.ssl_options.certfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+{mapping, "aws.arns.amqp10_client.ssl_options.keyfile", "aws.arn_config.arns",
+    [{datatype, string}]}.
+
+%%--------------------------------------------------------------------------------------------------
 %% rabbitmq_management plugin
 %%
 {mapping, "aws.arns.management.ssl.cacertfile", "aws.arn_config.arns",
@@ -128,6 +148,16 @@ fun(Conf) ->
         {"aws.arns.ssl_options.cacertfile", aws_arn_config_rabbit, ssl_options, cacertfile},
         {"aws.arns.ssl_options.certfile",   aws_arn_config_rabbit, ssl_options, certfile},
         {"aws.arns.ssl_options.keyfile",    aws_arn_config_rabbit, ssl_options, keyfile},
+
+        %% amqp_client
+        {"aws.arns.amqp_client.ssl_options.cacertfile", aws_arn_config_amqp_client, ssl_options, cacertfile},
+        {"aws.arns.amqp_client.ssl_options.certfile",   aws_arn_config_amqp_client, ssl_options, certfile},
+        {"aws.arns.amqp_client.ssl_options.keyfile",    aws_arn_config_amqp_client, ssl_options, keyfile},
+
+        %% amqp10_client
+        {"aws.arns.amqp10_client.ssl_options.cacertfile", aws_arn_config_amqp10_client, ssl_options, cacertfile},
+        {"aws.arns.amqp10_client.ssl_options.certfile",   aws_arn_config_amqp10_client, ssl_options, certfile},
+        {"aws.arns.amqp10_client.ssl_options.keyfile",    aws_arn_config_amqp10_client, ssl_options, keyfile},
 
         %% rabbitmq_management
         {"aws.arns.management.ssl.cacertfile",          aws_arn_config_management, ssl_options, cacertfile},
