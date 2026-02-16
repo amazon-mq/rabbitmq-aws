@@ -3,7 +3,7 @@
 Here are the commands to run when releasing a new version of this project:
 
 ```
-readonly VER=0.1.0
+readonly VER=0.2.0
 git checkout -b "rabbitmq-aws-$VER"
 sed -i.bak "s/^PROJECT_VERSION =.*/PROJECT_VERSION = $VER/" Makefile
 github_changelog_generator --future-release "$VER" --user amazon-mq --project rabbitmq-aws --token "$GITHUB_API_TOKEN"

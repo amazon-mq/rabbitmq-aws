@@ -4,8 +4,8 @@
 
 The `rabbitmq-aws` plugin enables RabbitMQ to fetch sensitive configuration data (certificates, secrets, passwords) from AWS services at startup instead of storing them on disk. It resolves AWS ARNs specified in RabbitMQ configuration and injects the retrieved values directly into the application environment.
 
-**Version:** 0.1.0  
-**License:** Apache-2.0  
+**Version:** 0.2.0
+**License:** Apache-2.0
 **Compatibility:** RabbitMQ 4.2.0+
 
 ## Core Architecture
@@ -97,6 +97,12 @@ Each handler module implements the `run/3` or `run/4` function to process resolv
 #### `aws_arn_config_rabbit.erl`
 Handles core RabbitMQ `ssl_options` configuration.
 
+#### `aws_arn_config_amqp_client.erl`
+Handles `amqp_client` application `ssl_options` configuration.
+
+#### `aws_arn_config_amqp10_client.erl`
+Handles `amqp10_client` application `ssl_options` configuration.
+
 #### `aws_arn_config_management.erl`
 Handles `rabbitmq_management` plugin SSL and OAuth client secrets.
 
@@ -131,6 +137,9 @@ Low-level application environment manipulation (update/delete operations).
 
 #### `aws_util.erl`
 Credential management utilities, primarily for resetting AWS credentials after role assumption.
+
+#### `aws_mgmt_util.erl`
+HTTP error response helpers for the management API, including 422 Unprocessable Entity responses.
 
 ### Management API Module
 
@@ -179,6 +188,16 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 - `aws.arns.ssl_options.cacertfile`
 - `aws.arns.ssl_options.certfile`
 - `aws.arns.ssl_options.keyfile`
+
+**AMQP Client SSL:**
+- `aws.arns.amqp_client.ssl_options.cacertfile`
+- `aws.arns.amqp_client.ssl_options.certfile`
+- `aws.arns.amqp_client.ssl_options.keyfile`
+
+**AMQP 1.0 Client SSL:**
+- `aws.arns.amqp10_client.ssl_options.cacertfile`
+- `aws.arns.amqp10_client.ssl_options.certfile`
+- `aws.arns.amqp10_client.ssl_options.keyfile`
 
 **Management Plugin:**
 - `aws.arns.management.ssl.cacertfile`
@@ -332,7 +351,7 @@ application:set_env()
 - Project name: `aws`
 - Module: `aws_app`
 - Registered process: `aws_sup`
-- Version: 0.1.0
+- Version: 0.2.0
 
 ## CI/CD
 
@@ -342,9 +361,9 @@ application:set_env()
    - Tests against RabbitMQ versions: v3.13.7, v4.2.x, main
    - Matrix builds with different OTP/Elixir versions
    - Runs daily at 16:00 UTC
-   - Caches RabbitMQ server builds
+   - Restores cached RabbitMQ server builds
 
-2. **build-rabbitmq-server.yaml** - Builds RabbitMQ server for testing
+2. **build-rabbitmq-server.yaml** - Builds and caches RabbitMQ server for testing
 
 3. **format-check.yaml** - Code formatting validation
 
