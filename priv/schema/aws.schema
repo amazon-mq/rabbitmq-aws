@@ -163,7 +163,7 @@ fun(Conf) ->
         {"aws.arns.management.ssl.cacertfile",          aws_arn_config_management, ssl_options, cacertfile},
         {"aws.arns.management.ssl.certfile",            aws_arn_config_management, ssl_options, certfile},
         {"aws.arns.management.ssl.keyfile",             aws_arn_config_management, ssl_options, keyfile},
-        {"aws.arns.management.ssl.oauth_client_secret", aws_arn_config_management, oauth_client_secret},
+        {"aws.arns.management.oauth_client_secret", aws_arn_config_management, oauth_client_secret},
 
         %% rabbitmq_auth_backend_http
         {"aws.arns.auth_http.ssl_options.cacertfile", aws_arn_config_http, ssl_options, cacertfile},
