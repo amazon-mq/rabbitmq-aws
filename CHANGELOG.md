@@ -10,6 +10,7 @@
 
 **Merged pull requests:**
 
+- rabbitmq-aws 0.2.0 [\#29](https://github.com/amazon-mq/rabbitmq-aws/pull/29) ([lukebakken](https://github.com/lukebakken))
 - Fix schema translation key for `management.oauth_client_secret` [\#28](https://github.com/amazon-mq/rabbitmq-aws/pull/28) ([lukebakken](https://github.com/lukebakken))
 - Update GH actions refs [\#26](https://github.com/amazon-mq/rabbitmq-aws/pull/26) ([lukebakken](https://github.com/lukebakken))
 - Fix error encoding validation api [\#25](https://github.com/amazon-mq/rabbitmq-aws/pull/25) ([sunfinite](https://github.com/sunfinite))
