@@ -36,7 +36,7 @@ jobs:
           key: rmq-${{ matrix.rmq-version }}-otp-${{ matrix.otp-version }}-elixir-${{ matrix.elixir-version }}
       - id: maybe-fail-rabbitmq-server-miss
         if: steps.restore-rabbitmq-server-cache.outputs.cache-hit != 'true'
-        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         with:
           script: |
             core.setFailed('could not restore cached rabbitmq-server build');
