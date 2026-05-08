@@ -57,7 +57,6 @@ The plugin uses RabbitMQ's boot step mechanism to execute before networking star
 - `arn:aws:s3:::bucket/key` - S3 objects
 - `arn:aws:secretsmanager:region:account:secret:name` - Secrets Manager
 - `arn:aws:acm-pca:region:account:certificate-authority/id` - ACM Private CA
-- `arn:aws-debug:file:::path` - Local files (testing only)
 
 #### `aws_arn_env.erl`
 **Purpose:** Application environment manipulation
