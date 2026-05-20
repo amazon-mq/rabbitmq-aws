@@ -14,8 +14,6 @@
 -spec resolve_arn(string()) -> {ok, binary()} | {error, term()}.
 resolve_arn(Arn) ->
     case parse_arn(Arn) of
-        {ok, #{partition := "aws-debug", service := "file", resource := Resource}} ->
-            {ok, _File} = file:read_file(Resource);
         {ok, #{service := "s3", resource := Resource}} ->
             aws_s3:fetch_object(Resource);
         {ok, #{service := "secretsmanager", region := Region}} ->
