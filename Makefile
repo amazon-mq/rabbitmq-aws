@@ -10,7 +10,7 @@ endef
 
 DEPS = rabbit_common rabbitmq_aws rabbit rabbitmq_management
 TEST_DEPS = meck rabbitmq_ct_helpers rabbitmq_ct_client_helpers
-LOCAL_DEPS = crypto inets ssl xmerl public_key
+LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
 
 PLT_APPS = rabbit
 
