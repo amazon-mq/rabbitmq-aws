@@ -2,7 +2,7 @@ PROJECT = aws
 PROJECT_DESCRIPTION = RabbitMQ - AWS integration plugin
 PROJECT_MOD = aws_app
 PROJECT_REGISTERED = aws_sup
-PROJECT_VERSION = 0.2.0
+PROJECT_VERSION = 0.3.0
 
 define PROJECT_ENV
 []
