@@ -36,5 +36,3 @@
 -define(AWS_LOG_INFO(Fmt, Args),
     ?LOG_INFO("~tp: " ++ Fmt, [?MODULE | Args])
 ).
-
--define(UNPROCESSABLE_ENTITY, 422).
