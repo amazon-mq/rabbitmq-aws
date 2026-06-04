@@ -22,7 +22,7 @@
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
--define(REASON_BAD_PASSWORD, <<"password must be a non-empty string">>).
+-define(REASON_BAD_PASSWORD_ARN, <<"password_arn must be a non-empty string">>).
 -define(REASON_BAD_SSL_FLAG, <<"use_ssl must be a boolean">>).
 -define(REASON_BAD_STARTTLS_FLAG, <<"use_starttls must be a boolean">>).
 -define(REASON_BAD_SSL_OPTIONS, <<"ssl_options must be an object">>).
@@ -30,6 +30,7 @@
 -define(REASON_CONNECTION, <<"could not connect to LDAP server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
+-define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 
 method_name() ->
     <<"ldap-simple-bind">>.
@@ -39,7 +40,7 @@ allowed_fields() ->
         <<"servers">>,
         <<"port">>,
         <<"user_dn">>,
-        <<"password">>,
+        <<"password_arn">>,
         <<"use_ssl">>,
         <<"use_starttls">>,
         <<"ssl_options">>
@@ -109,11 +110,14 @@ parse_user_dn(Body, Acc) ->
     end.
 
 parse_password(Body, Acc) ->
-    case maps:get(<<"password">>, Body, undefined) of
-        Password when is_binary(Password), byte_size(Password) > 0 ->
-            {ok, Acc#{password => Password}};
+    case maps:get(<<"password_arn">>, Body, undefined) of
+        Arn when is_binary(Arn), byte_size(Arn) > 0 ->
+            case resolve_arn(Arn) of
+                {ok, Password} -> {ok, Acc#{password => Password}};
+                {error, _} -> {error, input_invalid, ?REASON_ARN_RESOLVE}
+            end;
         _ ->
-            {error, input_invalid, ?REASON_BAD_PASSWORD}
+            {error, input_invalid, ?REASON_BAD_PASSWORD_ARN}
     end.
 
 parse_use_ssl(Body, Acc) ->
@@ -199,8 +203,7 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
 %% allowed surface narrow.
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
-        {cacertfile, <<"cacertfile">>, fun to_list/1},
-        {cacerts, <<"cacert_pem_data">>, fun decode_pem_cacerts/1},
+        {cacerts, <<"cacertfile_arn">>, fun resolve_and_decode_pem_cacerts/1},
         {verify, <<"verify">>, fun to_atom/1},
         {depth, <<"depth">>, fun to_integer/1},
         {versions, <<"versions">>, fun to_versions/1},
@@ -240,7 +243,16 @@ decode_pem_cacerts(B) when is_binary(B) ->
             [public_key:pem_entry_decode(E) || E <- Entries]
     end.
 
+resolve_and_decode_pem_cacerts(Arn) when is_binary(Arn) ->
+    case resolve_arn(Arn) of
+        {ok, PemData} -> decode_pem_cacerts(PemData);
+        {error, _} -> skip
+    end.
+
 %%--------------------------------------------------------------------
+
+resolve_arn(Arn) when is_binary(Arn) ->
+    aws_arn_util:resolve_arn(binary_to_list(Arn)).
 
 connection_timeout_ms() ->
     case application:get_env(aws, auth_validation_connection_timeout_ms) of
