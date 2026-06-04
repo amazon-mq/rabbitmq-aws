@@ -316,7 +316,7 @@ application:set_env()
 **GitHub Actions Workflows:**
 
 1. **build-test.yaml** - Main CI pipeline
-   - Tests against RabbitMQ versions: v3.13.7, v4.2.x, main
+   - Tests against RabbitMQ versions: v3.13.7, v4.2.x, v4.3.x, main
    - Matrix builds with different OTP/Elixir versions
    - Runs daily at 16:00 UTC
    - Restores cached RabbitMQ server builds
