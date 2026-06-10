@@ -102,7 +102,7 @@
 %% @doc Master toggle. When false (the default) the validation
 %% subsystem starts no workers and the endpoint returns 404.
 {mapping, "aws.auth_validation.enabled", "aws.auth_validation_enabled",
-    [{datatype, {enum, [true, false]}}, {default, false}]}.
+    [{datatype, {enum, [true, false]}}, {default, false}, {include_default, false}]}.
 
 %% @doc Per-method enable flag. Methods are enabled by default; set
 %% explicit false to disable a specific method even when the master
@@ -119,27 +119,27 @@
 
 %% @doc Maximum HTTP request body size in bytes.
 {mapping, "aws.auth_validation.max_body_size", "aws.auth_validation_max_body_size",
-    [{datatype, integer}, {default, 65536}]}.
+    [{datatype, integer}, {default, 65536}, {include_default, false}]}.
 
 %% @doc Maximum concurrent outbound auth-validation connections.
 {mapping, "aws.auth_validation.max_concurrent", "aws.auth_validation_max_concurrent",
-    [{datatype, integer}, {default, 5}]}.
+    [{datatype, integer}, {default, 5}, {include_default, false}]}.
 
 %% @doc Per-connection timeout in milliseconds for outbound calls.
 {mapping, "aws.auth_validation.connection_timeout_ms", "aws.auth_validation_connection_timeout_ms",
-    [{datatype, integer}, {default, 5000}]}.
+    [{datatype, integer}, {default, 5000}, {include_default, false}]}.
 
 %% @doc Rate limiter window in seconds (per source IP).
 {mapping, "aws.auth_validation.rate_limit.window_seconds", "aws.auth_validation_rate_limit_window_seconds",
-    [{datatype, integer}, {default, 60}]}.
+    [{datatype, integer}, {default, 60}, {include_default, false}]}.
 
 %% @doc Rate limiter max successful requests per window per source IP.
 {mapping, "aws.auth_validation.rate_limit.max_requests", "aws.auth_validation_rate_limit_max_requests",
-    [{datatype, integer}, {default, 10}]}.
+    [{datatype, integer}, {default, 10}, {include_default, false}]}.
 
 %% @doc Required management user tag to access the endpoint.
 {mapping, "aws.auth_validation.required_user_tag", "aws.auth_validation_required_user_tag",
-    [{datatype, atom}, {default, administrator}]}.
+    [{datatype, atom}, {default, administrator}, {include_default, false}]}.
 
 %%--------------------------------------------------------------------------------------------------
 %% misc

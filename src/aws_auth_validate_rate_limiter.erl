@@ -62,11 +62,15 @@ init(Config) when is_map(Config) ->
     schedule_sweep(State#rate_state.sweep_interval_ms),
     {ok, State}.
 
-handle_call({check, IP}, _From, #rate_state{
-    counters = Counters0,
-    window_ms = WindowMs,
-    max_per_window = Max
-} = State) ->
+handle_call(
+    {check, IP},
+    _From,
+    #rate_state{
+        counters = Counters0,
+        window_ms = WindowMs,
+        max_per_window = Max
+    } = State
+) ->
     Now = erlang:monotonic_time(millisecond),
     case maps:get(IP, Counters0, undefined) of
         undefined ->
@@ -87,11 +91,14 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info(sweep, #rate_state{
-    counters = Counters0,
-    window_ms = WindowMs,
-    sweep_interval_ms = SweepMs
-} = State) ->
+handle_info(
+    sweep,
+    #rate_state{
+        counters = Counters0,
+        window_ms = WindowMs,
+        sweep_interval_ms = SweepMs
+    } = State
+) ->
     Now = erlang:monotonic_time(millisecond),
     Counters1 = maps:filter(
         fun(_IP, {_Count, WindowStart}) -> (Now - WindowStart) < WindowMs end,
