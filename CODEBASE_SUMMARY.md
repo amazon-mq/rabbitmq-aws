@@ -137,41 +137,7 @@ Low-level application environment manipulation (update/delete operations).
 #### `aws_util.erl`
 Credential management utilities, primarily for resetting AWS credentials after role assumption.
 
-#### `aws_mgmt_util.erl`
-HTTP error response helpers for the management API, including 422 Unprocessable Entity responses.
 
-### Management API Module
-
-#### `aws_arn_mgmt.erl`
-**Purpose:** HTTP API for ARN validation
-
-**Endpoint:** `PUT /api/aws/arn/validate`
-
-**Request Format:**
-```json
-{
-  "assume_role_arn": "arn:aws:iam::account:role/name",
-  "arns": [
-    "arn:aws:secretsmanager:region:account:secret:name"
-  ]
-}
-```
-
-**Response Format:**
-```json
-[
-  {
-    "arn": "arn:aws:secretsmanager:...",
-    "value": "secret-value"
-  }
-]
-```
-
-**Features:**
-- Validates ARN resolution without restarting RabbitMQ
-- Supports role assumption for testing cross-account access
-- Returns HTTP 422 for unprocessable ARNs
-- Implements proper credential cleanup after validation
 
 ## Configuration Schema
 
@@ -300,13 +266,6 @@ application:set_env()
 
 ### Integration Tests (Common Test)
 
-**`aws_arn_mgmt_SUITE.erl`:**
-- HTTP API endpoint validation
-- Method restrictions (only PUT and OPTIONS allowed)
-- Error handling (400, 405, 422 responses)
-- Malformed ARN handling
-- Empty ARN list validation
-
 **`config_schema_SUITE.erl`:**
 - Cuttlefish schema validation
 - Configuration snippet testing
@@ -357,7 +316,7 @@ application:set_env()
 **GitHub Actions Workflows:**
 
 1. **build-test.yaml** - Main CI pipeline
-   - Tests against RabbitMQ versions: v3.13.7, v4.2.x, main
+   - Tests against RabbitMQ versions: v3.13.7, v4.2.x, v4.3.x, main
    - Matrix builds with different OTP/Elixir versions
    - Runs daily at 16:00 UTC
    - Restores cached RabbitMQ server builds

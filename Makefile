@@ -2,13 +2,13 @@ PROJECT = aws
 PROJECT_DESCRIPTION = RabbitMQ - AWS integration plugin
 PROJECT_MOD = aws_app
 PROJECT_REGISTERED = aws_sup
-PROJECT_VERSION = 0.2.0
+PROJECT_VERSION = 0.3.0
 
 define PROJECT_ENV
 []
 endef
 
-DEPS = rabbit_common rabbitmq_aws rabbit rabbitmq_management
+DEPS = rabbit_common rabbitmq_aws rabbit
 TEST_DEPS = meck rabbitmq_ct_helpers rabbitmq_ct_client_helpers
 LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
 

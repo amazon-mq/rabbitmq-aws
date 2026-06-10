@@ -30,11 +30,6 @@ configuration values with actual content from AWS services. Resolved ARN
 content, such as X509 certificates, **is not stored on disk** - it's passed
 directly to RabbitMQ.
 
-## Validation of AWS ARNs
-
-See the [API documentation](API.md) for how you can use an HTTP API to
-validate that ARNs resolve as expected.
-
 ### Supported AWS Services & APIs
 
 - **AWS Secrets Manager** (`GetSecretValue`) - Recommended for passwords and private keys
