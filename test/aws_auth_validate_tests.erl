@@ -28,8 +28,7 @@ rate_limiter_test_() ->
             }),
             Pid
         end,
-        fun stop/1,
-        [
+        fun stop/1, [
             {"allows up to max then rejects", fun() ->
                 ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
                 ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
@@ -72,8 +71,7 @@ rate_limiter_window_expiry_test_() ->
             }),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             ok = aws_auth_validate_rate_limiter:check(?IP1),
             ?assertEqual(
                 {error, rate_limited},
@@ -103,8 +101,7 @@ rate_limiter_sweep_eviction_test_() ->
             }),
             Pid
         end,
-        fun stop/1,
-        fun(Pid) ->
+        fun stop/1, fun(Pid) ->
             ok = aws_auth_validate_rate_limiter:check(?IP1),
             ok = aws_auth_validate_rate_limiter:check(?IP2),
             ?assertEqual(2, counter_count(Pid)),
@@ -134,8 +131,7 @@ semaphore_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 2}),
             Pid
         end,
-        fun stop/1,
-        [
+        fun stop/1, [
             {"acquire/release sequence", fun() ->
                 {ok, R1} = aws_auth_validate_semaphore:acquire(),
                 {ok, R2} = aws_auth_validate_semaphore:acquire(),
@@ -154,8 +150,7 @@ semaphore_crashed_holder_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 1}),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             Self = self(),
             Worker = spawn(fun() ->
                 {ok, _Ref} = aws_auth_validate_semaphore:acquire(),
@@ -164,7 +159,10 @@ semaphore_crashed_holder_test_() ->
                     die -> exit(boom)
                 end
             end),
-            receive acquired -> ok after 1_000 -> ?assert(false) end,
+            receive
+                acquired -> ok
+            after 1_000 -> ?assert(false)
+            end,
             ?assertEqual({error, full}, aws_auth_validate_semaphore:acquire()),
             Worker ! die,
             wait_until_zero(50),
@@ -182,8 +180,7 @@ semaphore_concurrent_cap_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 3}),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             Max = 3,
             Workers = 30,
             Self = self(),
@@ -194,9 +191,19 @@ semaphore_concurrent_cap_test_() ->
              || _ <- lists:seq(1, Workers)
             ],
             %% Wait for every worker to finish a full acquire/hold/release.
-            [receive {done, P} -> ok after 5_000 -> ?assert(false) end || P <- Pids],
+            [
+                receive
+                    {done, P} -> ok
+                after 5_000 -> ?assert(false)
+                end
+             || P <- Pids
+            ],
             Tracker ! {peak, self()},
-            Peak = receive {peak_value, V} -> V after 1_000 -> -1 end,
+            Peak =
+                receive
+                    {peak_value, V} -> V
+                after 1_000 -> -1
+                end,
             [
                 ?_assert(Peak =< Max),
                 ?_assert(Peak >= 1),
@@ -242,8 +249,7 @@ semaphore_idempotent_release_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 2}),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             {ok, Ref} = aws_auth_validate_semaphore:acquire(),
             ?assertEqual(1, aws_auth_validate_semaphore:current()),
             ok = aws_auth_validate_semaphore:release(Ref),
@@ -269,8 +275,11 @@ settle_to_zero(0) ->
     aws_auth_validate_semaphore:current();
 settle_to_zero(N) ->
     case aws_auth_validate_semaphore:current() of
-        0 -> 0;
-        _ -> timer:sleep(10), settle_to_zero(N - 1)
+        0 ->
+            0;
+        _ ->
+            timer:sleep(10),
+            settle_to_zero(N - 1)
     end.
 
 stop(Pid) ->
@@ -283,6 +292,9 @@ wait_until_zero(0) ->
     ?assertEqual(0, aws_auth_validate_semaphore:current());
 wait_until_zero(N) ->
     case aws_auth_validate_semaphore:current() of
-        0 -> ok;
-        _ -> timer:sleep(10), wait_until_zero(N - 1)
+        0 ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            wait_until_zero(N - 1)
     end.
