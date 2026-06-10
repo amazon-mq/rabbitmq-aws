@@ -7,17 +7,48 @@
 %%
 %% Opens an ephemeral connection per request, optionally performs
 %% start_tls, attempts a simple bind, then unconditionally closes the
-%% handle. All outcomes collapse to one of five fixed error categories
-%% so the HTTP response cannot be used to extract LDAP-server or
+%% handle. All outcomes collapse to a fixed set of error categories so
+%% the HTTP response cannot be used to extract LDAP-server or
 %% network-topology details. Credentials never appear in returned
 %% reasons.
+%%
+%% Beyond authentication, the backend optionally validates two further
+%% layers of an LDAP configuration, reusing the same bound connection:
+%%
+%%   * DN lookup -- when `dn_lookup_base' is supplied, confirms the base
+%%     DN exists and is readable by the bound user. `dn_lookup_attribute'
+%%     is checked for syntactic validity only.
+%%
+%%   * Authorization queries -- `queries.{tags,vhost_access,
+%%     resource_access,topic_access}' are parsed with the same grammar
+%%     the broker uses (aws_auth_validate_ldap_query), and any group/DN
+%%     referenced with a fully literal DN (no ${...} runtime placeholder)
+%%     is checked for existence and readability. Query terms that need a
+%%     runtime principal (e.g. ${username}) are parsed but not evaluated,
+%%     because the endpoint has no live login to evaluate them against and
+%%     must not leak directory contents.
+%%
+%% Parse failures map to `query_invalid' (400); a referenced object that
+%% cannot be verified maps to `authz_unverified' (422). Both carry fixed
+%% constant messages -- no DN, group name, or raw LDAP detail is echoed.
 -module(aws_auth_validate_ldap).
 
 -behaviour(aws_auth_validate_backend).
 
 -export([method_name/0, validate/1, allowed_fields/0]).
 
+-include_lib("eldap/include/eldap.hrl").
+
 -define(DEFAULT_TIMEOUT_MS, 5_000).
+
+%% Accepted query names within the `queries' object. Mirrors the broker's
+%% auth_ldap.queries.* config keys.
+-define(QUERY_NAMES, [
+    <<"tags">>,
+    <<"vhost_access">>,
+    <<"resource_access">>,
+    <<"topic_access">>
+]).
 
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
@@ -31,9 +62,20 @@
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
 -define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+-define(REASON_BAD_DN_LOOKUP_BASE, <<"dn_lookup_base must be a non-empty string">>).
+-define(REASON_BAD_DN_LOOKUP_ATTR, <<"dn_lookup_attribute must be a non-empty string">>).
+-define(REASON_BAD_QUERIES, <<"queries must be an object of query strings">>).
+-define(REASON_BAD_QUERY_VALUE, <<"each query must be a non-empty string">>).
+-define(REASON_QUERY_PARSE, <<"one or more authorization queries are not valid">>).
+-define(REASON_DN_LOOKUP_BASE_UNVERIFIED,
+    <<"dn_lookup_base does not exist or is not readable by the bind user">>
+).
+-define(REASON_AUTHZ_UNVERIFIED,
+    <<"a DN referenced by an authorization query could not be verified">>
+).
 
 method_name() ->
-    <<"ldap-simple-bind">>.
+    <<"ldap">>.
 
 allowed_fields() ->
     [
@@ -43,18 +85,31 @@ allowed_fields() ->
         <<"password_arn">>,
         <<"use_ssl">>,
         <<"use_starttls">>,
-        <<"ssl_options">>
+        <<"ssl_options">>,
+        <<"dn_lookup_base">>,
+        <<"dn_lookup_attribute">>,
+        <<"queries">>
     ].
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
 validate(Body) when is_map(Body) ->
+    %% Order matters for security: every purely-local check (type/shape
+    %% validation, query grammar, config conflicts) runs before we resolve
+    %% the password ARN. Malformed input is rejected without fetching the
+    %% customer's secret, and the secret is resolved only once we are about
+    %% to actually connect.
     case parse_input(Body) of
         {error, _, _} = Err ->
             Err;
         {ok, Params} ->
             case check_config_conflicts(Params) of
-                {error, _, _} = Err -> Err;
-                ok -> do_ldap_validate(Params)
+                {error, _, _} = Err ->
+                    Err;
+                ok ->
+                    case resolve_password(Body, Params) of
+                        {error, _, _} = Err -> Err;
+                        {ok, Params1} -> do_ldap_validate(Params1)
+                    end
             end
     end.
 
@@ -62,15 +117,19 @@ validate(Body) when is_map(Body) ->
 %% Input parsing
 %%--------------------------------------------------------------------
 
+%% Pure, network-free validation steps. Password ARN resolution is handled
+%% separately (resolve_password/2) after these all pass.
 parse_input(Body) ->
     Steps = [
         fun parse_servers/2,
         fun parse_port/2,
         fun parse_user_dn/2,
-        fun parse_password/2,
         fun parse_use_ssl/2,
         fun parse_use_starttls/2,
-        fun parse_ssl_options/2
+        fun parse_ssl_options/2,
+        fun parse_dn_lookup_base/2,
+        fun parse_dn_lookup_attribute/2,
+        fun parse_queries/2
     ],
     parse_input(Steps, Body, #{timeout => connection_timeout_ms()}).
 
@@ -109,11 +168,16 @@ parse_user_dn(Body, Acc) ->
             {error, input_invalid, ?REASON_BAD_USER_DN}
     end.
 
-parse_password(Body, Acc) ->
+%% Resolve the bind password from its ARN. Runs only after all pure input
+%% validation has passed, so a malformed request never triggers a secret
+%% fetch. The resolved password is added to the params map and never logged
+%% or returned. Validated for shape here (rather than in parse_input) so the
+%% network call stays out of the pure pipeline.
+resolve_password(Body, Params) ->
     case maps:get(<<"password_arn">>, Body, undefined) of
         Arn when is_binary(Arn), byte_size(Arn) > 0 ->
             case resolve_arn(Arn) of
-                {ok, Password} -> {ok, Acc#{password => Password}};
+                {ok, Password} -> {ok, Params#{password => Password}};
                 {error, _} -> {error, input_invalid, ?REASON_ARN_RESOLVE}
             end;
         _ ->
@@ -143,6 +207,67 @@ parse_ssl_options(Body, Acc) ->
             {error, input_invalid, ?REASON_BAD_SSL_OPTIONS}
     end.
 
+%% DN lookup fields are optional. When `dn_lookup_base' is absent we store
+%% `none' and skip the readability check entirely. `dn_lookup_attribute' is
+%% likewise optional and validated for shape only.
+parse_dn_lookup_base(Body, Acc) ->
+    case maps:get(<<"dn_lookup_base">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{dn_lookup_base => none}};
+        Base when is_binary(Base), byte_size(Base) > 0 ->
+            {ok, Acc#{dn_lookup_base => binary_to_list(Base)}};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_DN_LOOKUP_BASE}
+    end.
+
+parse_dn_lookup_attribute(Body, Acc) ->
+    case maps:get(<<"dn_lookup_attribute">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{dn_lookup_attribute => none}};
+        Attr when is_binary(Attr), byte_size(Attr) > 0 ->
+            {ok, Acc#{dn_lookup_attribute => binary_to_list(Attr)}};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_DN_LOOKUP_ATTR}
+    end.
+
+%% `queries' is an optional object mapping query names (tags, vhost_access,
+%% resource_access, topic_access) to query-DSL strings. Each value is parsed
+%% with the broker-compatible grammar; unknown query names are ignored (the
+%% registry-level field filter governs the top-level surface, not nested
+%% keys). A parse failure short-circuits to query_invalid.
+parse_queries(Body, Acc) ->
+    case maps:get(<<"queries">>, Body, undefined) of
+        undefined ->
+            {ok, Acc#{queries => []}};
+        Map when is_map(Map) ->
+            parse_query_map(maps:to_list(Map), Acc, []);
+        _ ->
+            {error, input_invalid, ?REASON_BAD_QUERIES}
+    end.
+
+parse_query_map([], Acc, Parsed) ->
+    {ok, Acc#{queries => lists:reverse(Parsed)}};
+parse_query_map([{Name, Value} | Rest], Acc, Parsed) ->
+    case lists:member(Name, ?QUERY_NAMES) of
+        false ->
+            %% Ignore query names we don't recognise rather than failing the
+            %% whole request; keeps the accepted surface aligned with the
+            %% broker's four query types without leaking which were ignored.
+            parse_query_map(Rest, Acc, Parsed);
+        true ->
+            case Value of
+                V when is_binary(V), byte_size(V) > 0 ->
+                    case aws_auth_validate_ldap_query:parse(V) of
+                        {ok, Query} ->
+                            parse_query_map(Rest, Acc, [{Name, Query} | Parsed]);
+                        {error, _} ->
+                            {error, query_invalid, ?REASON_QUERY_PARSE}
+                    end;
+                _ ->
+                    {error, input_invalid, ?REASON_BAD_QUERY_VALUE}
+            end
+    end.
+
 is_nonempty_binary(B) -> is_binary(B) andalso byte_size(B) > 0.
 
 %%--------------------------------------------------------------------
@@ -167,7 +292,7 @@ do_ldap_validate(#{
     use_starttls := UseStartTls,
     ssl_options := SslOpts,
     timeout := Timeout
-}) ->
+} = Params) ->
     OpenOpts = [{port, Port}, {timeout, Timeout}] ++ ssl_open_opts(UseSsl, SslOpts),
     case eldap:open(Servers, OpenOpts) of
         {error, _Reason} ->
@@ -179,13 +304,84 @@ do_ldap_validate(#{
                         {error, tls_failed, ?REASON_TLS_HANDSHAKE};
                     ok ->
                         case eldap:simple_bind(Handle, UserDn, Password) of
-                            ok -> ok;
+                            ok -> post_bind_checks(Handle, Params);
                             {error, _Reason} -> {error, auth_failed, ?REASON_AUTH}
                         end
                 end
             after
                 catch eldap:close(Handle)
             end
+    end.
+
+%% After a successful bind, run the optional DN-lookup and authorization
+%% checks in sequence on the same bound handle. The first failure wins; if
+%% none are configured (or all pass) the request succeeds with `ok'.
+post_bind_checks(Handle, Params) ->
+    case check_dn_lookup(Handle, Params) of
+        ok -> check_authz_queries(Handle, Params);
+        {error, _, _} = Err -> Err
+    end.
+
+%%--------------------------------------------------------------------
+%% DN lookup validation
+%%--------------------------------------------------------------------
+
+%% When a dn_lookup_base is supplied, confirm it exists and is readable by
+%% the bound user. We never run an actual username->DN search here (there is
+%% no principal to look up and doing so could leak directory contents);
+%% confirming the base is reachable is the side-effect-free signal a
+%% customer needs to know their dn_lookup_base is correct.
+check_dn_lookup(_Handle, #{dn_lookup_base := none}) ->
+    ok;
+check_dn_lookup(Handle, #{dn_lookup_base := Base}) ->
+    case object_exists(Handle, Base) of
+        true -> ok;
+        _ -> {error, authz_unverified, ?REASON_DN_LOOKUP_BASE_UNVERIFIED}
+    end.
+
+%%--------------------------------------------------------------------
+%% Authorization query validation
+%%--------------------------------------------------------------------
+
+%% For each parsed query, extract the fully-literal DNs (those with no
+%% ${...} runtime placeholder) and confirm each exists and is readable by
+%% the bound user. Queries that reference only runtime-filled DNs contribute
+%% no checks -- they were already validated for grammar at parse time.
+check_authz_queries(Handle, #{queries := Queries}) ->
+    LiteralDns = lists:usort(
+        lists:flatmap(
+            fun({_Name, Query}) -> aws_auth_validate_ldap_query:literal_dns(Query) end,
+            Queries
+        )
+    ),
+    check_dns(Handle, LiteralDns).
+
+check_dns(_Handle, []) ->
+    ok;
+check_dns(Handle, [DN | Rest]) ->
+    case object_exists(Handle, DN) of
+        true -> check_dns(Handle, Rest);
+        _ -> {error, authz_unverified, ?REASON_AUTHZ_UNVERIFIED}
+    end.
+
+%% Base-scoped existence probe. Mirrors rabbit_auth_backend_ldap:object_exists/3
+%% (base object, present(objectClass) filter) so a DN this returns true for is
+%% one the broker's queries could also resolve. Any error -- not found,
+%% referral, permission denied -- collapses to `false'; the caller maps that
+%% to the single fixed authz_unverified category, leaking no LDAP detail.
+object_exists(Handle, DN) ->
+    case
+        eldap:search(Handle, [
+            {base, DN},
+            {filter, eldap:present("objectClass")},
+            {attributes, ["objectClass"]},
+            {scope, eldap:baseObject()}
+        ])
+    of
+        {ok, #eldap_search_result{entries = Entries}} ->
+            length(Entries) > 0;
+        _ ->
+            false
     end.
 
 ssl_open_opts(true, SslOpts) ->

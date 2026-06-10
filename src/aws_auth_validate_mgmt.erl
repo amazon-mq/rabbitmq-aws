@@ -133,8 +133,10 @@ respond({error, Category, Reason}, Req, Context) when is_atom(Category), is_bina
 status_for_category(input_invalid) -> 400;
 status_for_category(connection_failed) -> 400;
 status_for_category(tls_failed) -> 400;
+status_for_category(query_invalid) -> 400;
 status_for_category(auth_failed) -> 422;
-status_for_category(config_conflict) -> 422.
+status_for_category(config_conflict) -> 422;
+status_for_category(authz_unverified) -> 422.
 
 reply_error(Status, Category, Message, Req, Context) ->
     Body = rabbit_json:encode(#{

@@ -37,7 +37,7 @@
 -include_lib("rabbitmq_ct_helpers/include/rabbit_mgmt_test.hrl").
 -include("aws.hrl").
 
--define(API, "/aws/auth/validate/ldap-simple-bind").
+-define(API, "/aws/auth/validate/ldap").
 
 all() ->
     [
@@ -94,7 +94,7 @@ end_per_group(_Group, Config) ->
 init_per_testcase(method_disabled_returns_404 = TC, Config) ->
     rabbit_ct_broker_helpers:rpc(
         Config, 0, application, set_env,
-        [aws, auth_validation_enabled_methods, [{<<"ldap-simple-bind">>, false}]]
+        [aws, auth_validation_enabled_methods, [{<<"ldap">>, false}]]
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(rate_limit_returns_429 = TC, Config) ->

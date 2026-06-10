@@ -14,7 +14,9 @@
     | connection_failed
     | tls_failed
     | auth_failed
-    | config_conflict.
+    | config_conflict
+    | query_invalid
+    | authz_unverified.
 
 -type result() :: ok | {error, error_category(), Reason :: binary()}.
 

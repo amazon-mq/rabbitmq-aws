@@ -107,7 +107,7 @@
 %% @doc Per-method enable flag. Methods are enabled by default; set
 %% explicit false to disable a specific method even when the master
 %% toggle is on. Example:
-%%   aws.auth_validation.enabled_methods.ldap-simple-bind = false
+%%   aws.auth_validation.enabled_methods.ldap = false
 {mapping, "aws.auth_validation.enabled_methods.$name", "aws.auth_validation_enabled_methods",
     [{datatype, {enum, [true, false]}}]}.
 
