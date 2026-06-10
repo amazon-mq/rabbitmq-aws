@@ -1,5 +1,22 @@
 # Changelog
 
+## [0.3.0](https://github.com/amazon-mq/rabbitmq-aws/tree/0.3.0) (2026-06-04)
+
+[Full Changelog](https://github.com/amazon-mq/rabbitmq-aws/compare/0.2.1...0.3.0)
+
+**Merged pull requests:**
+
+- Add v4.3.x to testing [\#39](https://github.com/amazon-mq/rabbitmq-aws/pull/39) ([lukebakken](https://github.com/lukebakken))
+- Delete management endpoint [\#38](https://github.com/amazon-mq/rabbitmq-aws/pull/38) ([the-mikedavis](https://github.com/the-mikedavis))
+
+## [0.2.1](https://github.com/amazon-mq/rabbitmq-aws/tree/0.2.1) (2026-05-20)
+
+[Full Changelog](https://github.com/amazon-mq/rabbitmq-aws/compare/0.2.0...0.2.1)
+
+**Merged pull requests:**
+
+- Bump the github-actions group with 3 updates [\#37](https://github.com/amazon-mq/rabbitmq-aws/pull/37) ([dependabot[bot]](https://github.com/apps/dependabot))
+
 ## [0.2.0](https://github.com/amazon-mq/rabbitmq-aws/tree/0.2.0) (2026-02-16)
 
 [Full Changelog](https://github.com/amazon-mq/rabbitmq-aws/compare/0.1.0...0.2.0)
@@ -10,12 +27,12 @@
 
 **Merged pull requests:**
 
+- Fix error encoding validation api [\#25](https://github.com/amazon-mq/rabbitmq-aws/pull/25) ([sunfinite](https://github.com/sunfinite))
+- Use dependabot to update actions refs [\#21](https://github.com/amazon-mq/rabbitmq-aws/pull/21) ([lukebakken](https://github.com/lukebakken))
 - rabbitmq-aws 0.2.0 [\#29](https://github.com/amazon-mq/rabbitmq-aws/pull/29) ([lukebakken](https://github.com/lukebakken))
 - Fix schema translation key for `management.oauth_client_secret` [\#28](https://github.com/amazon-mq/rabbitmq-aws/pull/28) ([lukebakken](https://github.com/lukebakken))
 - Update GH actions refs [\#26](https://github.com/amazon-mq/rabbitmq-aws/pull/26) ([lukebakken](https://github.com/lukebakken))
-- Fix error encoding validation api [\#25](https://github.com/amazon-mq/rabbitmq-aws/pull/25) ([sunfinite](https://github.com/sunfinite))
 - Add aws.arns.amqp\_client and amqp10\_client ssl\_options support [\#24](https://github.com/amazon-mq/rabbitmq-aws/pull/24) ([sunfinite](https://github.com/sunfinite))
-- Use dependabot to update actions refs [\#21](https://github.com/amazon-mq/rabbitmq-aws/pull/21) ([lukebakken](https://github.com/lukebakken))
 - Update GHA actions [\#20](https://github.com/amazon-mq/rabbitmq-aws/pull/20) ([lukebakken](https://github.com/lukebakken))
 - Update GHA actions refs [\#19](https://github.com/amazon-mq/rabbitmq-aws/pull/19) ([lukebakken](https://github.com/lukebakken))
 - Add workflow to indicate when GHA actions need updates [\#18](https://github.com/amazon-mq/rabbitmq-aws/pull/18) ([lukebakken](https://github.com/lukebakken))
