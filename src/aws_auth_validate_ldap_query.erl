@@ -55,7 +55,8 @@ parse(_) ->
 fixup(Query0) ->
     Query1 = string:trim(Query0, both),
     case Query1 of
-        "" -> ".";
+        "" ->
+            ".";
         _ ->
             case lists:last(Query1) of
                 $. -> Query1;

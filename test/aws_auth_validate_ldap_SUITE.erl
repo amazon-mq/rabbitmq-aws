@@ -102,7 +102,8 @@ init_per_suite(Config) ->
 
 end_per_suite(Config) ->
     case ?config(ldap_port, Config) of
-        undefined -> ok;
+        undefined ->
+            ok;
         Port ->
             catch delete_seed(Port),
             stop_slapd(Config)
@@ -129,9 +130,12 @@ end_per_testcase(TC, Config) ->
 %% resolve (which the backend maps to input_invalid).
 mock_resolve_arn(Arn) when is_list(Arn) ->
     mock_resolve_arn(list_to_binary(Arn));
-mock_resolve_arn(?BIND_PW_ARN) -> {ok, list_to_binary(?BIND_PW)};
-mock_resolve_arn(?WRONG_PW_ARN) -> {ok, <<"definitely-wrong">>};
-mock_resolve_arn(_Other) -> {error, not_found}.
+mock_resolve_arn(?BIND_PW_ARN) ->
+    {ok, list_to_binary(?BIND_PW)};
+mock_resolve_arn(?WRONG_PW_ARN) ->
+    {ok, <<"definitely-wrong">>};
+mock_resolve_arn(_Other) ->
+    {error, not_found}.
 
 %%--------------------------------------------------------------------
 %% Functional tests
@@ -290,8 +294,13 @@ start_slapd(Config) ->
     Cmd = [InitSlapd, SlapdDir, {"~b", [TcpPort]}],
     case rabbit_ct_helpers:exec(Cmd) of
         {ok, Stdout} ->
-            case re:run(Stdout, "^SLAPD_PID=([0-9]+)$",
-                        [{capture, all_but_first, list}, multiline]) of
+            case
+                re:run(
+                    Stdout,
+                    "^SLAPD_PID=([0-9]+)$",
+                    [{capture, all_but_first, list}, multiline]
+                )
+            of
                 {match, [SlapdPid]} ->
                     ct:pal("slapd PID ~ts listening on ~b", [SlapdPid, TcpPort]),
                     rabbit_ct_helpers:set_config(
@@ -308,9 +317,14 @@ start_slapd(Config) ->
 
 stop_slapd(Config) ->
     case ?config(slapd_pid, Config) of
-        undefined -> ok;
-        "0" -> ok;  %% macOS: externally-managed server, leave it running
-        Pid -> _ = rabbit_ct_helpers:exec(["kill", "-INT", Pid]), ok
+        undefined ->
+            ok;
+        %% macOS: externally-managed server, leave it running
+        "0" ->
+            ok;
+        Pid ->
+            _ = rabbit_ct_helpers:exec(["kill", "-INT", Pid]),
+            ok
     end.
 
 %%--------------------------------------------------------------------
@@ -342,14 +356,17 @@ seed(Port) ->
 delete_seed(Port) ->
     H = admin_connect(Port),
     try
-        [del(H, DN) || DN <- [
-            ?ADMINS_GROUP_DN,
-            ?ALICE_DN,
-            ?BIND_DN,
-            ?GROUPS_OU,
-            ?PEOPLE_OU,
-            ?BASE_DN
-        ]],
+        [
+            del(H, DN)
+         || DN <- [
+                ?ADMINS_GROUP_DN,
+                ?ALICE_DN,
+                ?BIND_DN,
+                ?GROUPS_OU,
+                ?PEOPLE_OU,
+                ?BASE_DN
+            ]
+        ],
         ok
     after
         catch eldap:close(H)

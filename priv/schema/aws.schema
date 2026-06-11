@@ -99,10 +99,13 @@
 %% auth validation endpoint (PUT /api/aws/auth/validate/:method)
 %%
 
-%% @doc Master toggle. When false (the default) the validation
-%% subsystem starts no workers and the endpoint returns 404.
+%% @doc Master toggle. When unset (the effective default) the validation
+%% subsystem starts no workers and the endpoint returns 404. The default
+%% lives in code (aws_sup reads this with a `false' fallback); it is
+%% intentionally NOT declared here so the key is only emitted into the
+%% generated config when an operator sets it.
 {mapping, "aws.auth_validation.enabled", "aws.auth_validation_enabled",
-    [{datatype, {enum, [true, false]}}, {default, false}]}.
+    [{datatype, {enum, [true, false]}}]}.
 
 %% @doc Per-method enable flag. Methods are enabled by default; set
 %% explicit false to disable a specific method even when the master
@@ -117,29 +120,40 @@
      [{list_to_binary(lists:last(Key)), Value} || {Key, Value} <- Settings]
  end}.
 
-%% @doc Maximum HTTP request body size in bytes.
+%% Note: none of the settings below declare a schema {default, ...}. A
+%% defaulted mapping is emitted into every generated config, which breaks
+%% config_schema_SUITE's exact-match snippets. Effective defaults are
+%% applied by the consuming code when the key is unset, so the key reaches
+%% the app env only when an operator sets it explicitly.
+
+%% @doc Maximum HTTP request body size in bytes (effective default 65536).
 {mapping, "aws.auth_validation.max_body_size", "aws.auth_validation_max_body_size",
-    [{datatype, integer}, {default, 65536}]}.
+    [{datatype, integer}]}.
 
-%% @doc Maximum concurrent outbound auth-validation connections.
+%% @doc Maximum concurrent outbound auth-validation connections (effective
+%% default 5; applied by aws_sup).
 {mapping, "aws.auth_validation.max_concurrent", "aws.auth_validation_max_concurrent",
-    [{datatype, integer}, {default, 5}]}.
+    [{datatype, integer}]}.
 
-%% @doc Per-connection timeout in milliseconds for outbound calls.
+%% @doc Per-connection timeout in milliseconds for outbound calls
+%% (effective default 5000).
 {mapping, "aws.auth_validation.connection_timeout_ms", "aws.auth_validation_connection_timeout_ms",
-    [{datatype, integer}, {default, 5000}]}.
+    [{datatype, integer}]}.
 
-%% @doc Rate limiter window in seconds (per source IP).
+%% @doc Rate limiter window in seconds, per source IP (effective default
+%% 60; applied by aws_sup).
 {mapping, "aws.auth_validation.rate_limit.window_seconds", "aws.auth_validation_rate_limit_window_seconds",
-    [{datatype, integer}, {default, 60}]}.
+    [{datatype, integer}]}.
 
-%% @doc Rate limiter max successful requests per window per source IP.
+%% @doc Rate limiter max successful requests per window per source IP
+%% (effective default 10; applied by aws_sup).
 {mapping, "aws.auth_validation.rate_limit.max_requests", "aws.auth_validation_rate_limit_max_requests",
-    [{datatype, integer}, {default, 10}]}.
+    [{datatype, integer}]}.
 
-%% @doc Required management user tag to access the endpoint.
+%% @doc Required management user tag to access the endpoint (effective
+%% default administrator).
 {mapping, "aws.auth_validation.required_user_tag", "aws.auth_validation_required_user_tag",
-    [{datatype, atom}, {default, administrator}]}.
+    [{datatype, atom}]}.
 
 %%--------------------------------------------------------------------------------------------------
 %% misc

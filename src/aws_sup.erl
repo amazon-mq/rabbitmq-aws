@@ -16,10 +16,15 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    %% Tolerate a few transient worker crashes before giving up: a single
+    %% restart within 5s (intensity => 1) would tear down the whole
+    %% supervisor -- and with it ARN resolution -- on a second crash. The
+    %% validation workers are independent gen_servers, so allow several
+    %% restarts in a slightly wider window before escalating.
     SupFlags = #{
         strategy => one_for_one,
-        intensity => 1,
-        period => 5
+        intensity => 5,
+        period => 10
     },
     ChildSpecs = auth_validation_children(),
     {ok, {SupFlags, ChildSpecs}}.
