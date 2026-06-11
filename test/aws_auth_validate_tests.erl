@@ -3,10 +3,11 @@
 %% vim:ft=erlang:
 %% -*- mode: erlang; -*-
 
-%% Unit tests for the auth-validation subsystem covering all four pure
-%% modules: rate limiter, semaphore, registry, and the LDAP backend's
-%% input parsing. The HTTP pipeline lives in
-%% aws_auth_validate_mgmt_SUITE.
+%% Unit tests for the auth-validation subsystem's pure modules: rate
+%% limiter, semaphore, registry, the LDAP backend's input parsing, and the
+%% LDAP query DSL parser (incl. upstream parity). The live bind/connect/TLS
+%% path lives in aws_auth_validate_ldap_SUITE; the HTTP pipeline (when added)
+%% lives in aws_auth_validate_mgmt_SUITE.
 -module(aws_auth_validate_tests).
 
 -include_lib("eunit/include/eunit.hrl").
@@ -28,8 +29,7 @@ rate_limiter_test_() ->
             }),
             Pid
         end,
-        fun stop/1,
-        [
+        fun stop/1, [
             {"allows up to max then rejects", fun() ->
                 ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
                 ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
@@ -72,8 +72,7 @@ rate_limiter_window_expiry_test_() ->
             }),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             ok = aws_auth_validate_rate_limiter:check(?IP1),
             ?assertEqual(
                 {error, rate_limited},
@@ -93,8 +92,7 @@ semaphore_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 2}),
             Pid
         end,
-        fun stop/1,
-        [
+        fun stop/1, [
             {"acquire/release sequence", fun() ->
                 {ok, R1} = aws_auth_validate_semaphore:acquire(),
                 {ok, R2} = aws_auth_validate_semaphore:acquire(),
@@ -113,8 +111,7 @@ semaphore_crashed_holder_test_() ->
             {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 1}),
             Pid
         end,
-        fun stop/1,
-        fun(_) ->
+        fun stop/1, fun(_) ->
             Self = self(),
             Worker = spawn(fun() ->
                 {ok, _Ref} = aws_auth_validate_semaphore:acquire(),
@@ -123,7 +120,10 @@ semaphore_crashed_holder_test_() ->
                     die -> exit(boom)
                 end
             end),
-            receive acquired -> ok after 1_000 -> ?assert(false) end,
+            receive
+                acquired -> ok
+            after 1_000 -> ?assert(false)
+            end,
             ?assertEqual({error, full}, aws_auth_validate_semaphore:acquire()),
             Worker ! die,
             wait_until_zero(50),
@@ -299,6 +299,91 @@ ldap_queries_input_test_() ->
     ].
 
 %%--------------------------------------------------------------------
+%% LDAP query DSL parser (aws_auth_validate_ldap_query)
+%%--------------------------------------------------------------------
+
+parse_accepts_test_() ->
+    [
+        ?_assertMatch({ok, _}, aws_auth_validate_ldap_query:parse(Q))
+     || Q <- accepted_queries()
+    ].
+
+parse_rejects_test_() ->
+    [
+        ?_assertMatch({error, _}, aws_auth_validate_ldap_query:parse(Q))
+     || Q <- rejected_queries()
+    ].
+
+parse_accepts_string_input_test() ->
+    ?assertMatch({ok, _}, aws_auth_validate_ldap_query:parse("{constant, true}")).
+
+%% Literal DN extraction (the placeholder-free DNs used for static reachability)
+
+literal_dns_in_group_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=admins,ou=groups,dc=example,dc=com\"}">>
+    ),
+    ?assertEqual(
+        ["cn=admins,ou=groups,dc=example,dc=com"],
+        aws_auth_validate_ldap_query:literal_dns(Q)
+    ).
+
+literal_dns_skips_placeholder_test() ->
+    %% A DN with a ${...} placeholder is runtime-filled, not literal, so it
+    %% contributes no static reachability check.
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{in_group, \"cn=${username},ou=groups,dc=example,dc=com\"}">>
+    ),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_constant_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(<<"{constant, true}">>),
+    ?assertEqual([], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_nested_and_or_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{'or', [{in_group, \"cn=a,dc=x\"}, {'and', [{in_group, \"cn=b,dc=x\"}]}]}">>
+    ),
+    ?assertEqual(
+        ["cn=a,dc=x", "cn=b,dc=x"],
+        aws_auth_validate_ldap_query:literal_dns(Q)
+    ).
+
+literal_dns_tag_queries_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"[{administrator, {in_group, \"cn=admins,dc=x\"}}, {management, {constant, true}}]">>
+    ),
+    ?assertEqual(["cn=admins,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_exists_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(<<"{exists, \"ou=users,dc=x\"}">>),
+    ?assertEqual(["ou=users,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+literal_dns_for_test() ->
+    {ok, Q} = aws_auth_validate_ldap_query:parse(
+        <<"{for, [{permission, configure, {in_group, \"cn=cfg,dc=x\"}}]}">>
+    ),
+    ?assertEqual(["cn=cfg,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
+
+%% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
+%% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
+%% returns {error, _}. Assert both classify each corpus entry the same way.
+%% Skipped gracefully if the upstream module is not on the code path.
+parity_test_() ->
+    case code:ensure_loaded(rabbit_auth_backend_ldap_util) of
+        {module, _} ->
+            [
+                {
+                    binary_to_list(Q),
+                    ?_assertEqual(upstream_accepts(Q), ours_accepts(Q))
+                }
+             || Q <- accepted_queries() ++ rejected_queries()
+            ];
+        {error, _} ->
+            []
+    end.
+
+%%--------------------------------------------------------------------
 %% Helpers
 %%--------------------------------------------------------------------
 
@@ -312,8 +397,11 @@ wait_until_zero(0) ->
     ?assertEqual(0, aws_auth_validate_semaphore:current());
 wait_until_zero(N) ->
     case aws_auth_validate_semaphore:current() of
-        0 -> ok;
-        _ -> timer:sleep(10), wait_until_zero(N - 1)
+        0 ->
+            ok;
+        _ ->
+            timer:sleep(10),
+            wait_until_zero(N - 1)
     end.
 
 %% A minimally-valid body for the pure validation pipeline. Note: the tests
@@ -327,3 +415,53 @@ base_body(Overrides) when is_map(Overrides) ->
         <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111111111111:secret:x">>
     },
     maps:merge(Base, Overrides).
+
+%% Query corpus shared by the parser accept/reject tests and the parity test.
+
+%% Queries the broker accepts. Kept in sync with the parity test.
+accepted_queries() ->
+    [
+        <<"{constant, true}">>,
+        <<"{constant, false}">>,
+        <<"{in_group, \"cn=admins,ou=groups,dc=example,dc=com\"}">>,
+        <<"{in_group, \"cn=g,dc=example,dc=com\", \"member\"}">>,
+        <<"{in_group_nested, \"cn=g,dc=example,dc=com\", \"member\"}">>,
+        <<"{'not', {constant, true}}">>,
+        <<"{'and', [{constant, true}, {constant, false}]}">>,
+        <<"{'or', [{constant, true}, {constant, false}]}">>,
+        <<"{equals, \"${username}\", \"admin\"}">>,
+        <<"{match, \"${username}\", \"^a.*\"}">>,
+        <<"{for, [{permission, configure, {constant, true}}]}">>,
+        %% tag_queries form: a list of {Tag, SubQuery} pairs.
+        <<"[{administrator, {in_group, \"cn=admins,dc=example,dc=com\"}}]">>,
+        %% trailing dot already present
+        <<"{constant, true}.">>,
+        %% A bare quoted string parses to an Erlang list, so it hits the
+        %% is_list/1 (tag_queries) clause in BOTH parsers. Included here to
+        %% pin that parity quirk rather than to endorse it as a useful query.
+        <<"\"just a string\"">>
+    ].
+
+rejected_queries() ->
+    [
+        <<"{garbage,">>,
+        <<"not even erlang">>,
+        <<"{bogus_term, 1, 2}">>,
+        <<"42">>,
+        <<>>
+    ].
+
+ours_accepts(Q) ->
+    case aws_auth_validate_ldap_query:parse(Q) of
+        {ok, _} -> true;
+        {error, _} -> false
+    end.
+
+upstream_accepts(Q) ->
+    try rabbit_auth_backend_ldap_util:parse_query(Q) of
+        %% cuttlefish:invalid/2 throws on rejection; any throw/exit means the
+        %% upstream parser rejected the query.
+        _ -> true
+    catch
+        _:_ -> false
+    end.

@@ -54,23 +54,32 @@ current() ->
 init(Config) when is_map(Config) ->
     {ok, #sem_state{max = maps:get(max, Config, ?DEFAULT_MAX)}}.
 
-handle_call(acquire, _From, #sem_state{max = Max, current = Current} = State)
-    when Current >= Max ->
+handle_call(acquire, _From, #sem_state{max = Max, current = Current} = State) when
+    Current >= Max
+->
     {reply, {error, full}, State};
-handle_call(acquire, {Pid, _Tag}, #sem_state{
-    current = Current,
-    holders = Holders0
-} = State) ->
+handle_call(
+    acquire,
+    {Pid, _Tag},
+    #sem_state{
+        current = Current,
+        holders = Holders0
+    } = State
+) ->
     Ref = erlang:monitor(process, Pid),
     Holders1 = maps:put(Ref, Pid, Holders0),
     {reply, {ok, Ref}, State#sem_state{
         current = Current + 1,
         holders = Holders1
     }};
-handle_call({release, Ref}, _From, #sem_state{
-    current = Current,
-    holders = Holders0
-} = State) ->
+handle_call(
+    {release, Ref},
+    _From,
+    #sem_state{
+        current = Current,
+        holders = Holders0
+    } = State
+) ->
     case maps:take(Ref, Holders0) of
         {_Pid, Holders1} ->
             erlang:demonitor(Ref, [flush]),
@@ -90,10 +99,13 @@ handle_call(_Request, _From, State) ->
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
-handle_info({'DOWN', Ref, process, _Pid, _Reason}, #sem_state{
-    current = Current,
-    holders = Holders0
-} = State) ->
+handle_info(
+    {'DOWN', Ref, process, _Pid, _Reason},
+    #sem_state{
+        current = Current,
+        holders = Holders0
+    } = State
+) ->
     case maps:take(Ref, Holders0) of
         {_Holder, Holders1} ->
             {noreply, State#sem_state{

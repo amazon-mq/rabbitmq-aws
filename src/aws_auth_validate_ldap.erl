@@ -283,16 +283,18 @@ check_config_conflicts(_) ->
 %% LDAP execution
 %%--------------------------------------------------------------------
 
-do_ldap_validate(#{
-    servers := Servers,
-    port := Port,
-    user_dn := UserDn,
-    password := Password,
-    use_ssl := UseSsl,
-    use_starttls := UseStartTls,
-    ssl_options := SslOpts,
-    timeout := Timeout
-} = Params) ->
+do_ldap_validate(
+    #{
+        servers := Servers,
+        port := Port,
+        user_dn := UserDn,
+        password := Password,
+        use_ssl := UseSsl,
+        use_starttls := UseStartTls,
+        ssl_options := SslOpts,
+        timeout := Timeout
+    } = Params
+) ->
     OpenOpts = [{port, Port}, {timeout, Timeout}] ++ ssl_open_opts(UseSsl, SslOpts),
     case eldap:open(Servers, OpenOpts) of
         {error, _Reason} ->
@@ -408,7 +410,8 @@ build_ssl_opts(Map) when is_map(Map) ->
     lists:foldl(
         fun({SslKey, JsonKey, Fun}, Acc) ->
             case maps:get(JsonKey, Map, undefined) of
-                undefined -> Acc;
+                undefined ->
+                    Acc;
                 Value ->
                     case (catch Fun(Value)) of
                         {'EXIT', _} -> Acc;
@@ -435,8 +438,7 @@ to_versions(L) when is_list(L) ->
 decode_pem_cacerts(B) when is_binary(B) ->
     case public_key:pem_decode(B) of
         [] -> skip;
-        Entries ->
-            [public_key:pem_entry_decode(E) || E <- Entries]
+        Entries -> [public_key:pem_entry_decode(E) || E <- Entries]
     end.
 
 resolve_and_decode_pem_cacerts(Arn) when is_binary(Arn) ->
