@@ -50,5 +50,19 @@ jobs:
       - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           path: rabbitmq-server/deps/aws
+      # OpenLDAP is required by aws_auth_validate_ldap_SUITE. Without it
+      # that suite skips itself; installing slapd lets it run for real.
+      - name: Set up OpenLDAP (slapd) for the LDAP validation suite
+        run: |
+          sudo apt-get update && \
+          sudo apt-get install -y \
+            ldap-utils \
+            slapd \
+            util-linux
+          # The suite starts and configures its own slapd instance, so stop
+          # and disable the system one (and AppArmor, which confines slapd).
+          sudo systemctl stop slapd
+          sudo aa-teardown || true
+          sudo systemctl disable --now apparmor.service || true
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws tests
