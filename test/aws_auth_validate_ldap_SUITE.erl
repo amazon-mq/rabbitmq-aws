@@ -87,8 +87,21 @@ init_per_suite(Config) ->
     {ok, _} = application:ensure_all_started(eldap),
     case start_slapd(Config) of
         {skip, _} = Skip ->
+            %% Clean user-skip: nothing was started, so this is harmless and
+            %% ct_run exits 0.
             Skip;
         Config1 ->
+            %% slapd is up. Seed the directory -- but eldap:open/1 uses
+            %% spawn_link, so a connection process that dies mid-seed sends a
+            %% LINKED EXIT SIGNAL to this process. Without trap_exit that
+            %% signal kills init_per_suite directly (it is not an exception,
+            %% so the try/catch below would NOT catch it), and Common Test
+            %% records the cases as auto-skipped -> ct_run returns a non-zero
+            %% exit even with "0 failed". Trap exits so a linked eldap death
+            %% becomes a catchable failure that we convert into a clean
+            %% {skip, _}; every non-success path here must RETURN {skip, _},
+            %% never crash.
+            Prev = process_flag(trap_exit, true),
             try
                 ok = seed(?config(ldap_port, Config1)),
                 Config1
@@ -97,7 +110,21 @@ init_per_suite(Config) ->
                     ct:pal("LDAP seed failed: ~p:~p~n~p", [Class, Reason, St]),
                     stop_slapd(Config1),
                     {skip, "Failed to seed slapd directory"}
+            after
+                %% Drain any linked-exit messages the seeding left behind so a
+                %% late one cannot surface during a later testcase, then
+                %% restore the original trap_exit setting.
+                flush_exits(),
+                process_flag(trap_exit, Prev)
             end
+    end.
+
+%% Drain pending {'EXIT', _, _} messages (from linked eldap connection
+%% processes) so they don't leak into subsequent test execution.
+flush_exits() ->
+    receive
+        {'EXIT', _, _} -> flush_exits()
+    after 0 -> ok
     end.
 
 end_per_suite(Config) ->
