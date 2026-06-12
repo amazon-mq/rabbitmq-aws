@@ -125,10 +125,13 @@ parity_test_() ->
     case code:ensure_loaded(rabbit_auth_backend_ldap_util) of
         {module, _} ->
             [
-                {binary_to_list(Q), ?_assertEqual(
-                    upstream_accepts(Q),
-                    ours_accepts(Q)
-                )}
+                {
+                    binary_to_list(Q),
+                    ?_assertEqual(
+                        upstream_accepts(Q),
+                        ours_accepts(Q)
+                    )
+                }
              || Q <- accepted_queries() ++ rejected_queries()
             ];
         {error, _} ->

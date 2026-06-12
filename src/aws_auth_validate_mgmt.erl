@@ -70,15 +70,27 @@ is_authorized(ReqData, Context) ->
 %%--------------------------------------------------------------------
 
 accept_content(Req0, Context) ->
-    T0 = erlang:monotonic_time(millisecond),
-    SourceIP = peer_ip(Req0),
-    Method = cowboy_req:binding(method, Req0),
-    case aws_auth_validate_rate_limiter:check(SourceIP) of
-        {error, rate_limited} ->
-            audit(Method, SourceIP, rate_limited, T0),
-            reply_error(429, rate_limited, <<"Rate limit exceeded">>, Req0, Context);
-        ok ->
-            with_body(T0, SourceIP, Method, Req0, Context)
+    %% Enforce the feature toggle here, before touching any worker. For a PUT,
+    %% cowboy_rest routes resource_exists/2 -> false into the create path
+    %% (accept_content), NOT a 404 -- so resource_exists alone does not gate
+    %% the endpoint. When the feature is disabled, aws_sup starts no
+    %% rate_limiter/semaphore workers, so reaching the pipeline below would
+    %% gen_server:call a non-existent process and crash (HTTP 500). Short-
+    %% circuit to 404 instead, matching the documented toggle behaviour.
+    case feature_enabled() of
+        false ->
+            reply_error(404, method_disabled, <<"Validation method disabled">>, Req0, Context);
+        true ->
+            T0 = erlang:monotonic_time(millisecond),
+            SourceIP = peer_ip(Req0),
+            Method = cowboy_req:binding(method, Req0),
+            case aws_auth_validate_rate_limiter:check(SourceIP) of
+                {error, rate_limited} ->
+                    audit(Method, SourceIP, rate_limited, T0),
+                    reply_error(429, rate_limited, <<"Rate limit exceeded">>, Req0, Context);
+                ok ->
+                    with_body(T0, SourceIP, Method, Req0, Context)
+            end
     end.
 
 with_body(T0, SourceIP, Method, Req0, Context) ->
@@ -96,7 +108,9 @@ with_body(T0, SourceIP, Method, Req0, Context) ->
                     with_semaphore(T0, SourceIP, Method, BodyMap, Req1, Context);
                 {ok, _NotMap} ->
                     audit(Method, SourceIP, input_invalid, T0),
-                    reply_error(400, input_invalid, <<"JSON body must be an object">>, Req1, Context)
+                    reply_error(
+                        400, input_invalid, <<"JSON body must be an object">>, Req1, Context
+                    )
             end
     end.
 
