@@ -11,10 +11,14 @@
 -module(aws_auth_validate_mgmt_SUITE).
 
 -export([
-    all/0, groups/0,
-    init_per_suite/1, end_per_suite/1,
-    init_per_group/2, end_per_group/2,
-    init_per_testcase/2, end_per_testcase/2
+    all/0,
+    groups/0,
+    init_per_suite/1,
+    end_per_suite/1,
+    init_per_group/2,
+    end_per_group/2,
+    init_per_testcase/2,
+    end_per_testcase/2
 ]).
 
 -export([
@@ -31,6 +35,9 @@
     get_returns_405/1,
     password_not_in_response/1
 ]).
+
+%% Invoked on the broker node via rpc to hold a semaphore slot.
+-export([hold_slot/1]).
 
 -include_lib("common_test/include/ct.hrl").
 -include_lib("eunit/include/eunit.hrl").
@@ -92,18 +99,21 @@ end_per_group(_Group, Config) ->
     ).
 
 init_per_testcase(method_disabled_returns_404 = TC, Config) ->
+    reset_rate_limiter(Config),
     rabbit_ct_broker_helpers:rpc(
-        Config, 0, application, set_env,
+        Config,
+        0,
+        application,
+        set_env,
         [aws, auth_validation_enabled_methods, [{<<"ldap">>, false}]]
     ),
     rabbit_ct_helpers:testcase_started(Config, TC);
-init_per_testcase(rate_limit_returns_429 = TC, Config) ->
-    %% Reset the rate limiter so prior tests can't interfere.
-    catch rabbit_ct_broker_helpers:rpc(
-        Config, 0, aws_auth_validate_rate_limiter, reset, []
-    ),
-    rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(TC, Config) ->
+    %% Reset the per-IP rate limiter before every case so no case inherits
+    %% another's token consumption (the feature_enabled group allows only 3
+    %% requests/window, and all CT traffic shares source IP 127.0.0.1).
+    %% rate_limit_returns_429 deliberately exhausts its own fresh budget.
+    reset_rate_limiter(Config),
     rabbit_ct_helpers:testcase_started(Config, TC).
 
 end_per_testcase(method_disabled_returns_404 = TC, Config) ->
@@ -157,29 +167,34 @@ missing_servers_returns_400(Config) ->
 
 rate_limit_returns_429(Config) ->
     %% rate limit window=60s, max=3 (configured in init_per_group)
-    Body = (base_body())#{<<"servers">> => [<<"127.0.0.1">>], <<"port">> => 1}, %% guaranteed-fail port
+
+    %% guaranteed-fail port
+    Body = (base_body())#{<<"servers">> => [<<"127.0.0.1">>], <<"port">> => 1},
     %% three requests should all proceed past rate limit; fourth gets 429
     [_ = put_request(Config, ?API, Body) || _ <- lists:seq(1, 3)],
     {ok, {{_, Code, _}, _, _}} = put_request(Config, ?API, Body),
     ?assertEqual(429, Code).
 
 capacity_exhausted_returns_503(Config) ->
-    %% Hold the only semaphore slot, then make a request and expect 503.
-    catch rabbit_ct_broker_helpers:rpc(
-        Config, 0, aws_auth_validate_rate_limiter, reset, []
-    ),
-    {ok, _Ref} = rabbit_ct_broker_helpers:rpc(
-        Config, 0, aws_auth_validate_semaphore, acquire, []
-    ),
+    %% Hold the only semaphore slot for the duration of the HTTP request.
+    %%
+    %% A plain rpc(..., aws_auth_validate_semaphore, acquire, []) does NOT
+    %% work: erpc runs acquire/0 in a transient worker process that exits as
+    %% soon as the call returns, and the semaphore monitors its holder and
+    %% auto-releases the slot on that worker's DOWN -- so the slot would be
+    %% free again before our request arrives. Instead spawn a long-lived
+    %% holder process ON THE BROKER NODE (via ?MODULE:hold_slot/1, which puts
+    %% this suite on the broker's code path) that acquires and then blocks
+    %% until told to release.
+    Holder = rabbit_ct_broker_helpers:rpc(Config, 0, ?MODULE, hold_slot, [self()]),
+    ok = wait_for_current(Config, 1, 50),
     try
         Body = base_body(),
         {ok, {{_, Code, _}, _, _}} = put_request(Config, ?API, Body),
         ?assertEqual(503, Code)
     after
-        rabbit_ct_broker_helpers:rpc(
-            Config, 0, application, set_env,
-            [aws, auth_validation_max_concurrent, 1]
-        )
+        Holder ! release,
+        _ = wait_for_current(Config, 0, 50)
     end.
 
 method_disabled_returns_404(Config) ->
@@ -189,7 +204,10 @@ method_disabled_returns_404(Config) ->
 
 options_returns_allowed_methods(Config) ->
     {ok, {{_, Code, _}, Headers, _}} = rabbit_mgmt_test_util:req(
-        Config, 0, options, ?API,
+        Config,
+        0,
+        options,
+        ?API,
         [rabbit_mgmt_test_util:auth_header("guest", "guest")]
     ),
     ?assertEqual(200, Code),
@@ -199,7 +217,10 @@ options_returns_allowed_methods(Config) ->
 
 get_returns_405(Config) ->
     {ok, {{_, Code, _}, _, _}} = rabbit_mgmt_test_util:req(
-        Config, 0, get, ?API,
+        Config,
+        0,
+        get,
+        ?API,
         [rabbit_mgmt_test_util:auth_header("guest", "guest")]
     ),
     ?assertEqual(405, Code).
@@ -207,9 +228,11 @@ get_returns_405(Config) ->
 password_not_in_response(Config) ->
     %% Property 6: response body must never contain the submitted password.
     Password = <<"super-secret-pAssw0rd!">>,
-    Body = (base_body())#{<<"password">> => Password,
-                          <<"servers">> => [<<"127.0.0.1">>],
-                          <<"port">> => 1},
+    Body = (base_body())#{
+        <<"password">> => Password,
+        <<"servers">> => [<<"127.0.0.1">>],
+        <<"port">> => 1
+    },
     {ok, {{_, _Code, _}, _, ResBody}} = put_request(Config, ?API, Body),
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Password)).
 
@@ -227,6 +250,40 @@ setup_broker(Config0, ExtraEnv) ->
         rabbit_ct_broker_helpers:setup_steps()
     ).
 
+%% Reset the per-IP rate limiter. Wrapped in catch because the
+%% feature_disabled group starts no limiter process (nothing to reset).
+reset_rate_limiter(Config) ->
+    catch rabbit_ct_broker_helpers:rpc(
+        Config, 0, aws_auth_validate_rate_limiter, reset, []
+    ),
+    ok.
+
+%% Runs ON THE BROKER NODE (invoked via rpc with Module=?MODULE). Spawns a
+%% persistent process that acquires the only semaphore slot and blocks until
+%% told to release, so the slot stays held across an HTTP request issued from
+%% the CT node. Returns the holder pid (on the broker node).
+hold_slot(Parent) ->
+    spawn(fun() ->
+        {ok, _Ref} = aws_auth_validate_semaphore:acquire(),
+        Parent ! slot_held,
+        receive
+            release -> ok
+        after 30_000 -> ok
+        end
+    end).
+
+%% Poll the semaphore's current holder count until it reaches Target.
+wait_for_current(_Config, Target, 0) ->
+    {error, {timeout_waiting_for_current, Target}};
+wait_for_current(Config, Target, N) ->
+    case rabbit_ct_broker_helpers:rpc(Config, 0, aws_auth_validate_semaphore, current, []) of
+        Target ->
+            ok;
+        _ ->
+            timer:sleep(20),
+            wait_for_current(Config, Target, N - 1)
+    end.
+
 base_body() ->
     #{
         <<"servers">> => [<<"127.0.0.1">>],
@@ -238,7 +295,10 @@ base_body() ->
 put_request(Config, Path, BodyMap) ->
     Body = binary_to_list(rabbit_json:encode(BodyMap)),
     rabbit_mgmt_test_util:req(
-        Config, 0, put, Path,
+        Config,
+        0,
+        put,
+        Path,
         [
             rabbit_mgmt_test_util:auth_header("guest", "guest"),
             {"content-type", "application/json"}
