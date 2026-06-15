@@ -373,10 +373,19 @@ literal_dns_for_test() ->
 %% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
 %% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
 %% returns {error, _}. Assert both classify each corpus entry the same way.
-%% Skipped gracefully if the upstream module is not on the code path.
+%%
+%% Runs only when upstream parse_query/1 is actually usable in this node.
+%% It is not enough that the module loads: parse_query/1 calls
+%% rabbit_data_coercion (and cuttlefish:invalid on rejection), and across
+%% the RMQ-version CI matrix those deps are not always loaded in the bare
+%% eunit node. If they are missing, every parse_query/1 call throws undef
+%% and upstream_accepts/1 would report "rejected" for EVERYTHING, making the
+%% test fail spuriously. So we probe upstream with a known-good and a
+%% known-bad query first and skip the whole parity check unless upstream
+%% classifies both correctly.
 parity_test_() ->
-    case code:ensure_loaded(rabbit_auth_backend_ldap_util) of
-        {module, _} ->
+    case upstream_parser_usable() of
+        true ->
             [
                 {
                     binary_to_list(Q),
@@ -384,9 +393,17 @@ parity_test_() ->
                 }
              || Q <- accepted_queries() ++ rejected_queries()
             ];
-        {error, _} ->
+        false ->
             []
     end.
+
+%% True only if rabbit_auth_backend_ldap_util:parse_query/1 is loaded AND its
+%% transitive deps are available, verified by a positive+negative probe.
+upstream_parser_usable() ->
+    code:ensure_loaded(rabbit_auth_backend_ldap_util) =/= {error, nofile} andalso
+        erlang:function_exported(rabbit_auth_backend_ldap_util, parse_query, 1) andalso
+        upstream_accepts(<<"{constant, true}">>) andalso
+        not upstream_accepts(<<"{bogus_term, 1, 2}">>).
 
 %%--------------------------------------------------------------------
 %% Helpers
