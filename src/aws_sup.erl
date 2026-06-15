@@ -16,10 +16,80 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
+    %% Tolerate a few transient worker crashes before giving up: a single
+    %% restart within 5s (intensity => 1) would tear down the whole
+    %% supervisor -- and with it ARN resolution -- on a second crash. The
+    %% validation workers are independent gen_servers, so allow several
+    %% restarts in a slightly wider window before escalating.
     SupFlags = #{
         strategy => one_for_one,
-        intensity => 1,
-        period => 5
+        intensity => 5,
+        period => 10
     },
-    ChildSpecs = [],
+    ChildSpecs = auth_validation_children(),
     {ok, {SupFlags, ChildSpecs}}.
+
+%%--------------------------------------------------------------------
+%% Auth validation feature: workers are started only when the feature
+%% toggle is on. With the toggle off, the supervisor remains empty and
+%% the validation route returns 404, leaving the rest of the plugin
+%% (ARN resolution) entirely undisturbed.
+%%--------------------------------------------------------------------
+
+auth_validation_children() ->
+    case application:get_env(aws, auth_validation_enabled, false) of
+        true -> [rate_limiter_spec(), semaphore_spec(), arn_lock_spec()];
+        _ -> []
+    end.
+
+rate_limiter_spec() ->
+    Config = rate_limiter_config(),
+    #{
+        id => aws_auth_validate_rate_limiter,
+        start => {aws_auth_validate_rate_limiter, start_link, [Config]},
+        restart => permanent,
+        shutdown => 5_000,
+        type => worker,
+        modules => [aws_auth_validate_rate_limiter]
+    }.
+
+semaphore_spec() ->
+    Config = semaphore_config(),
+    #{
+        id => aws_auth_validate_semaphore,
+        start => {aws_auth_validate_semaphore, start_link, [Config]},
+        restart => permanent,
+        shutdown => 5_000,
+        type => worker,
+        modules => [aws_auth_validate_semaphore]
+    }.
+
+%% Serializes ARN resolution so concurrent validations cannot clobber the
+%% shared rabbitmq_aws region/credential singleton mid-resolve.
+arn_lock_spec() ->
+    #{
+        id => aws_auth_validate_arn_lock,
+        start => {aws_auth_validate_arn_lock, start_link, []},
+        restart => permanent,
+        shutdown => 5_000,
+        type => worker,
+        modules => [aws_auth_validate_arn_lock]
+    }.
+
+rate_limiter_config() ->
+    WindowSecs = get_int_env(auth_validation_rate_limit_window_seconds, 60),
+    Max = get_int_env(auth_validation_rate_limit_max_requests, 10),
+    #{
+        window_ms => WindowSecs * 1_000,
+        max_per_window => Max,
+        sweep_interval_ms => max(WindowSecs * 1_000 div 2, 1_000)
+    }.
+
+semaphore_config() ->
+    #{max => get_int_env(auth_validation_max_concurrent, 5)}.
+
+get_int_env(Key, Default) ->
+    case application:get_env(aws, Key) of
+        {ok, N} when is_integer(N), N > 0 -> N;
+        _ -> Default
+    end.

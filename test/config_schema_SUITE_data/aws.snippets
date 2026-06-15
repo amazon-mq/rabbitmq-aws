@@ -100,5 +100,45 @@
             ]}
          ]}
         ],
-        [aws_arn_config]}
+        [aws_arn_config]},
+
+    {aws_auth_validation_enabled,
+        "aws.auth_validation.enabled = true",
+        [{aws, [{auth_validation_enabled, true}]}],
+        [aws_auth_validation_enabled]},
+
+    {aws_auth_validation_max_concurrent,
+        "aws.auth_validation.max_concurrent = 8",
+        [{aws, [{auth_validation_max_concurrent, 8}]}],
+        [aws_auth_validation_max_concurrent]},
+
+    {aws_auth_validation_max_body_size,
+        "aws.auth_validation.max_body_size = 32768",
+        [{aws, [{auth_validation_max_body_size, 32768}]}],
+        [aws_auth_validation_max_body_size]},
+
+    {aws_auth_validation_connection_timeout_ms,
+        "aws.auth_validation.connection_timeout_ms = 7000",
+        [{aws, [{auth_validation_connection_timeout_ms, 7000}]}],
+        [aws_auth_validation_connection_timeout_ms]},
+
+    {aws_auth_validation_rate_limit_window_seconds,
+        "aws.auth_validation.rate_limit.window_seconds = 30",
+        [{aws, [{auth_validation_rate_limit_window_seconds, 30}]}],
+        [aws_auth_validation_rate_limit_window_seconds]},
+
+    {aws_auth_validation_rate_limit_max_requests,
+        "aws.auth_validation.rate_limit.max_requests = 25",
+        [{aws, [{auth_validation_rate_limit_max_requests, 25}]}],
+        [aws_auth_validation_rate_limit_max_requests]},
+
+    {aws_auth_validation_required_user_tag,
+        "aws.auth_validation.required_user_tag = monitoring",
+        [{aws, [{auth_validation_required_user_tag, monitoring}]}],
+        [aws_auth_validation_required_user_tag]},
+
+    {aws_auth_validation_enabled_methods,
+        "aws.auth_validation.enabled_methods.ldap = true",
+        [{aws, [{auth_validation_enabled_methods, [{<<"ldap">>, true}]}]}],
+        [aws_auth_validation_enabled_methods]}
 ].
