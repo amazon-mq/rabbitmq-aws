@@ -74,17 +74,13 @@ scan(Str) ->
 %% Anything not matched here is rejected rather than passed to the backend.
 accept({constant, B} = T) when is_boolean(B) -> {ok, T};
 accept({in_group, _} = T) -> {ok, T};
-accept({in_group, _, _} = T) -> {ok, T};
 accept({in_group_nested, _, _} = T) -> {ok, T};
-accept({in_group_nested, _, _, _} = T) -> {ok, T};
 accept({for, Q} = T) when is_list(Q) -> {ok, T};
 accept({'not', _} = T) -> {ok, T};
 accept({'and', Q} = T) when is_list(Q) -> {ok, T};
 accept({'or', Q} = T) when is_list(Q) -> {ok, T};
 accept({equals, _, _} = T) -> {ok, T};
 accept({match, _, _} = T) -> {ok, T};
-accept({exists, _} = T) -> {ok, T};
-accept({attribute, _, _} = T) -> {ok, T};
 %% tag_queries are expressed as a list of {Tag, SubQuery} pairs.
 accept(T) when is_list(T) -> {ok, T};
 accept(_) -> {error, <<"unrecognised query expression">>}.

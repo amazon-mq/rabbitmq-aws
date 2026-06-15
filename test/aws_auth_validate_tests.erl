@@ -356,8 +356,13 @@ literal_dns_tag_queries_test() ->
     ?assertEqual(["cn=admins,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
 
 literal_dns_exists_test() ->
-    {ok, Q} = aws_auth_validate_ldap_query:parse(<<"{exists, \"ou=users,dc=x\"}">>),
-    ?assertEqual(["ou=users,dc=x"], aws_auth_validate_ldap_query:literal_dns(Q)).
+    %% parse/1 rejects {exists,_} (parse_query/1 does not allow it), but
+    %% literal_dns/1 still walks the term defensively, so test it on a
+    %% directly-constructed term rather than via parse/1.
+    ?assertEqual(
+        ["ou=users,dc=x"],
+        aws_auth_validate_ldap_query:literal_dns({exists, "ou=users,dc=x"})
+    ).
 
 literal_dns_for_test() ->
     {ok, Q} = aws_auth_validate_ldap_query:parse(
@@ -424,7 +429,6 @@ accepted_queries() ->
         <<"{constant, true}">>,
         <<"{constant, false}">>,
         <<"{in_group, \"cn=admins,ou=groups,dc=example,dc=com\"}">>,
-        <<"{in_group, \"cn=g,dc=example,dc=com\", \"member\"}">>,
         <<"{in_group_nested, \"cn=g,dc=example,dc=com\", \"member\"}">>,
         <<"{'not', {constant, true}}">>,
         <<"{'and', [{constant, true}, {constant, false}]}">>,
@@ -448,7 +452,12 @@ rejected_queries() ->
         <<"not even erlang">>,
         <<"{bogus_term, 1, 2}">>,
         <<"42">>,
-        <<>>
+        <<>>,
+        %% Forms the runtime evaluator handles but parse_query/1 (the config
+        %% gate we mirror) rejects, so the endpoint rejects them too.
+        <<"{in_group, \"cn=g,dc=example,dc=com\", \"member\"}">>,
+        <<"{exists, \"ou=users,dc=example,dc=com\"}">>,
+        <<"{attribute, \"cn=g,dc=example,dc=com\", \"member\"}">>
     ].
 
 ours_accepts(Q) ->
