@@ -8,8 +8,8 @@
 %% Implements the rabbit_mgmt_extension behaviour so the route is
 %% mounted automatically by the management plugin. Each request flows
 %% through a fixed pipeline: feature toggle -> management auth -> user
-%% tag gate -> per-IP rate limit -> body size cap -> JSON decode ->
-%% concurrency semaphore -> registry dispatch -> audit log -> response.
+%% tag gate -> body size cap -> JSON decode -> concurrency semaphore ->
+%% registry dispatch -> audit log -> response.
 -module(aws_auth_validate_mgmt).
 
 -behaviour(rabbit_mgmt_extension).
@@ -74,9 +74,9 @@ accept_content(Req0, Context) ->
     %% cowboy_rest routes resource_exists/2 -> false into the create path
     %% (accept_content), NOT a 404 -- so resource_exists alone does not gate
     %% the endpoint. When the feature is disabled, aws_sup starts no
-    %% rate_limiter/semaphore workers, so reaching the pipeline below would
-    %% gen_server:call a non-existent process and crash (HTTP 500). Short-
-    %% circuit to 404 instead, matching the documented toggle behaviour.
+    %% semaphore worker, so reaching the pipeline below would gen_server:call
+    %% a non-existent process and crash (HTTP 500). Short-circuit to 404
+    %% instead, matching the documented toggle behaviour.
     case feature_enabled() of
         false ->
             reply_error(404, method_disabled, <<"Validation method disabled">>, Req0, Context);
@@ -84,14 +84,37 @@ accept_content(Req0, Context) ->
             T0 = erlang:monotonic_time(millisecond),
             SourceIP = peer_ip(Req0),
             Method = cowboy_req:binding(method, Req0),
-            case aws_auth_validate_rate_limiter:check(SourceIP) of
-                {error, rate_limited} ->
-                    audit(Method, SourceIP, rate_limited, T0),
-                    reply_error(429, rate_limited, <<"Rate limit exceeded">>, Req0, Context);
-                ok ->
+            %% The semaphore worker is started by aws_sup only at boot, when
+            %% the feature was already enabled. If the env was flipped to true
+            %% at runtime (no restart), or the supervisor exhausted its restart
+            %% intensity and gave up on the worker, feature_enabled/0 reads true
+            %% but no semaphore process is registered. Acquiring would then
+            %% gen_server:call a non-existent name and exit with noproc -> the
+            %% acquire is outside with_semaphore/6's try, so that surfaces as an
+            %% opaque HTTP 500. Detect the missing worker and return a graceful
+            %% 503 instead: the endpoint is enabled in config but not serviceable
+            %% until the broker is restarted.
+            case workers_ready() of
+                false ->
+                    audit(Method, SourceIP, capacity_exhausted, T0),
+                    reply_error(
+                        503,
+                        capacity_exhausted,
+                        <<"Validation service is not ready; broker restart required">>,
+                        Req0,
+                        Context
+                    );
+                true ->
                     with_body(T0, SourceIP, Method, Req0, Context)
             end
     end.
+
+%% The endpoint is serviceable only if its semaphore worker is actually
+%% running (see accept_content/2 for why feature_enabled/0 alone is not
+%% enough). Checked via whereis rather than a try around acquire so the
+%% failure is caught before any request body is read.
+workers_ready() ->
+    is_pid(erlang:whereis(aws_auth_validate_semaphore)).
 
 with_body(T0, SourceIP, Method, Req0, Context) ->
     MaxBytes = max_body_size(),
@@ -189,6 +212,14 @@ result_category({error, Category, _Reason}) -> Category.
 %% Operator-configured non-administrator tag gating. The default
 %% (administrator) is handled in is_authorized/2 via the management
 %% plugin's helper, which already handles oauth tokens etc.
+%%
+%% An OPTIONS preflight reaches is_authorized/2 too, but rabbit_mgmt_util
+%% short-circuits OPTIONS to {true, _, Context} WITHOUT authenticating, so
+%% Context#context.user is `undefined'. Let that case through (the admin
+%% path does the same) so a CORS preflight is not rejected with a spurious
+%% 401 -- there is no body to act on, and the actual PUT is still gated.
+authorize_tag(_Tag, ReqData, #context{user = undefined} = Context) ->
+    {true, ReqData, Context};
 authorize_tag(Tag, ReqData, #context{user = #user{tags = Tags}} = Context) ->
     case lists:member(Tag, Tags) of
         true -> {true, ReqData, Context};

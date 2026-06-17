@@ -16,11 +16,10 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    %% Tolerate a few transient worker crashes before giving up: a single
-    %% restart within 5s (intensity => 1) would tear down the whole
-    %% supervisor -- and with it ARN resolution -- on a second crash. The
-    %% validation workers are independent gen_servers, so allow several
-    %% restarts in a slightly wider window before escalating.
+    %% Tolerate a few transient worker crashes before giving up: a very low
+    %% intensity would tear down the whole supervisor on a second crash in a
+    %% short window. The validation worker is an independent gen_server, so
+    %% allow several restarts in a slightly wider window before escalating.
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
@@ -38,21 +37,14 @@ init([]) ->
 
 auth_validation_children() ->
     case application:get_env(aws, auth_validation_enabled, false) of
-        true -> [rate_limiter_spec(), semaphore_spec(), arn_lock_spec()];
+        true -> [semaphore_spec()];
         _ -> []
     end.
 
-rate_limiter_spec() ->
-    Config = rate_limiter_config(),
-    #{
-        id => aws_auth_validate_rate_limiter,
-        start => {aws_auth_validate_rate_limiter, start_link, [Config]},
-        restart => permanent,
-        shutdown => 5_000,
-        type => worker,
-        modules => [aws_auth_validate_rate_limiter]
-    }.
-
+%% The concurrency semaphore bounds simultaneous outbound LDAP connections;
+%% it is the endpoint's primary, topology-independent backpressure. (ARN
+%% resolution is serialized by aws_auth_validate_arn_lock, which is a
+%% global:trans/4 lock and needs no supervised process.)
 semaphore_spec() ->
     Config = semaphore_config(),
     #{
@@ -62,27 +54,6 @@ semaphore_spec() ->
         shutdown => 5_000,
         type => worker,
         modules => [aws_auth_validate_semaphore]
-    }.
-
-%% Serializes ARN resolution so concurrent validations cannot clobber the
-%% shared rabbitmq_aws region/credential singleton mid-resolve.
-arn_lock_spec() ->
-    #{
-        id => aws_auth_validate_arn_lock,
-        start => {aws_auth_validate_arn_lock, start_link, []},
-        restart => permanent,
-        shutdown => 5_000,
-        type => worker,
-        modules => [aws_auth_validate_arn_lock]
-    }.
-
-rate_limiter_config() ->
-    WindowSecs = get_int_env(auth_validation_rate_limit_window_seconds, 60),
-    Max = get_int_env(auth_validation_rate_limit_max_requests, 10),
-    #{
-        window_ms => WindowSecs * 1_000,
-        max_per_window => Max,
-        sweep_interval_ms => max(WindowSecs * 1_000 div 2, 1_000)
     }.
 
 semaphore_config() ->

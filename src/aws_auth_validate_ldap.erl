@@ -17,7 +17,14 @@
 %%
 %%   * DN lookup -- when `dn_lookup_base' is supplied, confirms the base
 %%     DN exists and is readable by the bound user. `dn_lookup_attribute'
-%%     is checked for syntactic validity only.
+%%     is checked for syntactic validity only: it is NOT used in a live
+%%     username->DN search, because the endpoint has no principal to look up
+%%     and running one could leak directory contents. CONSEQUENCE: a request
+%%     with a correct dn_lookup_base but a wrong dn_lookup_attribute still
+%%     returns `ok'. An `ok' here means "the base is reachable", not "this
+%%     attribute resolves a user" -- a distinction that must be reflected in
+%%     any user-facing documentation so customers do not over-trust the
+%%     result.
 %%
 %%   * Authorization queries -- `queries.{tags,vhost_access,
 %%     resource_access,topic_access}' are parsed with the same grammar
@@ -50,6 +57,32 @@
     <<"topic_access">>
 ]).
 
+%% Accepted keys within the `ssl_options' object. A request carrying any
+%% other key is rejected (rather than silently dropped) so a mis-typed
+%% option cannot make validation pass green without testing the option the
+%% customer intended.
+-define(SSL_OPTION_KEYS, [
+    <<"cacertfile_arn">>,
+    <<"verify">>,
+    <<"depth">>,
+    <<"versions">>,
+    <<"server_name_indication">>
+]).
+
+%% Accepted values for the `verify' ssl option. Mirrors the ssl app's two
+%% modes; anything else is a mis-typed value and rejected up front rather
+%% than silently dropped and re-defaulted.
+-define(SSL_VERIFY_VALUES, [<<"verify_peer">>, <<"verify_none">>]).
+
+%% Accepted values for the `versions' ssl option. Mirrors the TLS versions
+%% the ssl app understands.
+-define(SSL_VERSION_VALUES, [
+    <<"tlsv1.3">>,
+    <<"tlsv1.2">>,
+    <<"tlsv1.1">>,
+    <<"tlsv1">>
+]).
+
 -define(REASON_BAD_SERVERS, <<"servers must be a non-empty list of non-empty strings">>).
 -define(REASON_BAD_PORT, <<"port must be an integer in 1..65535">>).
 -define(REASON_BAD_USER_DN, <<"user_dn must be a non-empty string">>).
@@ -57,6 +90,15 @@
 -define(REASON_BAD_SSL_FLAG, <<"use_ssl must be a boolean">>).
 -define(REASON_BAD_STARTTLS_FLAG, <<"use_starttls must be a boolean">>).
 -define(REASON_BAD_SSL_OPTIONS, <<"ssl_options must be an object">>).
+-define(REASON_UNKNOWN_SSL_OPTION, <<
+    "ssl_options contains an unknown key; allowed keys are cacertfile_arn, "
+    "verify, depth, versions, server_name_indication"
+>>).
+-define(REASON_BAD_SSL_VERIFY, <<"ssl_options.verify must be verify_peer or verify_none">>).
+-define(REASON_BAD_SSL_DEPTH, <<"ssl_options.depth must be a non-negative integer">>).
+-define(REASON_BAD_SSL_VERSIONS, <<"ssl_options.versions must be a list of known TLS versions">>).
+-define(REASON_BAD_SSL_SNI, <<"ssl_options.server_name_indication must be a string">>).
+-define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
 -define(REASON_TLS_BOTH, <<"use_ssl and use_starttls are mutually exclusive">>).
 -define(REASON_CONNECTION, <<"could not connect to LDAP server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
@@ -202,9 +244,57 @@ parse_ssl_options(Body, Acc) ->
         undefined ->
             {ok, Acc#{ssl_options => #{}}};
         Map when is_map(Map) ->
-            {ok, Acc#{ssl_options => Map}};
+            %% Validate both keys AND values here, in the pure phase. Rejecting
+            %% only unknown keys is not enough: a known key with a mis-typed
+            %% value (e.g. "verify":"verfy_none") would otherwise survive to
+            %% build_ssl_opts, be silently dropped by its catch, and re-default
+            %% to verify_peer -- so validation would test options that differ
+            %% from what was submitted, the exact silent-drop failure we are
+            %% trying to prevent.
+            case [K || K <- maps:keys(Map), not lists:member(K, ?SSL_OPTION_KEYS)] of
+                [] -> validate_ssl_values(maps:to_list(Map), Acc, Map);
+                [_ | _] -> {error, input_invalid, ?REASON_UNKNOWN_SSL_OPTION}
+            end;
         _ ->
             {error, input_invalid, ?REASON_BAD_SSL_OPTIONS}
+    end.
+
+%% Validate each known ssl_options value for shape/domain in the pure phase.
+%% On success the original map is stored unchanged (build_ssl_opts translates
+%% it later); on the first bad value the whole request is rejected.
+validate_ssl_values([], Acc, Map) ->
+    {ok, Acc#{ssl_options => Map}};
+validate_ssl_values([{Key, Value} | Rest], Acc, Map) ->
+    case valid_ssl_value(Key, Value) of
+        ok -> validate_ssl_values(Rest, Acc, Map);
+        {error, _, _} = Err -> Err
+    end.
+
+valid_ssl_value(<<"verify">>, V) ->
+    case lists:member(V, ?SSL_VERIFY_VALUES) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_VERIFY}
+    end;
+valid_ssl_value(<<"depth">>, V) when is_integer(V), V >= 0 ->
+    ok;
+valid_ssl_value(<<"depth">>, _) ->
+    {error, input_invalid, ?REASON_BAD_SSL_DEPTH};
+valid_ssl_value(<<"versions">>, V) when is_list(V), V =/= [] ->
+    case lists:all(fun(Ver) -> lists:member(Ver, ?SSL_VERSION_VALUES) end, V) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_VERSIONS}
+    end;
+valid_ssl_value(<<"versions">>, _) ->
+    {error, input_invalid, ?REASON_BAD_SSL_VERSIONS};
+valid_ssl_value(<<"server_name_indication">>, V) ->
+    case is_nonempty_binary(V) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_SNI}
+    end;
+valid_ssl_value(<<"cacertfile_arn">>, V) ->
+    case is_nonempty_binary(V) of
+        true -> ok;
+        false -> {error, input_invalid, ?REASON_BAD_SSL_CACERT_ARN}
     end.
 
 %% DN lookup fields are optional. When `dn_lookup_base' is absent we store
@@ -420,8 +510,8 @@ maybe_start_tls(Handle, true, SslOpts, Timeout) ->
     eldap:start_tls(Handle, build_ssl_opts(SslOpts), Timeout).
 
 %% Translate the JSON ssl_options map into an Erlang ssl options
-%% proplist suitable for eldap. Unknown keys are ignored to keep the
-%% allowed surface narrow.
+%% proplist suitable for eldap. The accepted key surface is validated up
+%% front in parse_ssl_options/2, so any key reaching here is known.
 build_ssl_opts(Map) when is_map(Map) ->
     Pairs = [
         {cacerts, <<"cacertfile_arn">>, fun resolve_and_decode_pem_cacerts/1},
@@ -430,7 +520,7 @@ build_ssl_opts(Map) when is_map(Map) ->
         {versions, <<"versions">>, fun to_versions/1},
         {server_name_indication, <<"server_name_indication">>, fun to_list/1}
     ],
-    lists:foldl(
+    Translated = lists:foldl(
         fun({SslKey, JsonKey, Fun}, Acc) ->
             case maps:get(JsonKey, Map, undefined) of
                 undefined ->
@@ -445,7 +535,51 @@ build_ssl_opts(Map) when is_map(Map) ->
         end,
         [],
         Pairs
-    ).
+    ),
+    apply_verify_default(Translated).
+
+%% OTP's ssl defaults `verify' to verify_none, which silently accepts any
+%% certificate -- insecure, and a poor thing to validate a config against.
+%% When the caller did not specify `verify', prefer verify_peer -- BUT only
+%% when a trust anchor is actually available to verify against (the caller's
+%% cacertfile_arn, or the validator host's OS trust store). Forcing
+%% verify_peer with no CA would make the handshake fail with unknown_ca and
+%% report tls_failed/connection_failed for a config the real broker (default
+%% verify_none) would accept -- a host-environment artifact, not a customer
+%% config error, breaking decision parity. With no trust source we therefore
+%% leave `verify' unset (broker-parity verify_none). An explicit `verify'
+%% from the caller is always left untouched (verify_none stays opt-in).
+apply_verify_default(Opts) ->
+    case lists:keymember(verify, 1, Opts) of
+        true ->
+            Opts;
+        false ->
+            case trust_source(Opts) of
+                {ok, Opts1} -> [{verify, verify_peer} | Opts1];
+                none -> Opts
+            end
+    end.
+
+%% Returns {ok, OptsWithCacerts} when a trust anchor is available (either the
+%% caller already supplied cacerts, or the OS trust store is non-empty, in
+%% which case it is added), or `none' when nothing can verify the peer.
+trust_source(Opts) ->
+    case lists:keymember(cacerts, 1, Opts) of
+        true ->
+            {ok, Opts};
+        false ->
+            case os_cacerts() of
+                [] -> none;
+                Certs -> {ok, [{cacerts, Certs} | Opts]}
+            end
+    end.
+
+os_cacerts() ->
+    try
+        public_key:cacerts_get()
+    catch
+        _:_ -> []
+    end.
 
 to_list(B) when is_binary(B) -> binary_to_list(B);
 to_list(L) when is_list(L) -> L.

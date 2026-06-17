@@ -11,7 +11,7 @@
 %% over the same accepted-term allowlist) so that a query the broker would
 %% accept is accepted here and vice-versa (design requirement R12: the
 %% validation endpoint must not diverge from rabbit_auth_backend_ldap). A
-%% parity test (aws_auth_validate_query_parity_tests) guards against drift.
+%% parity test in aws_auth_validate_tests guards against drift.
 %%
 %% Two deliberate differences from the upstream helper:
 %%   1. It returns {ok, Query} | {error, Reason} instead of throwing via

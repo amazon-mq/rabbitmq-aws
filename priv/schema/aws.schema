@@ -140,16 +140,6 @@
 {mapping, "aws.auth_validation.connection_timeout_ms", "aws.auth_validation_connection_timeout_ms",
     [{datatype, integer}]}.
 
-%% @doc Rate limiter window in seconds, per source IP (effective default
-%% 60; applied by aws_sup).
-{mapping, "aws.auth_validation.rate_limit.window_seconds", "aws.auth_validation_rate_limit_window_seconds",
-    [{datatype, integer}]}.
-
-%% @doc Rate limiter max successful requests per window per source IP
-%% (effective default 10; applied by aws_sup).
-{mapping, "aws.auth_validation.rate_limit.max_requests", "aws.auth_validation_rate_limit_max_requests",
-    [{datatype, integer}]}.
-
 %% @doc Required management user tag to access the endpoint (effective
 %% default administrator).
 {mapping, "aws.auth_validation.required_user_tag", "aws.auth_validation_required_user_tag",

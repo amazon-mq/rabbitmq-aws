@@ -3,84 +3,14 @@
 %% vim:ft=erlang:
 %% -*- mode: erlang; -*-
 
-%% Unit tests for the auth-validation subsystem's pure modules: rate
-%% limiter, semaphore, registry, the LDAP backend's input parsing, and the
+%% Unit tests for the auth-validation subsystem's pure modules: semaphore,
+%% ARN-resolution lock, registry, the LDAP backend's input parsing, and the
 %% LDAP query DSL parser (incl. upstream parity). The live bind/connect/TLS
-%% path lives in aws_auth_validate_ldap_SUITE; the HTTP pipeline (when added)
-%% lives in aws_auth_validate_mgmt_SUITE.
+%% path lives in aws_auth_validate_ldap_SUITE; the HTTP pipeline lives in
+%% aws_auth_validate_mgmt_SUITE.
 -module(aws_auth_validate_tests).
 
 -include_lib("eunit/include/eunit.hrl").
-
--define(IP1, {10, 0, 0, 1}).
--define(IP2, {10, 0, 0, 2}).
-
-%%--------------------------------------------------------------------
-%% Rate limiter
-%%--------------------------------------------------------------------
-
-rate_limiter_test_() ->
-    {foreach,
-        fun() ->
-            {ok, Pid} = aws_auth_validate_rate_limiter:start_link(#{
-                window_ms => 60_000,
-                max_per_window => 3,
-                sweep_interval_ms => 60_000
-            }),
-            Pid
-        end,
-        fun stop/1, [
-            {"allows up to max then rejects", fun() ->
-                ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
-                ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
-                ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1)),
-                ?assertEqual(
-                    {error, rate_limited},
-                    aws_auth_validate_rate_limiter:check(?IP1)
-                )
-            end},
-            {"per-IP isolation", fun() ->
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ?assertEqual(
-                    {error, rate_limited},
-                    aws_auth_validate_rate_limiter:check(?IP1)
-                ),
-                ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP2))
-            end},
-            {"reset clears counters", fun() ->
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ok = aws_auth_validate_rate_limiter:check(?IP1),
-                ?assertEqual(
-                    {error, rate_limited},
-                    aws_auth_validate_rate_limiter:check(?IP1)
-                ),
-                ok = aws_auth_validate_rate_limiter:reset(),
-                ?assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1))
-            end}
-        ]}.
-
-rate_limiter_window_expiry_test_() ->
-    {setup,
-        fun() ->
-            {ok, Pid} = aws_auth_validate_rate_limiter:start_link(#{
-                window_ms => 50,
-                max_per_window => 1,
-                sweep_interval_ms => 60_000
-            }),
-            Pid
-        end,
-        fun stop/1, fun(_) ->
-            ok = aws_auth_validate_rate_limiter:check(?IP1),
-            ?assertEqual(
-                {error, rate_limited},
-                aws_auth_validate_rate_limiter:check(?IP1)
-            ),
-            timer:sleep(80),
-            [?_assertEqual(ok, aws_auth_validate_rate_limiter:check(?IP1))]
-        end}.
 
 %%--------------------------------------------------------------------
 %% Semaphore
@@ -134,59 +64,56 @@ semaphore_crashed_holder_test_() ->
 %% ARN resolution lock
 %%--------------------------------------------------------------------
 
+%% The lock is now a global:trans/4 lock with no server process, so there is
+%% nothing to start or stop -- with_lock/1 is callable directly.
 arn_lock_test_() ->
-    {foreach,
-        fun() ->
-            {ok, Pid} = aws_auth_validate_arn_lock:start_link(),
-            Pid
-        end,
-        fun stop/1, [
-            {"returns the closure's value", fun() ->
-                ?assertEqual(42, aws_auth_validate_arn_lock:with_lock(fun() -> 42 end))
-            end},
-            {"serializes concurrent callers (no interleaving)", fun() ->
-                %% Each closure marks the lock busy on entry and clears it on
-                %% exit; if two ran concurrently one would observe busy=true.
-                %% A shared ets table records whether overlap was ever seen.
-                T = ets:new(arn_lock_probe, [public, set]),
-                ets:insert(T, {busy, false}),
-                ets:insert(T, {overlap, false}),
-                Self = self(),
-                Run = fun() ->
-                    aws_auth_validate_arn_lock:with_lock(fun() ->
-                        case ets:lookup(T, busy) of
-                            [{busy, true}] -> ets:insert(T, {overlap, true});
-                            _ -> ok
-                        end,
-                        ets:insert(T, {busy, true}),
-                        timer:sleep(15),
-                        ets:insert(T, {busy, false}),
-                        ok
-                    end),
-                    Self ! done
-                end,
-                Pids = [spawn(Run) || _ <- lists:seq(1, 5)],
-                [
-                    receive
-                        done -> ok
-                    after 5_000 -> ?assert(false)
-                    end
-                 || _ <- Pids
-                ],
-                ?assertEqual([{overlap, false}], ets:lookup(T, overlap)),
-                ets:delete(T)
-            end},
-            {"re-raises the closure's exception in the caller", fun() ->
-                ?assertError(
-                    boom,
-                    aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end)
-                )
-            end},
-            {"survives a crashing closure (next call still works)", fun() ->
-                catch aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end),
-                ?assertEqual(ok, aws_auth_validate_arn_lock:with_lock(fun() -> ok end))
-            end}
-        ]}.
+    [
+        {"returns the closure's value", fun() ->
+            ?assertEqual(42, aws_auth_validate_arn_lock:with_lock(fun() -> 42 end))
+        end},
+        {"serializes concurrent callers (no interleaving)", fun() ->
+            %% Each closure marks the lock busy on entry and clears it on
+            %% exit; if two ran concurrently one would observe busy=true.
+            %% A shared ets table records whether overlap was ever seen.
+            T = ets:new(arn_lock_probe, [public, set]),
+            ets:insert(T, {busy, false}),
+            ets:insert(T, {overlap, false}),
+            Self = self(),
+            Run = fun() ->
+                aws_auth_validate_arn_lock:with_lock(fun() ->
+                    case ets:lookup(T, busy) of
+                        [{busy, true}] -> ets:insert(T, {overlap, true});
+                        _ -> ok
+                    end,
+                    ets:insert(T, {busy, true}),
+                    timer:sleep(15),
+                    ets:insert(T, {busy, false}),
+                    ok
+                end),
+                Self ! done
+            end,
+            Pids = [spawn(Run) || _ <- lists:seq(1, 5)],
+            [
+                receive
+                    done -> ok
+                after 5_000 -> ?assert(false)
+                end
+             || _ <- Pids
+            ],
+            ?assertEqual([{overlap, false}], ets:lookup(T, overlap)),
+            ets:delete(T)
+        end},
+        {"propagates the closure's exception to the caller", fun() ->
+            ?assertError(
+                boom,
+                aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end)
+            )
+        end},
+        {"releases the lock after a crashing closure (next call still works)", fun() ->
+            catch aws_auth_validate_arn_lock:with_lock(fun() -> erlang:error(boom) end),
+            ?assertEqual(ok, aws_auth_validate_arn_lock:with_lock(fun() -> ok end))
+        end}
+    ].
 
 %%--------------------------------------------------------------------
 %% Registry
@@ -297,6 +224,35 @@ ldap_input_validation_test_() ->
         ?_assertMatch(
             {error, input_invalid, _},
             aws_auth_validate_ldap:validate(base_body(#{<<"ssl_options">> => <<"x">>}))
+        ),
+        %% An unknown ssl_options key is rejected, not silently dropped.
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(
+                base_body(#{<<"ssl_options">> => #{<<"verfy">> => <<"verify_peer">>}})
+            )
+        ),
+        %% A known key with a mis-typed value is rejected in the pure phase
+        %% (rather than dropped and re-defaulted).
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(
+                base_body(#{<<"ssl_options">> => #{<<"verify">> => <<"verfy_none">>}})
+            )
+        ),
+        %% depth must be a non-negative integer.
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(
+                base_body(#{<<"ssl_options">> => #{<<"depth">> => -1}})
+            )
+        ),
+        %% versions must be a list of known TLS versions.
+        ?_assertMatch(
+            {error, input_invalid, _},
+            aws_auth_validate_ldap:validate(
+                base_body(#{<<"ssl_options">> => #{<<"versions">> => [<<"sslv3">>]}})
+            )
         )
     ].
 

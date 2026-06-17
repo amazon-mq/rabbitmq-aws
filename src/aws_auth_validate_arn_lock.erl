@@ -20,81 +20,37 @@
 %% is reachable, so it never races validation traffic. Only
 %% validation-vs-validation needs guarding, which is what this lock does.
 %%
-%% The closure runs INSIDE this gen_server, so resolutions are inherently
-%% serialized. A crashing closure is caught here (the lock server survives)
-%% and its exception is re-raised in the caller, preserving the existing
-%% try/catch behaviour in aws_auth_validate_ldap:validate/1.
+%% Implementation: a node-local `global:trans/4' lock (lock id scoped to
+%% `node()'), not a dedicated gen_server. `global:trans/4' runs the closure
+%% IN THE CALLER (so the resolved password never leaves this process -- it is
+%% not copied into a server's mailbox, preserving the R6 no-leak property)
+%% and wraps it in `try Fun() after del_lock', so the lock is always released
+%% and any exception propagates to the caller unchanged. There is therefore
+%% no separate server process to start or supervise.
 -module(aws_auth_validate_arn_lock).
 
--behaviour(gen_server).
+-export([with_lock/1]).
 
--export([start_link/0, start_link/1, with_lock/1]).
+%% Lock id for global:trans/4. The {ResourceId, LockRequesterId} shape is
+%% global's convention; scoping the resource to node() keeps the lock
+%% node-local and distinct from any other global lock.
+-define(LOCK_ID(Self), {{?MODULE, node()}, Self}).
 
--export([
-    init/1,
-    handle_call/3,
-    handle_cast/2,
-    handle_info/2,
-    terminate/2,
-    code_change/3
-]).
+%% global:trans/4 retries acquisition this many times before returning
+%% `aborted' rather than blocking forever. Each retry waits for the current
+%% holder to release, so this bounds how long a caller queues behind an
+%% in-flight resolution. ARN resolution is a bounded HTTP call, so a finite
+%% retry budget is enough; `infinity' could wedge a caller behind a stuck
+%% holder with no escape.
+-define(LOCK_RETRIES, 600).
 
-%% Upper bound on a single serialized resolution. Must exceed the AWS
-%% client's own retry/timeout budget so a slow-but-progressing resolve is
-%% not aborted, while still bounding how long one stuck resolve can block
-%% the queue. rabbitmq_aws does linear-backoff retries with finite per-call
-%% timeouts, so 60s is comfortably above a normal worst case.
--define(DEFAULT_CALL_TIMEOUT_MS, 60_000).
-
--record(state, {}).
-
--spec start_link() -> {ok, pid()} | {error, term()}.
-start_link() ->
-    start_link(#{}).
-
--spec start_link(map()) -> {ok, pid()} | {error, term()}.
-start_link(Config) when is_map(Config) ->
-    gen_server:start_link({local, ?MODULE}, ?MODULE, Config, []).
-
-%% Run Fun under the lock, serialized against all other with_lock/1 callers.
-%% Returns Fun's value, or re-raises in the caller whatever exception Fun
-%% raised (so callers see the same error class/reason as an unlocked call).
--spec with_lock(fun(() -> Result)) -> Result.
+%% Run Fun serialized against all other with_lock/1 callers on this node.
+%% Returns Fun's value. Any exception Fun raises propagates to the caller
+%% unchanged (global:trans/4 releases the lock via try/after first), matching
+%% the behaviour of an unlocked call.
+-spec with_lock(fun(() -> Result)) -> Result when Result :: term().
 with_lock(Fun) when is_function(Fun, 0) ->
-    case gen_server:call(?MODULE, {run, Fun}, ?DEFAULT_CALL_TIMEOUT_MS) of
-        {ok, Result} -> Result;
-        {raised, Class, Reason, Stacktrace} -> erlang:raise(Class, Reason, Stacktrace)
+    case global:trans(?LOCK_ID(self()), Fun, [node()], ?LOCK_RETRIES) of
+        aborted -> error(arn_lock_aborted);
+        Result -> Result
     end.
-
-%%--------------------------------------------------------------------
-%% gen_server callbacks
-%%--------------------------------------------------------------------
-
-init(_Config) ->
-    {ok, #state{}}.
-
-handle_call({run, Fun}, _From, State) ->
-    %% Run the closure here so it is serialized with every other request.
-    %% Catch any exception so a failed resolution never crashes the lock
-    %% server; re-raise it in the caller to preserve unlocked semantics.
-    Reply =
-        try Fun() of
-            Result -> {ok, Result}
-        catch
-            Class:Reason:Stacktrace -> {raised, Class, Reason, Stacktrace}
-        end,
-    {reply, Reply, State};
-handle_call(_Request, _From, State) ->
-    {reply, {error, unknown_request}, State}.
-
-handle_cast(_Msg, State) ->
-    {noreply, State}.
-
-handle_info(_Info, State) ->
-    {noreply, State}.
-
-terminate(_Reason, _State) ->
-    ok.
-
-code_change(_OldVsn, State, _Extra) ->
-    {ok, State}.

@@ -122,16 +122,6 @@
         [{aws, [{auth_validation_connection_timeout_ms, 7000}]}],
         [aws_auth_validation_connection_timeout_ms]},
 
-    {aws_auth_validation_rate_limit_window_seconds,
-        "aws.auth_validation.rate_limit.window_seconds = 30",
-        [{aws, [{auth_validation_rate_limit_window_seconds, 30}]}],
-        [aws_auth_validation_rate_limit_window_seconds]},
-
-    {aws_auth_validation_rate_limit_max_requests,
-        "aws.auth_validation.rate_limit.max_requests = 25",
-        [{aws, [{auth_validation_rate_limit_max_requests, 25}]}],
-        [aws_auth_validation_rate_limit_max_requests]},
-
     {aws_auth_validation_required_user_tag,
         "aws.auth_validation.required_user_tag = monitoring",
         [{aws, [{auth_validation_required_user_tag, monitoring}]}],
