@@ -27,6 +27,11 @@
 %% and wraps it in `try Fun() after del_lock', so the lock is always released
 %% and any exception propagates to the caller unchanged. There is therefore
 %% no separate server process to start or supervise.
+%%
+%% Requires a distributed (alive) node: `global' only serializes correctly
+%% once `net_kernel' is up. The broker always runs as a distributed
+%% `rabbit@host' node, so this holds in production; the unit test starts
+%% distribution explicitly before asserting serialization.
 -module(aws_auth_validate_arn_lock).
 
 -export([with_lock/1]).
