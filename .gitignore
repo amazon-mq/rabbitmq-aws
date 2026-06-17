@@ -70,3 +70,5 @@ callgraph.dot*
 .exrc
 .ignore
 /genhtml/
+
+.security-scan/
