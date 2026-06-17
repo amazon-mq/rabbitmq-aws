@@ -30,8 +30,7 @@
 %%
 %% Requires a distributed (alive) node: `global' only serializes correctly
 %% once `net_kernel' is up. The broker always runs as a distributed
-%% `rabbit@host' node, so this holds in production; the unit test starts
-%% distribution explicitly before asserting serialization.
+%% `rabbit@host' node, so this holds in production.
 -module(aws_auth_validate_arn_lock).
 
 -export([with_lock/1]).
