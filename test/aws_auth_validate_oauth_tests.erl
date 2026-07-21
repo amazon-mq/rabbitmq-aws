@@ -1032,6 +1032,66 @@ authz_iam_scope_alias_grants_access_test_() ->
         end)
     end}.
 
+%% -------- PARITY PIN: rabbitmq/rabbitmq-server discussion #16947 --------
+%%
+%% rabbit_auth_backend_oauth2 resolves additional_scopes_key via split_path/1:
+%%
+%%   split_path(Path) ->
+%%       binary:split(Path, <<".">>, [global, trim_all]).
+%%
+%% Flat claim keys containing dots -- typical for OIDC/STS-style URIs like
+%% <<"https://sts.amazonaws.com/tags">> -- are split into nested-map path
+%% segments (["https://sts", "amazonaws", "com/tags"]) and looked up as a
+%% deeply nested key in the flat claims map. The key is never found, so the
+%% scopes under it are never extracted.
+%%
+%% This test PINS the current (broken) behavior: the authz evaluator returns
+%% authz_unverified because it sees no effective scopes. When upstream fixes
+%% split_path (or adds a dedicated flat-key accessor for additional_scopes_key),
+%% this test MUST be revisited: the assertion should flip from authz_unverified
+%% to ok, and the change landed together with the broker dependency bump.
+%%
+%% This matches the project's parity stance: document upstream behavior, pin
+%% against drift, and surface regressions as test failures the moment the
+%% dependency changes.
+%% -------------------------------------------------------------------
+authz_dotted_additional_scopes_key_parity_pin_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        maybe_skip_authz(fun() ->
+            #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+            %% Token carries scopes under a dotted claim key (OIDC/STS-style URI).
+            %% split_path/1 will incorrectly split this on dots, breaking resolution.
+            Token = Sign(#{
+                <<"exp">> => future(),
+                <<"aud">> => <<"rabbitmq">>,
+                <<"https://sts.amazonaws.com/tags">> => [
+                    <<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>
+                ]
+            }),
+            JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+            mock_httpc_response(200, JwksBody),
+            Body = (jwks_body())#{
+                <<"access_token">> => Token,
+                <<"resource_server_id">> => <<"rabbitmq">>,
+                <<"scope_prefix">> => <<"rabbitmq.">>,
+                %% Point additional_scopes_key at the dotted claim.
+                <<"additional_scopes_key">> => <<"https://sts.amazonaws.com/tags">>,
+                <<"authz_check">> => #{
+                    <<"resource">> => <<"my-queue">>,
+                    <<"permission">> => <<"write">>
+                }
+            },
+            Result = aws_auth_validate_oauth:validate(Body),
+            [
+                %% Current behavior: split_path splits the dotted key, lookup fails,
+                %% no scopes extracted -> authz_unverified. This will flip to ok once
+                %% upstream fixes the lookup.
+                ?_assertMatch({error, authz_unverified, _}, Result),
+                ?_assert(reason_contains(Result, "no scopes for this resource_server"))
+            ]
+        end)
+    end}.
+
 %% authz_check without an access_token is rejected in the pure phase.
 authz_check_without_token_rejected_test() ->
     Body = (jwks_body())#{
