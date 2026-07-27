@@ -1051,9 +1051,24 @@ authz_iam_scope_alias_grants_access_test_() ->
 %% this test MUST be revisited: the assertion should flip from authz_unverified
 %% to ok, and the change landed together with the broker dependency bump.
 %%
-%% This matches the project's parity stance: document upstream behavior, pin
-%% against drift, and surface regressions as test failures the moment the
-%% dependency changes.
+%% DORMANCY: the pin only RUNS once the broker ships the arity-4 scope API
+%% (resource_access/4). On an older dep, HAVE_OAUTH2_RESOURCE_SERVER is undefined,
+%% available/0 is false, and maybe_skip_authz/1 returns [] -- the body never
+%% executes. So a green suite does NOT mean "still broken as expected"; it may
+%% mean the pin was skipped. Concretely, if upstream backports only the
+%% split_path fix to a dep series WITHOUT the arity-4 API, this pin stays dormant
+%% and the regression slips through here. The pin fires only on a series with the
+%% full arity-4 API; treat the parity-bump revisit as the real backstop.
+%%
+%% FLIP SHAPE: the scope value below is deliberately `rabbitmq.'-prefixed. In the
+%% fixed backend, extract_scope_list_from_token_value/2 takes a LIST value
+%% VERBATIM (only a map value keyed by resource_server_id is prefix-injected), so
+%% after the scope_prefix "rabbitmq." strip this yields write:*/* and flips to ok.
+%% An unprefixed value here would be filtered to [] by the strip and never flip.
+%%
+%% This matches the project's parity stance: document upstream behavior and pin
+%% against drift, surfacing regressions as test failures once the dep ships the
+%% arity-4 API.
 %% -------------------------------------------------------------------
 authz_dotted_additional_scopes_key_parity_pin_test_() ->
     {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
