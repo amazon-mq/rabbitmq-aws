@@ -34,7 +34,10 @@
     tls_no_certs_returns_400_input_invalid/1,
     tls_missing_cacert_arn_returns_400/1,
     tls_no_assume_role_returns_422_config_conflict/1,
-    tls_response_no_ca_material/1
+    tls_response_no_ca_material/1,
+    tls_chain_valid_returns_204/1,
+    tls_chain_invalid_returns_422/1,
+    tls_cert_login_conflict_returns_422/1
 ]).
 
 %% Invoked on the broker node via rpc to install/remove the AWS-boundary mocks.
@@ -74,7 +77,13 @@ groups() ->
             %% cacertfile_arn referenced but no assume_role configured -> 422.
             tls_no_assume_role_returns_422_config_conflict,
             %% resolved CA material must not appear in the response.
-            tls_response_no_ca_material
+            tls_response_no_ca_material,
+            %% Client cert chain validates against the CA bundle -> 204.
+            tls_chain_valid_returns_204,
+            %% Client cert not chaining to the CA -> 422 auth_failed.
+            tls_chain_invalid_returns_422,
+            %% cert_login without client_cert -> 422 config_conflict.
+            tls_cert_login_conflict_returns_422
         ]}
     ].
 
@@ -89,9 +98,16 @@ init_per_suite(Config) ->
     %% PEM binaries are threaded to the broker-node mock via rpc per testcase.
     ValidCaPem = gen_ca_pem(Config, "valid", "-days 2"),
     ExpiredCaPem = gen_expired_ca_pem(Config),
+    %% Generate a leaf cert signed by the same valid CA (for chain validation cases).
+    ClientLeafPem = gen_leaf_cert_pem(Config, "client-leaf", "valid"),
+    %% Generate an unrelated leaf cert (signed by a different CA) for the invalid case.
+    _ = gen_ca_pem(Config, "other", "-days 2"),
+    UnrelatedLeafPem = gen_leaf_cert_pem(Config, "unrelated-leaf", "other"),
     [
         {valid_ca_pem, ValidCaPem},
-        {expired_ca_pem, ExpiredCaPem}
+        {expired_ca_pem, ExpiredCaPem},
+        {client_leaf_pem, ClientLeafPem},
+        {unrelated_leaf_pem, UnrelatedLeafPem}
         | Config
     ].
 
@@ -135,6 +151,10 @@ init_per_testcase(tls_no_assume_role_returns_422_config_conflict = TC, Config) -
     %% refused with config_conflict rather than resolved under the instance role.
     rabbit_ct_broker_helpers:rpc(Config, 0, application, unset_env, [aws, arn_config]),
     rabbit_ct_helpers:testcase_started(Config, TC);
+%% The cert_login conflict case fails at input validation (pure); no mock needed.
+init_per_testcase(tls_cert_login_conflict_returns_422 = TC, Config) ->
+    enable_tls_method(Config),
+    rabbit_ct_helpers:testcase_started(Config, TC);
 %% Every other case enables the method AND installs a resolve mock returning the
 %% appropriate fixture PEM.
 init_per_testcase(TC, Config) ->
@@ -146,6 +166,9 @@ init_per_testcase(TC, Config) ->
 end_per_testcase(tls_disabled_by_default_returns_404 = TC, Config) ->
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(tls_missing_cacert_arn_returns_400 = TC, Config) ->
+    disable_methods(Config),
+    rabbit_ct_helpers:testcase_finished(Config, TC);
+end_per_testcase(tls_cert_login_conflict_returns_422 = TC, Config) ->
     disable_methods(Config),
     rabbit_ct_helpers:testcase_finished(Config, TC);
 end_per_testcase(tls_no_assume_role_returns_422_config_conflict = TC, Config) ->
@@ -172,6 +195,10 @@ pem_for_case(tls_no_certs_returns_400_input_invalid, _Config) ->
     %% decodes the body but yields zero certificates (the `skip' branch), as
     %% opposed to the malformed-base64 case above, which raises.
     <<"-----BEGIN PRIVATE KEY-----\naGVsbG8=\n-----END PRIVATE KEY-----\n">>;
+pem_for_case(tls_chain_valid_returns_204, Config) ->
+    ?config(valid_ca_pem, Config);
+pem_for_case(tls_chain_invalid_returns_422, Config) ->
+    ?config(valid_ca_pem, Config);
 pem_for_case(_TC, Config) ->
     %% Default (valid CA) for tls_valid_ca_returns_204 / tls_response_no_ca_material.
     ?config(valid_ca_pem, Config).
@@ -231,6 +258,51 @@ tls_response_no_ca_material(Config) ->
     Body = iolist_to_binary(ResBody),
     Needle = pem_body_slice(Pem),
     ?assertEqual(nomatch, binary:match(Body, Needle)).
+
+%% A client certificate that chains to the resolved CA bundle passes (204).
+%% This exercises Layer 1 (chain validation) without cert_login (chain-only mode).
+tls_chain_valid_returns_204(Config) ->
+    ClientPem = ?config(client_leaf_pem, Config),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => ClientPem
+    },
+    {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?API, Body),
+    ?assertEqual(204, Code),
+    ?assertEqual(<<>>, iolist_to_binary(ResBody)).
+
+%% A client certificate signed by a different CA does not chain -> 422 auth_failed.
+tls_chain_invalid_returns_422(Config) ->
+    UnrelatedPem = ?config(unrelated_leaf_pem, Config),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => UnrelatedPem
+    },
+    {ok, {{_, Code, _}, _, ResBody}} = put_request(Config, ?API, Body),
+    ?assertEqual(422, Code),
+    ?assertMatch(#{<<"error">> := <<"auth_failed">>}, decode(ResBody)).
+
+%% cert_login without client_cert is a cross-field conflict -> 422.
+tls_cert_login_conflict_returns_422(Config) ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>}
+    },
+    {ok, {{_, Code, _}, _, ResBody}} = put_request(Config, ?API, Body),
+    ?assertEqual(422, Code),
+    ?assertMatch(#{<<"error">> := <<"config_conflict">>}, decode(ResBody)).
 
 %%--------------------------------------------------------------------
 %% Broker-node mocks (invoked via rpc)
@@ -362,6 +434,39 @@ gen_expired_ca_pem(Config) ->
         false ->
             skip
     end.
+
+%% Generate a leaf cert signed by the named CA fixture. Returns a cert-only PEM
+%% (no private key material).
+gen_leaf_cert_pem(Config, Name, CaName) ->
+    PrivDir = ?config(priv_dir, Config),
+    CaKey = filename:join(PrivDir, CaName ++ "-ca-key.pem"),
+    CaCert = filename:join(PrivDir, CaName ++ "-ca-cert.pem"),
+    LeafKey = filename:join(PrivDir, Name ++ "-key.pem"),
+    LeafCsr = filename:join(PrivDir, Name ++ ".csr"),
+    LeafCert = filename:join(PrivDir, Name ++ "-cert.pem"),
+    %% Generate leaf key + CSR.
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-subj /CN=~s 2>/dev/null",
+                [LeafKey, LeafCsr, Name]
+            )
+        )
+    ),
+    %% Sign leaf with the named CA.
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+                "-out ~ts -days 2 2>/dev/null",
+                [LeafCsr, CaCert, CaKey, LeafCert]
+            )
+        )
+    ),
+    true = filelib:is_regular(LeafCert),
+    {ok, Pem} = file:read_file(LeafCert),
+    Pem.
 
 has_error(Out) ->
     string:find(Out, "error") =/= nomatch orelse

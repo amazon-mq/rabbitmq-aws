@@ -12,23 +12,32 @@
 %%
 %% It validates the material only, not a live handshake. The other backends
 %% probe an outbound auth server; here the config is an inbound listener, so
-%% there is nothing for the broker to connect to (and no client keystore to
-%% connect with). Checks:
+%% there is nothing for the broker to connect to. Checks:
 %%   1. the cacertfile ARN resolves,
 %%   2. the resolved PEM holds at least one well-formed CA certificate,
 %%   3. none of those certificates is expired or not yet valid,
 %%   4. verify / fail_if_no_peer_cert / depth / versions are well-shaped.
 %%
-%% A pass means the material is usable, not that mTLS as a whole works: it does
-%% not cover client-cert chaining, common-name-to-user mapping, network
-%% reachability, or whether the broker is actually running this config.
+%% Optionally, when `client_cert' and `cert_login' are supplied, the backend
+%% also validates:
+%%   5. the client certificate chains to the supplied CA bundle (Layer 1),
+%%   6. a username can be extracted from the leaf cert using the configured
+%%      cert_login strategy -- DN / CN / SAN (Layer 2),
+%%   7. the extracted username resolves to an internal broker user (Layer 3).
+%%
+%% A pass means the material is usable and (when layers 5-7 are exercised) the
+%% cert-login pipeline produces a resolvable user, not that the broker is
+%% actually running this config.
 %%
 %% Result categories (shared with the other backends):
 %%   * input_invalid (400) -- bad target/ssl_options, missing cacertfile_arn,
 %%     ARN resolve failure, or a PEM with no parseable CA certificate.
 %%   * tls_failed (400) -- a CA certificate is expired or not yet valid.
+%%   * auth_failed (422) -- client certificate chain validation failed, no
+%%     username could be extracted, or the extracted user does not exist.
 %%   * config_conflict (422) -- a cacertfile_arn is given but no
-%%     aws.arns.assume_role_arn is configured.
+%%     aws.arns.assume_role_arn is configured; or cert_login references
+%%     unavailable broker modules.
 -module(aws_auth_validate_tls).
 
 -behaviour(aws_auth_validate_backend).
@@ -36,14 +45,18 @@
 -export([method_name/0, validate/1, allowed_fields/0]).
 
 -ifdef(TEST).
-%% Exposed for the unit tests: the pure input parser and the certificate-validity
+%% Exposed for the unit tests: the pure input parser, the certificate-validity
 %% helpers (classify_validity/3 lets the expired/not-yet-valid branches be tested
-%% without generating an actually-expired cert).
+%% without generating an actually-expired cert), and the client-cert-login layers.
 -export([
     parse_input/1,
     check_cert_validity/1,
     cert_validity_seconds/1,
-    classify_validity/3
+    classify_validity/3,
+    validate_chain/3,
+    extract_username/2,
+    resolve_user/1,
+    sanitize_username/1
 ]).
 -endif.
 
@@ -94,6 +107,71 @@
     "set aws.arns.assume_role_arn"
 >>).
 
+%% client_cert / cert_login reason strings (Layer 1-3 validation).
+-define(REASON_BAD_CLIENT_CERT,
+    <<"client_cert must be a non-empty PEM-encoded certificate chain">>
+).
+-define(REASON_CLIENT_CERT_PRIVATE_KEY,
+    <<"client_cert must not contain private key material; send only certificate entries">>
+).
+-define(REASON_BAD_CERT_LOGIN, <<"cert_login must be an object">>).
+-define(REASON_BAD_CERT_LOGIN_FROM,
+    <<"cert_login.from must be distinguished_name, common_name, or subject_alternative_name">>
+).
+-define(REASON_SAN_TYPE_REQUIRES_SAN_FROM,
+    <<"cert_login.san_type is only valid when from is subject_alternative_name">>
+).
+-define(REASON_SAN_INDEX_REQUIRES_SAN_FROM,
+    <<"cert_login.san_index is only valid when from is subject_alternative_name">>
+).
+-define(REASON_BAD_SAN_TYPE,
+    <<"cert_login.san_type must be dns, ip, email, uri, or other_name">>
+).
+-define(REASON_BAD_SAN_INDEX,
+    <<"cert_login.san_index must be a non-negative integer">>
+).
+-define(REASON_UNKNOWN_CERT_LOGIN_KEY,
+    <<"cert_login contains an unknown key; allowed keys are from, san_type, san_index">>
+).
+-define(REASON_CERT_LOGIN_REQUIRES_CLIENT_CERT,
+    <<"cert_login requires client_cert to be present">>
+).
+-define(REASON_CERT_LOGIN_REQUIRES_VERIFY_PEER,
+    <<"cert-based login requires ssl_options.verify = verify_peer">>
+).
+-define(REASON_CHAIN_FAILED,
+    <<"the client certificate does not chain to the supplied CA bundle">>
+).
+-define(REASON_CHAIN_EXPIRED,
+    <<"the client certificate chain contains an expired or not-yet-valid certificate">>
+).
+-define(REASON_CHAIN_MALFORMED,
+    <<"a certificate in the client chain could not be parsed">>
+).
+-define(REASON_EXTRACT_FAILED,
+    <<"no username could be extracted from the client certificate with the supplied cert_login settings">>
+).
+-define(REASON_USER_NOT_FOUND(Name),
+    iolist_to_binary([
+        <<"no internal user named ">>, sanitize_username(Name), <<" exists">>
+    ])
+).
+-define(REASON_USER_LOOKUP_UNAVAILABLE,
+    <<"user-resolution check unavailable on this broker series">>
+).
+
+-define(INTERNAL_BACKEND, rabbit_auth_backend_internal).
+-define(MAX_USERNAME_LEN, 256).
+
+%% Private key entry types that must be rejected from client_cert input (R6).
+-define(PRIVATE_KEY_TYPES, [
+    'RSAPrivateKey',
+    'DSAPrivateKey',
+    'ECPrivateKey',
+    'PrivateKeyInfo',
+    'EncryptedPrivateKeyInfo'
+]).
+
 %% Surface passed to the shared aws_auth_validate_ssl helpers: the ARN-bearing
 %% keys, the allowed-key set, and this backend's reason strings. client_cert is
 %% false (no client pair) and sni_key is unused here; both are required by the
@@ -125,7 +203,7 @@ method_name() ->
     <<"tls">>.
 
 allowed_fields() ->
-    [<<"target">>, <<"ssl_options">>].
+    [<<"target">>, <<"ssl_options">>, <<"client_cert">>, <<"cert_login">>].
 
 -spec validate(map()) -> aws_auth_validate_backend:result().
 validate(Body) when is_map(Body) ->
@@ -149,7 +227,10 @@ parse_input(Body) ->
     Steps = [
         fun parse_target/2,
         fun parse_ssl_options/2,
-        fun require_cacert/2
+        fun require_cacert/2,
+        fun parse_client_cert/2,
+        fun parse_cert_login/2,
+        fun cross_field_checks/2
     ],
     run_steps(Steps, Body, #{}).
 
@@ -193,7 +274,9 @@ require_cacert(_Body, #{ssl_options := Map} = Acc) ->
 %%--------------------------------------------------------------------
 
 %% Resolve the cacertfile ARN, then decode and check the CA bundle. The only
-%% network call is the ARN fetch; nothing connects to a listener.
+%% network call is the ARN fetch; nothing connects to a listener. When client
+%% certificate layers are present, continue into chain/extract/resolve after
+%% the CA bundle passes.
 do_tls_validate(#{ssl_options := Map} = Params) ->
     %% A request that referenced no ARN carries the `none' sentinel, which
     %% resolve_arn/2 refuses. cacertfile_arn is required, so a valid request
@@ -204,7 +287,10 @@ do_tls_validate(#{ssl_options := Map} = Params) ->
         {error, _} ->
             {error, input_invalid, ?REASON_ARN_RESOLVE};
         {ok, Pem} ->
-            decode_and_check(Pem)
+            case decode_and_check(Pem) of
+                {error, _, _} = Err -> Err;
+                ok -> maybe_chain_validate(Params, Pem)
+            end
     end.
 
 %% Decode the CA PEM and check each certificate. The decode is wrapped because
@@ -306,3 +392,352 @@ ymd_to_seconds(Year, Rest) ->
 
 to_str(T) when is_binary(T) -> binary_to_list(T);
 to_str(T) when is_list(T) -> T.
+
+%%--------------------------------------------------------------------
+%% Input parsing: client_cert (optional PEM chain)
+%%--------------------------------------------------------------------
+
+%% client_cert is optional; when present it must be a non-empty binary holding
+%% only certificate PEM entries (no private key material -- R6).
+parse_client_cert(Body, Acc) ->
+    case maps:get(<<"client_cert">>, Body, undefined) of
+        undefined ->
+            {ok, Acc};
+        Pem when is_binary(Pem), byte_size(Pem) > 0 ->
+            decode_client_cert_pem(Pem, Acc);
+        _ ->
+            {error, input_invalid, ?REASON_BAD_CLIENT_CERT}
+    end.
+
+decode_client_cert_pem(Pem, Acc) ->
+    Entries =
+        try
+            public_key:pem_decode(Pem)
+        catch
+            _:_ -> error
+        end,
+    case Entries of
+        error ->
+            {error, input_invalid, ?REASON_BAD_CLIENT_CERT};
+        Decoded when is_list(Decoded) ->
+            classify_pem_entries(Decoded, Acc)
+    end.
+
+%% Split the decoded PEM entries: reject if any private key type is present,
+%% collect Certificate DERs. An empty cert list after filtering is an error.
+classify_pem_entries(Entries, Acc) ->
+    HasKey = lists:any(
+        fun({Type, _Der, _Enc}) -> lists:member(Type, ?PRIVATE_KEY_TYPES) end,
+        Entries
+    ),
+    case HasKey of
+        true ->
+            {error, input_invalid, ?REASON_CLIENT_CERT_PRIVATE_KEY};
+        false ->
+            Ders = [Der || {'Certificate', Der, not_encrypted} <- Entries],
+            case Ders of
+                [] -> {error, input_invalid, ?REASON_BAD_CLIENT_CERT};
+                _ -> {ok, Acc#{client_cert_ders => Ders}}
+            end
+    end.
+
+%%--------------------------------------------------------------------
+%% Input parsing: cert_login (optional username-extraction config)
+%%--------------------------------------------------------------------
+
+%% cert_login is optional; when present it must be a map with `from' required
+%% plus optional `san_type' and `san_index' (only valid in SAN mode).
+parse_cert_login(Body, Acc) ->
+    case maps:get(<<"cert_login">>, Body, undefined) of
+        undefined ->
+            {ok, Acc};
+        Map when is_map(Map) ->
+            validate_cert_login(Map, Acc);
+        _ ->
+            {error, input_invalid, ?REASON_BAD_CERT_LOGIN}
+    end.
+
+validate_cert_login(Map, Acc) ->
+    AllowedKeys = [<<"from">>, <<"san_type">>, <<"san_index">>],
+    case [K || K <- maps:keys(Map), not lists:member(K, AllowedKeys)] of
+        [_ | _] ->
+            {error, input_invalid, ?REASON_UNKNOWN_CERT_LOGIN_KEY};
+        [] ->
+            parse_cert_login_from(Map, Acc)
+    end.
+
+parse_cert_login_from(Map, Acc) ->
+    case maps:get(<<"from">>, Map, undefined) of
+        <<"distinguished_name">> ->
+            check_no_san_fields(Map, Acc, distinguished_name);
+        <<"common_name">> ->
+            check_no_san_fields(Map, Acc, common_name);
+        <<"subject_alternative_name">> ->
+            parse_san_fields(Map, Acc);
+        <<"subject_alt_name">> ->
+            parse_san_fields(Map, Acc);
+        _ ->
+            {error, input_invalid, ?REASON_BAD_CERT_LOGIN_FROM}
+    end.
+
+%% For non-SAN modes, san_type and san_index are not valid.
+check_no_san_fields(Map, Acc, From) ->
+    case maps:is_key(<<"san_type">>, Map) of
+        true ->
+            {error, input_invalid, ?REASON_SAN_TYPE_REQUIRES_SAN_FROM};
+        false ->
+            case maps:is_key(<<"san_index">>, Map) of
+                true ->
+                    {error, input_invalid, ?REASON_SAN_INDEX_REQUIRES_SAN_FROM};
+                false ->
+                    {ok, Acc#{cert_login => #{from => From}}}
+            end
+    end.
+
+%% In SAN mode, validate san_type (required) and san_index (optional, default 0).
+parse_san_fields(Map, Acc) ->
+    case maps:get(<<"san_type">>, Map, undefined) of
+        undefined ->
+            {error, input_invalid, ?REASON_BAD_SAN_TYPE};
+        TypeBin ->
+            case san_type_atom(TypeBin) of
+                error ->
+                    {error, input_invalid, ?REASON_BAD_SAN_TYPE};
+                {ok, TypeAtom} ->
+                    parse_san_index(Map, Acc, TypeAtom)
+            end
+    end.
+
+parse_san_index(Map, Acc, TypeAtom) ->
+    case maps:get(<<"san_index">>, Map, 0) of
+        I when is_integer(I), I >= 0 ->
+            {ok, Acc#{
+                cert_login => #{
+                    from => subject_alternative_name,
+                    san_type => TypeAtom,
+                    san_index => I
+                }
+            }};
+        _ ->
+            {error, input_invalid, ?REASON_BAD_SAN_INDEX}
+    end.
+
+san_type_atom(<<"dns">>) -> {ok, dns};
+san_type_atom(<<"ip">>) -> {ok, ip};
+san_type_atom(<<"email">>) -> {ok, email};
+san_type_atom(<<"uri">>) -> {ok, uri};
+san_type_atom(<<"other_name">>) -> {ok, other_name};
+san_type_atom(_) -> error.
+
+%%--------------------------------------------------------------------
+%% Input parsing: cross-field checks
+%%--------------------------------------------------------------------
+
+%% cert_login without client_cert is a conflict; cert_login without verify_peer
+%% is unsafe (the chain would not be validated by the broker).
+cross_field_checks(_Body, Acc) ->
+    case maps:is_key(cert_login, Acc) of
+        false ->
+            {ok, Acc};
+        true ->
+            case maps:is_key(client_cert_ders, Acc) of
+                false ->
+                    {error, config_conflict, ?REASON_CERT_LOGIN_REQUIRES_CLIENT_CERT};
+                true ->
+                    check_verify_for_cert_login(Acc)
+            end
+    end.
+
+check_verify_for_cert_login(#{ssl_options := SslMap} = Acc) ->
+    case maps:get(<<"verify">>, SslMap, undefined) of
+        <<"verify_peer">> -> {ok, Acc};
+        _ -> {error, config_conflict, ?REASON_CERT_LOGIN_REQUIRES_VERIFY_PEER}
+    end.
+
+%%--------------------------------------------------------------------
+%% Layer 1: client certificate chain validation
+%%--------------------------------------------------------------------
+
+%% When client_cert_ders is present, validate the chain against the CA bundle.
+%% Otherwise the existing CA-only validation already passed and we are done
+%% (unless cert_login is present, which cross_field_checks already guarantees
+%% cannot happen without client_cert_ders).
+maybe_chain_validate(#{client_cert_ders := ClientDers} = Params, CaPem) ->
+    CaDers = aws_auth_validate_ssl:decode_pem_cacerts(CaPem),
+    Depth = maps:get(<<"depth">>, maps:get(ssl_options, Params, #{}), undefined),
+    case validate_chain(ClientDers, CaDers, Depth) of
+        ok -> maybe_extract_username(Params);
+        {error, _, _} = Err -> Err
+    end;
+maybe_chain_validate(_Params, _CaPem) ->
+    %% No client_cert: existing CA-only validation already passed.
+    ok.
+
+%% Validate the client certificate chain against the CA trust anchors using
+%% public_key:pkix_path_validation/3. ClientDers is leaf-first; CaDers is the
+%% trust anchor pool. Depth caps intermediate chain length when set.
+-spec validate_chain([binary()], [binary()] | skip, integer() | undefined) ->
+    ok | {error, auth_failed | input_invalid, binary()}.
+validate_chain(_ClientDers, skip, _Depth) ->
+    %% No CA certs decoded (should not reach here -- decode_and_check catches it).
+    {error, auth_failed, ?REASON_CHAIN_FAILED};
+validate_chain(ClientDers, CaDers, Depth) ->
+    try
+        Opts =
+            case Depth of
+                undefined -> [];
+                N when is_integer(N), N >= 0 -> [{max_path_length, N}]
+            end,
+        %% pkix_path_validation wants: TrustAnchor (DER), Chain (EE toward root
+        %% EXCLUDING the anchor), Options. Find which CA in the bundle issued the
+        %% topmost cert in the client chain.
+        TopCert = lists:last(ClientDers),
+        case find_trust_anchor(TopCert, CaDers) of
+            {ok, AnchorDer} ->
+                case public_key:pkix_path_validation(AnchorDer, ClientDers, Opts) of
+                    {ok, _} ->
+                        ok;
+                    {error, {bad_cert, cert_expired}} ->
+                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
+                    {error, {bad_cert, {cert_expired, _}}} ->
+                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
+                    {error, {bad_cert, _}} ->
+                        {error, auth_failed, ?REASON_CHAIN_FAILED}
+                end;
+            not_found ->
+                {error, auth_failed, ?REASON_CHAIN_FAILED}
+        end
+    catch
+        _:_ -> {error, input_invalid, ?REASON_CHAIN_MALFORMED}
+    end.
+
+%% Find the trust anchor in CaDers whose subject matches the issuer of TopCertDer.
+find_trust_anchor(TopCertDer, CaDers) ->
+    TopOtp = public_key:pkix_decode_cert(TopCertDer, otp),
+    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    find_by_subject(Issuer, CaDers).
+
+find_by_subject(_Issuer, []) ->
+    not_found;
+find_by_subject(Issuer, [CaDer | Rest]) ->
+    CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+    Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
+    case public_key:pkix_normalize_name(Issuer) =:= public_key:pkix_normalize_name(Subject) of
+        true -> {ok, CaDer};
+        false -> find_by_subject(Issuer, Rest)
+    end.
+
+%%--------------------------------------------------------------------
+%% Layer 2: username extraction from the leaf certificate
+%%--------------------------------------------------------------------
+
+%% When cert_login is present, extract the username from the leaf cert.
+maybe_extract_username(#{cert_login := Login, client_cert_ders := [LeafDer | _]}) ->
+    case extract_username(LeafDer, Login) of
+        {ok, Username} -> resolve_user(Username);
+        {error, _, _} = Err -> Err
+    end;
+maybe_extract_username(_Params) ->
+    %% No cert_login: chain-check-only case (mTLS encryption validation).
+    ok.
+
+%% COUPLING NOTE (see the parity-scope discussion in the module header): this
+%% function mirrors rabbit_ssl:peer_cert_auth_name/2's three-clause dispatch
+%% (distinguished_name | common_name | subject_alternative_name). The extraction
+%% itself delegates to rabbit_cert_info (broker code) so the field-extraction
+%% logic cannot drift; only this dispatch sequencing and the SAN-type/index
+%% selection can. Keep in sync with peer_cert_auth_name/2 if a new mode is added
+%% upstream.
+-spec extract_username(binary(), map()) ->
+    {ok, binary()} | {error, auth_failed, binary()}.
+extract_username(LeafDer, #{from := distinguished_name}) ->
+    %% Stricter than upstream (which returns an empty binary as a valid name):
+    %% an empty subject is treated as extraction failure. This is deliberate for
+    %% a validation endpoint -- fail-fast rather than silently accepting a name
+    %% that will be rejected later by the auth mechanism.
+    Name = iolist_to_binary(rabbit_cert_info:subject(LeafDer)),
+    case Name of
+        <<>> -> {error, auth_failed, ?REASON_EXTRACT_FAILED};
+        _ -> {ok, Name}
+    end;
+extract_username(LeafDer, #{from := common_name}) ->
+    case rabbit_cert_info:subject_items(LeafDer, ?'id-at-commonName') of
+        not_found ->
+            {error, auth_failed, ?REASON_EXTRACT_FAILED};
+        CNs ->
+            {ok, list_to_binary(string:join(CNs, ","))}
+    end;
+extract_username(LeafDer, #{from := subject_alternative_name, san_type := Type, san_index := Index}) ->
+    OtpType = otp_san_type(Type),
+    SANs = rabbit_cert_info:subject_alternative_names(LeafDer),
+    Filtered = [V || {T, V} <- SANs, T =:= OtpType],
+    %% Index is 0-based in config, 1-based for lists:nth.
+    case length(Filtered) > Index of
+        true ->
+            Raw = lists:nth(Index + 1, Filtered),
+            Value = maybe_sanitize_other_name(OtpType, Raw),
+            {ok, iolist_to_binary([Value])};
+        false ->
+            {error, auth_failed, ?REASON_EXTRACT_FAILED}
+    end.
+
+%% Maps the cert_login san_type atoms to the OTP SAN type tags used by
+%% rabbit_cert_info:subject_alternative_names/1.
+otp_san_type(dns) -> dNSName;
+otp_san_type(ip) -> iPAddress;
+otp_san_type(email) -> rfc822Name;
+otp_san_type(uri) -> uniformResourceIdentifier;
+otp_san_type(other_name) -> otherName.
+
+%% otherName SANs are represented by OTP as {'AnotherName', OID, Value} -- a
+%% 3-tuple. rabbit_cert_info:sanitize_other_name/1 expects a binary, so coerce
+%% via rabbit_data_coercion:to_binary/1 to match the upstream rabbit_ssl
+%% dispatch (rabbit_ssl.erl line ~180).
+maybe_sanitize_other_name(otherName, {'AnotherName', _OID, Value}) ->
+    rabbit_cert_info:sanitize_other_name(rabbit_data_coercion:to_binary(Value));
+maybe_sanitize_other_name(_Type, Value) ->
+    Value.
+
+%%--------------------------------------------------------------------
+%% Layer 3: user resolution (read-only lookup)
+%%--------------------------------------------------------------------
+
+%% Verify that the extracted username exists in the internal auth backend.
+%% This is a read-only mnesia/khepri lookup -- no state mutation (R3).
+-spec resolve_user(binary()) -> ok | {error, auth_failed | config_conflict, binary()}.
+resolve_user(Username) ->
+    case internal_backend_available() of
+        false ->
+            {error, config_conflict, ?REASON_USER_LOOKUP_UNAVAILABLE};
+        true ->
+            %% Look up the RAW extracted name -- it is what the broker's own
+            %% EXTERNAL login would pass to check_user_login. Sanitization is
+            %% applied only when echoing the name in the reason (R4), so the
+            %% lookup verdict cannot diverge from the live broker's.
+            case ?INTERNAL_BACKEND:exists(Username) of
+                true -> ok;
+                false -> {error, auth_failed, ?REASON_USER_NOT_FOUND(Username)}
+            end
+    end.
+
+internal_backend_available() ->
+    module_ready(?INTERNAL_BACKEND) andalso
+        erlang:function_exported(?INTERNAL_BACKEND, exists, 1).
+
+module_ready(Mod) ->
+    case code:ensure_loaded(Mod) of
+        {module, Mod} -> true;
+        _ -> false
+    end.
+
+%% Cap username length and strip control characters. The username derives from
+%% the caller's own supplied certificate (R4 basis for echoing it), but we still
+%% bound it against degenerate inputs.
+-spec sanitize_username(binary()) -> binary().
+sanitize_username(Name) when is_binary(Name) ->
+    Capped =
+        case byte_size(Name) > ?MAX_USERNAME_LEN of
+            true -> binary:part(Name, 0, ?MAX_USERNAME_LEN);
+            false -> Name
+        end,
+    <<<<C>> || <<C>> <= Capped, C >= 32, C =/= 127>>.
