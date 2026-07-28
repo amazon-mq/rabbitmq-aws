@@ -751,6 +751,34 @@ tls_validate_chain_depth_zero_single_leaf_test() ->
     {_CaKey, CaDer, LeafDer} = gen_ca_and_leaf(),
     ?assertEqual(ok, aws_auth_validate_tls:validate_chain([LeafDer], [CaDer], 0)).
 
+tls_validate_chain_with_intermediate_test() ->
+    %% Leaf signed by an intermediate CA, presented leaf-first with the
+    %% intermediate ([leaf, int]); the root is the bundle anchor. This is the
+    %% real client-chain shape and requires the chain to be reordered
+    %% anchor-closest-first for pkix_path_validation.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_missing_intermediate_test() ->
+    %% The same leaf without its intermediate cannot build a path to the root
+    %% anchor, so it must be rejected.
+    {RootDer, _IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_intermediate_depth_zero_rejected_test() ->
+    %% depth=0 forbids any intermediate; the leaf+intermediate chain exceeds it.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], 0)
+    ).
+
 %%====================================================================
 %% Username extraction tests (Layer 2)
 %%====================================================================
@@ -1013,3 +1041,58 @@ gen_private_key_pem() ->
 %% Derive the cert filename from the key filename (matching gen_ca's naming).
 ca_cert_file_from_key(CaKeyFile) ->
     re:replace(CaKeyFile, "ca-key-", "ca-cert-", [{return, list}]).
+
+%% Generate a root CA, an intermediate CA signed by the root, and a leaf signed
+%% by the intermediate. Returns {RootCaDer, IntDer, LeafDer}. Exercises the
+%% multi-cert chain path (leaf + intermediate presented, root is the anchor).
+gen_root_int_leaf() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    F = fun(Name) -> filename:join(Dir, Name ++ "-" ++ Suffix ++ ".pem") end,
+    RootKey = F("ri-root-key"),
+    RootCert = F("ri-root-cert"),
+    IntKey = F("ri-int-key"),
+    IntCsr = F("ri-int-csr"),
+    IntCert = F("ri-int-cert"),
+    IntExt = F("ri-int-ext"),
+    LeafKey = F("ri-leaf-key"),
+    LeafCsr = F("ri-leaf-csr"),
+    LeafCert = F("ri-leaf-cert"),
+    ok = file:write_file(
+        IntExt,
+        "basicConstraints=critical,CA:TRUE,pathlen:0\n"
+        "keyUsage=critical,keyCertSign,cRLSign\n"
+    ),
+    Sh = fun(Fmt, Args) -> os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj /CN=TestRootCA~s 2>/dev/null",
+        [RootKey, RootCert, Suffix]
+    ),
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj /CN=TestIntCA~s 2>/dev/null",
+        [IntKey, IntCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 -extfile ~ts 2>/dev/null",
+        [IntCsr, RootCert, RootKey, IntCert, IntExt]
+    ),
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj /CN=TestChainLeaf~s 2>/dev/null",
+        [LeafKey, LeafCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 2>/dev/null",
+        [LeafCsr, IntCert, IntKey, LeafCert]
+    ),
+    {ok, RootPem} = file:read_file(RootCert),
+    {ok, IntPem} = file:read_file(IntCert),
+    {ok, LeafPem} = file:read_file(LeafCert),
+    [{'Certificate', RootDer, not_encrypted}] = public_key:pem_decode(RootPem),
+    [{'Certificate', IntDer, not_encrypted}] = public_key:pem_decode(IntPem),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {RootDer, IntDer, LeafDer}.

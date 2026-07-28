@@ -588,13 +588,17 @@ validate_chain(ClientDers, CaDers, Depth) ->
                 undefined -> [];
                 N when is_integer(N), N >= 0 -> [{max_path_length, N}]
             end,
-        %% pkix_path_validation wants: TrustAnchor (DER), Chain (EE toward root
-        %% EXCLUDING the anchor), Options. Find which CA in the bundle issued the
-        %% topmost cert in the client chain.
+        %% pkix_path_validation wants: TrustAnchor (DER), Chain (Options).
+        %% ClientDers is leaf-first ([leaf, intermediates...]); the topmost cert
+        %% (lists:last) is the one issued by a bundle CA, so match the anchor
+        %% against its issuer. The chain itself must be passed anchor-closest
+        %% first (the cert the anchor issued down to the leaf), which is the
+        %% reverse of the leaf-first ClientDers.
         TopCert = lists:last(ClientDers),
+        Chain = lists:reverse(ClientDers),
         case find_trust_anchor(TopCert, CaDers) of
             {ok, AnchorDer} ->
-                case public_key:pkix_path_validation(AnchorDer, ClientDers, Opts) of
+                case public_key:pkix_path_validation(AnchorDer, Chain, Opts) of
                     {ok, _} ->
                         ok;
                     {error, {bad_cert, cert_expired}} ->
