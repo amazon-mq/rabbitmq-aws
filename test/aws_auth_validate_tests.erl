@@ -860,11 +860,12 @@ assume_role_configured_failure_returns_input_invalid() ->
     ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_')).
 
 %%--------------------------------------------------------------------
-%% R6: password must never reach a crash report / log, even on a raise
+%% The resolved password must never reach a crash report or log, even on a raise
 %%--------------------------------------------------------------------
 
 %% A unique, recognisable sentinel standing in for the resolved bind password.
-%% If it appears anywhere in a crash report or log line, R6 is violated.
+%% If it appears anywhere in a crash report or log line, the no-credential-leakage
+%% invariant is violated.
 -define(SECRET, "S3cr3t-Sentinel-Passw0rd-DO-NOT-LEAK").
 
 %% do_ldap_validate/1 is not exported, so reach it via validate/1's public
@@ -1040,7 +1041,7 @@ cacert_arn_resolution_test_() ->
                 ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
             end},
             {"resolved secret never appears in the ARN-failure reason", fun() ->
-                %% R6: field attribution must not become a channel for content.
+                %% Field attribution must not become a channel for secret content.
                 meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
                     {error, {access_denied, "arn:aws:iam::999:role/secret-role"}, State}
                 end),
@@ -1317,8 +1318,8 @@ fill_does_not_affect_literal_dns_test() ->
 value_str({string, S}) -> S;
 value_str(S) when is_list(S) -> S.
 
-%% Parity of fill/2 with the broker's fill machinery (design req R12). Our DN
-%% sinks must match rabbit_ldap_rfc4514:fill_dn/2 and our value sinks must match
+%% Parity of fill/2 with the broker's fill machinery. Our DN sinks must match
+%% rabbit_ldap_rfc4514:fill_dn/2 and our value sinks must match
 %% rabbit_auth_backend_ldap_util:fill/2. Skips unless both upstream modules are
 %% loadable (same matrix concern as the parser parity test).
 fill_parity_test_() ->
@@ -1385,7 +1386,7 @@ fill_upstream_usable() ->
         erlang:function_exported(rabbit_ldap_rfc4514, fill_dn, 2) andalso
         erlang:function_exported(rabbit_auth_backend_ldap_util, fill, 2).
 
-%% Parity with rabbit_auth_backend_ldap_util:parse_query/1 (design req R12).
+%% Parity with rabbit_auth_backend_ldap_util:parse_query/1.
 %% The broker's parser throws via cuttlefish:invalid/2 on rejection; ours
 %% returns {error, _}. Assert both classify each corpus entry the same way.
 %%

@@ -419,7 +419,7 @@ oidc_discovery_jwks_uri_ssrf_denied_test_() ->
     end}.
 
 %%--------------------------------------------------------------------
-%% R6: no secret leakage in error results
+%% No secret leakage in error results
 %%--------------------------------------------------------------------
 
 %% A network-phase error must never include resolved secret material.
@@ -846,7 +846,7 @@ access_token_end_to_end_expired_test_() ->
         [?_assertMatch({error, token_expired, _}, aws_auth_validate_oauth:validate(Body))]
     end}.
 
-%% R6: a valid supplied token's claims must not leak into the rendered result.
+%% A valid supplied token's claims must not leak into the rendered result.
 access_token_no_leak_test_() ->
     {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
         #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),

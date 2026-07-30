@@ -632,7 +632,7 @@ is_denied_ip(IP) ->
 %% BROADER than the http/oauth infra-only denylist in aws_auth_validate_net: LDAP
 %% denies ALL RFC1918/CGNAT/reserved space, not just broker infra. Sharing the
 %% classifier while keeping a distinct list means a future range or segment-math
-%% fix cannot silently apply to only one backend. Mirrors #153, one layer up.
+%% fix cannot silently apply to only one backend.
 %%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space; it can
 %%     route to provider/internal infrastructure, so it is denied too.
 %%   240.0.0.0/4 is reserved/Class E, including 255.255.255.255 limited broadcast.
@@ -671,17 +671,18 @@ check_config_conflicts(_) ->
 %% LDAP execution
 %%--------------------------------------------------------------------
 
-%% SECURITY (R6): the resolved bind password is passed to eldap:simple_bind/3
-%% as a direct argument. If anything in the connect/bind/post-bind section
-%% *raises* (rather than returning {error, _}), the exception's stacktrace
-%% would carry the live argument terms -- including this function's Params map,
-%% which holds the plaintext password -- into a Cowboy crash report. To
-%% guarantee the password can never reach a log or crash dump, the entire body
-%% is destructured into a separate worker (do_ldap_bind/1) whose only job is to
-%% return a fixed-category result, and any escaping exception is caught here and
-%% collapsed to the fixed connection_failed category. We deliberately discard
-%% the caught class/reason/stacktrace (binding them to throwaway names that are
-%% never logged or returned) so no fragment of the bind arguments survives.
+%% SECURITY: no credential leakage. The resolved bind password is passed to
+%% eldap:simple_bind/3 as a direct argument. If anything in the connect/bind/
+%% post-bind section *raises* (rather than returning {error, _}), the
+%% exception's stacktrace would carry the live argument terms -- including this
+%% function's Params map, which holds the plaintext password -- into a Cowboy
+%% crash report. To guarantee the password can never reach a log or crash dump,
+%% the entire body is destructured into a separate worker (do_ldap_bind/1) whose
+%% only job is to return a fixed-category result, and any escaping exception is
+%% caught here and collapsed to the fixed connection_failed category. We
+%% deliberately discard the caught class/reason/stacktrace (binding them to
+%% throwaway names that are never logged or returned) so no fragment of the bind
+%% arguments survives.
 %% Note: a raise in a post-bind probe (e.g. eldap:search/2 in object_exists/2)
 %% is therefore reported as connection_failed rather than its more specific
 %% category. This is a deliberate, safe degradation -- those probes already map
@@ -726,7 +727,7 @@ do_ldap_connect(
             {error, connection_failed, ?REASON_CONNECTION};
         {ok, Handle} ->
             try
-                %% SSRF (R4): close the DNS-rebinding window. parse_servers/2's
+                %% SSRF defense: close the DNS-rebinding window. parse_servers/2's
                 %% is_allowed_server/1 vetted a resolved IP, but eldap re-resolved
                 %% the hostname for this connection, so the peer we are actually
                 %% attached to may differ (DNS rebinding). Re-check the *real*
@@ -1010,7 +1011,8 @@ eval_dn_probe(DN, Probe) ->
 %% (default "member") against the resolved user DN. A match means the user is a
 %% member. Distinct from object_exists/2, which only proves the group EXISTS;
 %% reusing that here would wrongly pass a real-but-non-member group. Any
-%% non-{ok,_} collapses to false (never raises -- R6).
+%% non-{ok,_} collapses to false (never raises -- so a resolved secret cannot
+%% reach a crash report).
 eval_membership(_Handle, _DN, _Desc, undefined) ->
     %% No resolved principal in scope for this sub-result; degrade.
     skip;
@@ -1154,8 +1156,9 @@ build_tls_opts(true, SslOpts) ->
 
 %% Resolve an ARN using the request's threaded aws_state() (shared helper). The
 %% state is built once per request by resolve_request_state/1 under the
-%% operator-configured assume_role. R6: the resolved secret is neither logged nor
-%% returned; R3: this runs only after the pure validation pipeline.
+%% operator-configured assume_role. The resolved secret is neither logged nor
+%% returned (no credential leakage); this runs only after the pure validation
+%% pipeline (zero side effects -- no secret fetch for a malformed request).
 resolve_arn(Arn, State) when is_binary(Arn) ->
     aws_auth_validate_ssl:resolve_arn(Arn, State).
 

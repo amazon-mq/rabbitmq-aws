@@ -333,10 +333,10 @@ scheme_policy_divergence_test() ->
     ?assertEqual(ok, aws_auth_validate_oauth:url_allowed(HttpsUrl)).
 
 %%--------------------------------------------------------------------
-%% aws_auth_validate_ssl:apply_verify_default/2 (R7): verify_peer is never
-%% SILENTLY downgraded. This is the false-positive the whole endpoint exists to
-%% prevent -- an operator who wrote verify_peer must not be told "reachable" by a
-%% probe that quietly fell back to verify_none. These pin every branch of the
+%% aws_auth_validate_ssl:apply_verify_default/2: verify_peer is never SILENTLY
+%% downgraded to verify_none. An explicitly requested verify_peer with no trust
+%% anchor must FAIL rather than pass, because silently downgrading would report a
+%% config as certificate-verified when it is not. These pin every branch of the
 %% policy directly, deterministically, without needing a live TLS server (the
 %% http/oauth/tls SUITEs cover it end to end but skip when no server is present).
 %%
@@ -362,9 +362,8 @@ with_empty_os_store(Fun) ->
         end,
         fun(_) -> meck:unload(public_key) end, Fun}.
 
-%% LOAD-BEARING R7 assertion: an EXPLICIT verify_peer with no trust anchor MUST
-%% fail closed with tls_failed -- it must never be silently downgraded to
-%% verify_none.
+%% LOAD-BEARING assertion: an EXPLICIT verify_peer with no trust anchor MUST fail
+%% closed with tls_failed -- it must never be silently downgraded to verify_none.
 apply_verify_default_explicit_verify_peer_without_anchor_fails_test_() ->
     with_empty_os_store(fun() ->
         Result = aws_auth_validate_ssl:apply_verify_default([{verify, verify_peer}], true),

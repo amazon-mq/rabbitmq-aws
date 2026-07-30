@@ -205,9 +205,9 @@ init_per_testcase(success_returns_204 = TC, Config) ->
     rabbit_ct_helpers:testcase_started(Config, TC);
 init_per_testcase(backend_raise_returns_500_without_leak = TC, Config) ->
     %% Drive the registry dispatch to RAISE with a secret-bearing term, so the
-    %% handler's with_semaphore/6 defence-in-depth catch (the R6 crash-dump guard)
-    %% is exercised through the real Cowboy pipeline. The mock runs ON THE BROKER
-    %% NODE so the handler sees it.
+    %% handler's with_semaphore/6 defence-in-depth catch (the crash-dump leakage
+    %% guard) is exercised through the real Cowboy pipeline. The mock runs ON THE
+    %% BROKER NODE so the handler sees it.
     ok = rabbit_ct_broker_helpers:rpc(
         Config, 0, ?MODULE, mock_dispatch_raise, [?LEAK_SENTINEL]
     ),
@@ -404,12 +404,12 @@ method_disabled_returns_404(Config) ->
     {ok, {{_, Code, _}, _, _}} = put_request(Config, ?API, Body),
     ?assertEqual(404, Code).
 
-%% R5/R6 (crash-dump leakage): the handler's with_semaphore/6 wraps the backend
-%% dispatch in a try/catch whose sole purpose is to keep an escaping exception --
-%% which would carry the request BodyMap (and any resolved secret) into a Cowboy
-%% crash report -- from ever surfacing. Nothing exercised that catch before: the
-%% success/error paths all RETURN a value, so the class:reason:stack discard was
-%% asserted nowhere.
+%% No credential leakage (crash-dump path): the handler's with_semaphore/6 wraps
+%% the backend dispatch in a try/catch whose sole purpose is to keep an escaping
+%% exception -- which would carry the request BodyMap (and any resolved secret)
+%% into a Cowboy crash report -- from ever surfacing. Nothing exercised that catch
+%% before: the success/error paths all RETURN a value, so the class:reason:stack
+%% discard was asserted nowhere.
 %%
 %% Here we force dispatch to RAISE with a secret-bearing term (the worst case for
 %% a crash-report leak) and drive a real PUT through the handler. We assert:
@@ -419,7 +419,7 @@ method_disabled_returns_404(Config) ->
 %%      body -- it is a fixed category + message only.
 %% The submitted-password no-leak on the response is covered by
 %% password_not_in_response; this is specifically the RAISE path through the
-%% handler boundary that the design doc flagged as unproven.
+%% handler boundary that was previously unproven.
 backend_raise_returns_500_without_leak(Config) ->
     Body = (base_body())#{<<"password">> => ?LEAK_SENTINEL},
     {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?API, Body),
@@ -466,11 +466,11 @@ custom_tag_insufficient_returns_401(Config) ->
     ?assertEqual(401, Code),
     ?assertMatch(#{<<"error">> := <<"insufficient_user_tag">>}, decode(ResBody)).
 
-%% R2 confirmatory test: the authorize_tag/3 `user = undefined' clause
-%% (aws_auth_validate_mgmt.erl) lets a request through WITHOUT a user, on the
-%% documented assumption that only an unauthenticated OPTIONS preflight can reach
-%% it (rabbit_mgmt_util short-circuits OPTIONS to {true, _, undefined} before
-%% authenticating). The safety of the whole custom-tag branch rests on that
+%% Authorization gate confirmatory test: the authorize_tag/3 `user = undefined'
+%% clause (aws_auth_validate_mgmt.erl) lets a request through WITHOUT a user, on
+%% the documented assumption that only an unauthenticated OPTIONS preflight can
+%% reach it (rabbit_mgmt_util short-circuits OPTIONS to {true, _, undefined}
+%% before authenticating). The safety of the whole custom-tag branch rests on that
 %% clause being UNREACHABLE by a state-changing PUT. This asserts the invariant:
 %% an UNAUTHENTICATED PUT (no auth header) is stopped with 401 by is_authorized/2
 %% BEFORE authorize_tag/3 is reached -- it must never dispatch. If a future
@@ -570,7 +570,7 @@ oauth_success_returns_204(Config) ->
 
 %% The 204 response must carry no secret material. We submit a body that
 %% contains a plausible secret field and verify it does not appear in the
-%% response (R6).
+%% response.
 oauth_response_no_secret(Config) ->
     Secret = <<"oauth-client-secret-DO-NOT-LEAK-1234">>,
     Body = (oauth_body())#{<<"client_secret">> => Secret},
@@ -655,7 +655,7 @@ oauth_authz_denies_returns_422(Config) ->
     {ok, {{_, Code, _}, _Headers, ResBody}} = put_request(Config, ?OAUTH_API, Body),
     ?assertEqual(422, Code),
     ?assertMatch(#{<<"error">> := <<"authz_unverified">>}, decode(ResBody)),
-    %% R6/R4: the caller's token must never appear in the response body.
+    %% The caller's token must never appear in the response body.
     ?assertEqual(nomatch, binary:match(iolist_to_binary(ResBody), Token)).
 
 %%--------------------------------------------------------------------

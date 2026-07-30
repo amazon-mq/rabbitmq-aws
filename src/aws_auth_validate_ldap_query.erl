@@ -9,9 +9,9 @@
 %% This intentionally mirrors the grammar accepted by
 %% rabbit_auth_backend_ldap_util:parse_query/1 (erl_scan + erl_parse:parse_term
 %% over the same accepted-term allowlist) so that a query the broker would
-%% accept is accepted here and vice-versa (design requirement R12: the
-%% validation endpoint must not diverge from rabbit_auth_backend_ldap). A
-%% parity test in aws_auth_validate_tests guards against drift.
+%% accept is accepted here and vice-versa -- the endpoint's parse decision must
+%% match the live broker's for the same input. A parity test in
+%% aws_auth_validate_tests guards against drift.
 %%
 %% Three deliberate differences from the upstream helper:
 %%   1. It returns {ok, Query} | {error, Reason} instead of throwing via

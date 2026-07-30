@@ -232,9 +232,9 @@ custom_ca_verify_peer_returns_ok(Config) ->
         meck:unload(aws_arn_util)
     end.
 
-%% R4/R6: a fixed-category error response must not echo the target host, port,
-%% or URL. Drive an auth_failed (a 404 JWKS) and assert the rendered result
-%% contains neither the loopback address nor the stub port.
+%% Fixed-category responses must not echo the target host, port, or URL (doing so
+%% would enable SSRF reconnaissance). Drive an auth_failed (a 404 JWKS) and assert
+%% the rendered result contains neither the loopback address nor the stub port.
 error_reason_leaks_no_target_detail(Config) ->
     Port = ?config(self_port, Config),
     Url = self_url(Config, "/notfound"),

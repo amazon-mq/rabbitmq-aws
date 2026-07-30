@@ -259,7 +259,7 @@ tls_arn_resolve_failure_test_() ->
                 R
             ),
             %% The resolved content and the underlying AWS error must never be
-            %% echoed, however specific the field attribution gets (R6/R4).
+            %% echoed, however specific the field attribution gets.
             ?_assertNot(reason_contains(R, ?SECRET)),
             ?_assertNot(reason_contains(R, <<"not_found">>))
         ]
