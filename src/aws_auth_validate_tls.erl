@@ -676,7 +676,14 @@ validate_chain(ClientDers, CaDers, Depth) ->
             end,
         %% Rebuild the chain in issuer-linked order starting from the leaf.
         %% The leaf MUST be element 0; the tail is reordered by issuer linkage.
-        OrderedDers = order_chain(ClientDers),
+        Reordered = order_chain(ClientDers),
+        %% A listener treats every cacerts entry as chain-building material, not
+        %% only as a trust anchor (ssl_certificate:certificate_chain/3), so a
+        %% bundle carrying [root, intermediate] completes a client that presents
+        %% the leaf alone. Extend the chain with non-self-signed bundle CAs
+        %% before searching for an anchor, or that configuration -- which a real
+        %% handshake accepts -- would be reported as not chaining.
+        OrderedDers = extend_with_bundle_intermediates(Reordered, CaDers),
         %% The top cert (lists:last) is the one closest to (or matching) a
         %% bundle CA. Find anchors based on its issuer. If the top cert itself
         %% is one of the anchors (client included the root in its PEM), strip
@@ -790,6 +797,46 @@ find_issuer_in(Issuer, [Der | Rest]) ->
         false ->
             case find_issuer_in(Issuer, Rest) of
                 {ok, Found, Rem} -> {ok, Found, [Der | Rem]};
+                not_found -> not_found
+            end
+    end.
+
+%% Extend an ordered (leaf-first) chain upward using non-self-signed CAs from
+%% the bundle, mirroring how a listener uses cacerts as chain-building material
+%% and not only as anchors. Only NON-self-signed entries are appended: a
+%% self-signed match is a trust anchor and is handled by find_trust_anchors/2,
+%% which also keeps a self-signed cert from being appended to itself.
+%%
+%% Each appended CA is removed from the candidate pool, so the recursion is
+%% bounded by the bundle size and cannot loop on a cross-signed pair.
+extend_with_bundle_intermediates(OrderedDers, CaDers) ->
+    TopCert = lists:last(OrderedDers),
+    TopOtp = public_key:pkix_decode_cert(TopCert, otp),
+    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    case take_non_self_signed_by_subject(Issuer, CaDers) of
+        {ok, IntDer, RestCaDers} ->
+            extend_with_bundle_intermediates(OrderedDers ++ [IntDer], RestCaDers);
+        not_found ->
+            OrderedDers
+    end.
+
+%% Take the first non-self-signed bundle CA whose subject matches Issuer,
+%% returning it alongside the remaining candidates.
+take_non_self_signed_by_subject(_Issuer, []) ->
+    not_found;
+take_non_self_signed_by_subject(Issuer, [CaDer | Rest]) ->
+    CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+    Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
+    Matches =
+        public_key:pkix_normalize_name(Issuer) =:=
+            public_key:pkix_normalize_name(Subject) andalso
+            not public_key:pkix_is_self_signed(CaOtp),
+    case Matches of
+        true ->
+            {ok, CaDer, Rest};
+        false ->
+            case take_non_self_signed_by_subject(Issuer, Rest) of
+                {ok, Found, Rem} -> {ok, Found, [CaDer | Rem]};
                 not_found -> not_found
             end
     end.

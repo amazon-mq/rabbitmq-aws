@@ -60,13 +60,9 @@ parity_test_() ->
                     {"intermediate_only_control_root_bundle_leaf_plus_int_both_accept", fun() ->
                         intermediate_only_control_root_bundle_leaf_plus_int_accept(Fixtures)
                     end},
-                    %% NOTE: a control case "bundle=[Root,Int], client=[leaf]" is
-                    %% deliberately omitted. It reveals a SEPARATE source divergence
-                    %% where the endpoint does not use bundle entries as intermediate
-                    %% chain-building material (only as trust anchors), while ssl does.
-                    %% That is a new finding beyond the seven fixed in PR #165 -- see the
-                    %% commit message for details. A source fix is needed before this
-                    %% control can be enabled.
+                    {"root_int_bundle_leaf_alone_both_accept", fun() ->
+                        root_int_bundle_leaf_alone_both_accept(Fixtures)
+                    end},
                     {"key_rollover_old_new_order_both_accept", fun() ->
                         key_rollover_old_new_order_both_accept(Fixtures)
                     end},
@@ -195,6 +191,38 @@ intermediate_only_control_root_bundle_leaf_plus_int_accept(#{
         ServerKey
     ),
     assert_parity(EndpointResult, SslResult, "control_root_bundle_leaf_plus_int").
+
+%% Control for Finding 1: bundle=[Root, Int], client=[leaf] -- both accept.
+%%
+%% This is the reviewer's fourth measured control ("bundle=[Root, Int], client
+%% sends [leaf] -> handshake ok"). A listener treats every cacerts entry as
+%% chain-building material, not only as a trust anchor, so it discovers the
+%% intermediate in the bundle and completes the leaf-only client. Requiring a
+%% self-signed anchor (the Finding 1 fix) turned this into a false FAIL until
+%% validate_chain/3 also extended the chain from the bundle. Keep this pinned:
+%% it is the case that distinguishes "reject non-self-signed ANCHORS" from the
+%% overreach of "ignore non-self-signed bundle entries entirely".
+root_int_bundle_leaf_alone_both_accept(#{
+    root_der := RootDer,
+    int_der := IntDer,
+    leaf_der := LeafDer,
+    leaf_key := LeafKey,
+    leaf_cert := LeafCert,
+    server_key := ServerKey,
+    server_cert := ServerCert,
+    root_cert := RootCert,
+    int_cert := IntCert
+}) ->
+    EndpointResult = aws_auth_validate_tls:validate_chain([LeafDer], [RootDer, IntDer], undefined),
+    ChainFile = write_chain_file([LeafCert]),
+    SslResult = do_handshake(
+        _CaCerts = [RootCert, IntCert],
+        _ClientCertFile = ChainFile,
+        _ClientKeyFile = LeafKey,
+        ServerCert,
+        ServerKey
+    ),
+    assert_parity(EndpointResult, SslResult, "root_int_bundle_leaf_alone").
 
 %% Finding 2: Key rollover, bundle order [OldRoot, NewRoot], leaf chains to NewRoot.
 key_rollover_old_new_order_both_accept(#{
