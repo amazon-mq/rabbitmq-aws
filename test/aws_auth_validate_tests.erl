@@ -996,6 +996,62 @@ cacert_arn_resolution_test_() ->
                     aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:garbage">>))
                 )
             end},
+            {"both ARNs unresolvable -> one reason naming BOTH fields", fun() ->
+                %% The plural case: an operator with two broken ARNs must learn
+                %% about both in one response instead of fixing one, retrying,
+                %% and discovering the second. Requires the resolver to attempt
+                %% both rather than stopping at the password.
+                meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+                    {error, not_found, State}
+                end),
+                ?assertEqual(
+                    {error, input_invalid, <<
+                        "ARN resolution failed for: password_arn, "
+                        "ssl_options.cacertfile_arn"
+                    >>},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:nope">>))
+                )
+            end},
+            {"only the password ARN failing names only that field", fun() ->
+                %% Attribution must be precise: a working CA bundle must not be
+                %% blamed alongside the broken password.
+                meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                    case lists:prefix("arn:aws:cacert", Arn) of
+                        true -> {ok, ca_pem_for_test(), State};
+                        false -> {error, not_found, State}
+                    end
+                end),
+                ?assertEqual(
+                    {error, input_invalid, <<"ARN resolution failed for: password_arn">>},
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:ok">>))
+                )
+            end},
+            {"a password_arn SHAPE error fetches no ARN at all", fun() ->
+                %% ARN-first ordering: aggregating failures must not cause a
+                %% malformed request to trigger a secret fetch. A missing
+                %% password_arn is pure-input invalid, so neither ARN is fetched
+                %% even though a cacertfile_arn is present.
+                meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+                    {ok, <<"pw">>, State}
+                end),
+                Body = maps:remove(<<"password_arn">>, tls_body(<<"arn:aws:cacert:x">>)),
+                Result = aws_auth_validate_ldap:validate(Body),
+                ?assertMatch({error, input_invalid, <<"password_arn must be", _/binary>>}, Result),
+                ?assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            end},
+            {"resolved secret never appears in the ARN-failure reason", fun() ->
+                %% R6: field attribution must not become a channel for content.
+                meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+                    {error, {access_denied, "arn:aws:iam::999:role/secret-role"}, State}
+                end),
+                {error, input_invalid, Reason} =
+                    aws_auth_validate_ldap:validate(tls_body(<<"arn:aws:cacert:nope">>)),
+                %% The underlying AWS error (which can carry account ids and role
+                %% names) must be dropped, not echoed.
+                ?assertEqual(nomatch, binary:match(Reason, <<"999">>)),
+                ?assertEqual(nomatch, binary:match(Reason, <<"secret-role">>)),
+                ?assertEqual(nomatch, binary:match(Reason, <<"access_denied">>))
+            end},
             {"CA-cert ARN ignored when TLS is off (no resolve, no error)", fun() ->
                 %% With use_ssl/use_starttls both false the CA cert is never
                 %% consumed, so a bogus cacertfile_arn must not trigger a
@@ -1018,6 +1074,25 @@ cacert_arn_resolution_test_() ->
                 ?assertNotMatch({error, input_invalid, _}, Result)
             end}
         ]}.
+
+%% A self-signed CA PEM, so a mocked cacertfile_arn can RESOLVE successfully and
+%% the test isolates password-ARN attribution from a CA content failure.
+ca_pem_for_test() ->
+    Dir = filename:join(["/tmp", "aws-auth-validate-ldap-arn-tests"]),
+    ok = filelib:ensure_dir(filename:join(Dir, "x")),
+    Key = filename:join(Dir, "ca-key.pem"),
+    Cert = filename:join(Dir, "ca-cert.pem"),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-days 2 -subj /CN=AwsAuthValidateLdapArnTestCA 2>/dev/null",
+                [Key, Cert]
+            )
+        )
+    ),
+    {ok, Pem} = file:read_file(Cert),
+    Pem.
 
 %% A body with TLS enabled and a caller-supplied CA-cert ARN, otherwise valid.
 tls_body(CacertArn) ->

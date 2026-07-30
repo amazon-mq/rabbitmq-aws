@@ -558,8 +558,87 @@ http_resolve_arn_fails_closed_on_none_sentinel_test_() ->
             },
             Result = aws_auth_validate_http:build_client_ssl_opts(Params),
             [
-                ?_assertEqual({error, input_invalid, <<"failed to resolve ARN">>}, Result),
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"ARN resolution failed for: ssl_options.cacertfile_arn">>},
+                    Result
+                ),
                 ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% All THREE ARN fields failing are named in one response. The point of the
+%% attribution is that an operator with several broken ARNs learns about all of
+%% them in a single call instead of one per round trip, so the resolver must
+%% attempt every ARN rather than stopping at the first failure.
+http_arn_resolve_failure_names_all_failed_fields_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {error, denied, State} end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
+            Params = #{
+                ssl_options => #{
+                    <<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>,
+                    <<"certfile_arn">> => <<"arn:aws:s3:::cert">>,
+                    <<"keyfile_arn">> => <<"arn:aws:s3:::key">>
+                },
+                aws_state => fake_state
+            },
+            Result = aws_auth_validate_http:build_client_ssl_opts(Params),
+            [
+                ?_assertEqual(
+                    {error, input_invalid, <<
+                        "ARN resolution failed for: ssl_options.cacertfile_arn, "
+                        "ssl_options.certfile_arn, ssl_options.keyfile_arn"
+                    >>},
+                    Result
+                ),
+                %% Every ARN must actually be attempted -- that is what makes the
+                %% full list possible. Short-circuiting would name only the first.
+                ?_assertEqual(3, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% Only the fields that actually failed are named: a request whose CA bundle
+%% resolves but whose mTLS key does not must not blame the CA bundle.
+http_arn_resolve_failure_names_only_failed_fields_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                case lists:suffix("key", Arn) of
+                    true -> {error, denied, State};
+                    false -> {ok, ?SECRET, State}
+                end
+            end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
+            Params = #{
+                ssl_options => #{
+                    <<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>,
+                    <<"certfile_arn">> => <<"arn:aws:s3:::cert">>,
+                    <<"keyfile_arn">> => <<"arn:aws:s3:::key">>
+                },
+                aws_state => fake_state
+            },
+            Result = aws_auth_validate_http:build_client_ssl_opts(Params),
+            [
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"ARN resolution failed for: ssl_options.keyfile_arn">>},
+                    Result
+                ),
+                %% The resolved material must never appear in the reason (R6).
+                ?_assertNot(
+                    case Result of
+                        {error, _, R} -> binary:match(R, ?SECRET) =/= nomatch;
+                        _ -> false
+                    end
+                )
             ]
         end}.
 

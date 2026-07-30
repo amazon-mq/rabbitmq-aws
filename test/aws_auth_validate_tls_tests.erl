@@ -246,15 +246,30 @@ tls_malformed_pem_maps_to_input_invalid_test_() ->
         end
     ).
 
-%% An ARN resolution failure maps to input_invalid.
+%% An ARN resolution failure maps to input_invalid and NAMES the field that
+%% failed, so the operator knows which ARN to fix. This backend takes only
+%% cacertfile_arn, so there is exactly one field to name.
 tls_arn_resolve_failure_test_() ->
     {setup, fun setup_role/0, fun cleanup_role/1, fun(_) ->
         meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {error, not_found, State} end),
         R = validate_ok_body(),
         [
-            ?_assertEqual({error, input_invalid, <<"failed to resolve ARN">>}, R)
+            ?_assertEqual(
+                {error, input_invalid, <<"ARN resolution failed for: ssl_options.cacertfile_arn">>},
+                R
+            ),
+            %% The resolved content and the underlying AWS error must never be
+            %% echoed, however specific the field attribution gets (R6/R4).
+            ?_assertNot(reason_contains(R, ?SECRET)),
+            ?_assertNot(reason_contains(R, <<"not_found">>))
         ]
     end}.
+
+%% True when the reason binary of an error result contains Needle.
+reason_contains({error, _Category, Reason}, Needle) when is_binary(Reason) ->
+    binary:match(Reason, Needle) =/= nomatch;
+reason_contains(_Other, _Needle) ->
+    false.
 
 %% A valid, in-window CA bundle passes. Generated fresh so it is current.
 tls_valid_ca_returns_ok_test_() ->
