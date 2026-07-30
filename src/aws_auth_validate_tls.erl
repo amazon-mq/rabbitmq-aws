@@ -109,15 +109,19 @@
 
 %% client_cert / cert_login reason strings (Layer 1-3 validation).
 -define(REASON_BAD_CLIENT_CERT,
-    <<"client_cert must be a non-empty PEM-encoded certificate chain">>
+    <<"client_cert must be a non-empty PEM-encoded certificate chain (leaf certificate first)">>
 ).
 -define(REASON_CLIENT_CERT_PRIVATE_KEY,
     <<"client_cert must not contain private key material; send only certificate entries">>
 ).
--define(REASON_BAD_CERT_LOGIN, <<"cert_login must be an object">>).
--define(REASON_BAD_CERT_LOGIN_FROM,
-    <<"cert_login.from must be distinguished_name, common_name, or subject_alternative_name">>
+-define(REASON_CLIENT_CERT_UNEXPECTED_ENTRY,
+    <<"client_cert contains a non-certificate PEM entry; send only certificate entries">>
 ).
+-define(REASON_BAD_CERT_LOGIN, <<"cert_login must be an object">>).
+-define(REASON_BAD_CERT_LOGIN_FROM, <<
+    "cert_login.from must be distinguished_name, common_name, "
+    "subject_alternative_name, or subject_alt_name"
+>>).
 -define(REASON_SAN_TYPE_REQUIRES_SAN_FROM,
     <<"cert_login.san_type is only valid when from is subject_alternative_name">>
 ).
@@ -142,6 +146,21 @@
 -define(REASON_CHAIN_FAILED,
     <<"the client certificate does not chain to the supplied CA bundle">>
 ).
+-define(REASON_CHAIN_DEPTH_EXCEEDED,
+    <<"the client certificate chain exceeds the configured path length (depth)">>
+).
+-define(REASON_CHAIN_INVALID_SIGNATURE,
+    <<"a certificate in the client chain has an invalid signature">>
+).
+-define(REASON_CHAIN_INVALID_ISSUER,
+    <<"a certificate in the client chain has an invalid issuer">>
+).
+-define(REASON_CHAIN_BAD_KEY_USAGE,
+    <<"a certificate in the client chain has invalid key usage">>
+).
+-define(REASON_CHAIN_MISSING_BASIC_CONSTRAINT,
+    <<"a certificate in the client chain is missing a required basic constraint">>
+).
 -define(REASON_CHAIN_EXPIRED,
     <<"the client certificate chain contains an expired or not-yet-valid certificate">>
 ).
@@ -159,11 +178,28 @@
 -define(REASON_USER_LOOKUP_UNAVAILABLE,
     <<"user-resolution check unavailable on this broker series">>
 ).
+-define(REASON_USER_LOOKUP_INCONCLUSIVE(Name),
+    iolist_to_binary([
+        <<"user ">>,
+        sanitize_username(Name),
+        <<
+            " not found in the internal backend; other auth backends are configured"
+            " and the user may exist there (cannot verify without network I/O)"
+        >>
+    ])
+).
 
 -define(INTERNAL_BACKEND, rabbit_auth_backend_internal).
 -define(MAX_USERNAME_LEN, 256).
 
-%% Private key entry types that must be rejected from client_cert input (R6).
+%% Known private-key atom tags. Used for message selection only -- the actual
+%% rejection is allowlist-based (only 'Certificate' entries pass). When the
+%% offending entry carries one of these types or a tuple tag like
+%% {no_asn1, new_openssh}, the operator gets the specific "never send key
+%% material" reason; other unrecognized entry types get a generic rejection.
+%% EncryptedPrivateKeyInfo is listed for documentation: OTP rewrites it to
+%% PrivateKeyInfo internally before a caller sees it, but keeping it here is
+%% harmless and documents intent.
 -define(PRIVATE_KEY_TYPES, [
     'RSAPrivateKey',
     'DSAPrivateKey',
@@ -289,11 +325,13 @@ do_tls_validate(#{ssl_options := Map} = Params) ->
         {ok, Pem} ->
             case decode_and_check(Pem) of
                 {error, _, _} = Err -> Err;
-                ok -> maybe_chain_validate(Params, Pem)
+                {ok, CaDers} -> maybe_chain_validate(Params, CaDers)
             end
     end.
 
-%% Decode the CA PEM and check each certificate. The decode is wrapped because
+%% Decode the CA PEM and check each certificate. Returns {ok, CaDers} on
+%% success so the caller can thread the already-decoded DER list into chain
+%% validation without a redundant second decode. The decode is wrapped because
 %% public_key:pem_decode/1 raises (rather than returning `skip') on a
 %% cert-framed PEM with a malformed base64 body -- one of the misconfigurations
 %% this catches -- so it must map to input_invalid, not crash.
@@ -305,9 +343,15 @@ decode_and_check(Pem) ->
             _Class:_Reason -> error
         end,
     case Decoded of
-        error -> {error, input_invalid, ?REASON_NO_CERTS};
-        skip -> {error, input_invalid, ?REASON_NO_CERTS};
-        Ders -> check_cert_validity(Ders)
+        error ->
+            {error, input_invalid, ?REASON_NO_CERTS};
+        skip ->
+            {error, input_invalid, ?REASON_NO_CERTS};
+        Ders ->
+            case check_cert_validity(Ders) of
+                ok -> {ok, Ders};
+                {error, _, _} = Err -> Err
+            end
     end.
 
 %% Check every certificate's [notBefore, notAfter] window against now, failing
@@ -423,23 +467,60 @@ decode_client_cert_pem(Pem, Acc) ->
             classify_pem_entries(Decoded, Acc)
     end.
 
-%% Split the decoded PEM entries: reject if any private key type is present,
-%% collect Certificate DERs. An empty cert list after filtering is an error.
+%% Allowlist-structured: only plain Certificate entries are accepted. Any
+%% entry whose type is NOT 'Certificate' is rejected immediately -- this
+%% closes the class of bypass where an unenumerated key tag (e.g. the tuple
+%% {no_asn1, new_openssh} for OpenSSH-format keys) slips past a denylist.
+%% ?PRIVATE_KEY_TYPES is retained for message selection: when the offending
+%% entry IS a recognizable key type the operator gets the actionable
+%% "never send key material" reason; other unexpected entries get a generic
+%% non-certificate reason.
 classify_pem_entries(Entries, Acc) ->
-    HasKey = lists:any(
-        fun({Type, _Der, _Enc}) -> lists:member(Type, ?PRIVATE_KEY_TYPES) end,
-        Entries
-    ),
-    case HasKey of
-        true ->
-            {error, input_invalid, ?REASON_CLIENT_CERT_PRIVATE_KEY};
-        false ->
+    case find_non_cert_entry(Entries) of
+        none ->
             Ders = [Der || {'Certificate', Der, not_encrypted} <- Entries],
             case Ders of
                 [] -> {error, input_invalid, ?REASON_BAD_CLIENT_CERT};
                 _ -> {ok, Acc#{client_cert_ders => Ders}}
-            end
+            end;
+        {rejected, Reason} ->
+            {error, input_invalid, Reason}
     end.
+
+%% Scan entries for the first non-Certificate entry. Returns `none' if all
+%% entries are plain certificates, otherwise {rejected, Reason}.
+find_non_cert_entry([]) ->
+    none;
+find_non_cert_entry([{'Certificate', _Der, not_encrypted} | Rest]) ->
+    find_non_cert_entry(Rest);
+find_non_cert_entry([{Type, _Der, _Enc} | _Rest]) ->
+    case is_known_key_type(Type) of
+        true -> {rejected, ?REASON_CLIENT_CERT_PRIVATE_KEY};
+        false -> {rejected, ?REASON_CLIENT_CERT_UNEXPECTED_ENTRY}
+    end.
+
+%% Returns true when the PEM type tag identifies a private key -- either an
+%% atom from the traditional set or the tuple tag used by OpenSSH keys.
+%%
+%% The {no_asn1, _} clause is reachable at RUNTIME even though dialyzer claims
+%% otherwise: public_key's exported pem_entry() type enumerates only the ASN.1
+%% record tags, but pubkey_pem emits {no_asn1, new_openssh} for an OpenSSH
+%% private key block. Verified on this OTP:
+%%
+%%   public_key:pem_decode(<<"-----BEGIN OPENSSH PRIVATE KEY-----"...>>)
+%%   => [{{no_asn1, new_openssh}, <<...>>, not_encrypted}]
+%%
+%% So the incomplete upstream spec, not this clause, is the inaccuracy. The
+%% clause is what keeps an OpenSSH key from being reported as a generic
+%% unexpected entry instead of key material, so it must not be removed. The
+%% nowarn is scoped to this function only.
+-dialyzer({nowarn_function, is_known_key_type/1}).
+is_known_key_type(Type) when is_atom(Type) ->
+    lists:member(Type, ?PRIVATE_KEY_TYPES);
+is_known_key_type({no_asn1, _}) ->
+    true;
+is_known_key_type(_) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% Input parsing: cert_login (optional username-extraction config)
@@ -474,6 +555,8 @@ parse_cert_login_from(Map, Acc) ->
             check_no_san_fields(Map, Acc, common_name);
         <<"subject_alternative_name">> ->
             parse_san_fields(Map, Acc);
+        %% Mirrors the broker's accepted spellings: rabbit_ssl accepts both
+        %% subject_alternative_name and subject_alt_name for ssl_cert_login_from.
         <<"subject_alt_name">> ->
             parse_san_fields(Map, Acc);
         _ ->
@@ -562,25 +645,28 @@ check_verify_for_cert_login(#{ssl_options := SslMap} = Acc) ->
 %% Otherwise the existing CA-only validation already passed and we are done
 %% (unless cert_login is present, which cross_field_checks already guarantees
 %% cannot happen without client_cert_ders).
-maybe_chain_validate(#{client_cert_ders := ClientDers} = Params, CaPem) ->
-    CaDers = aws_auth_validate_ssl:decode_pem_cacerts(CaPem),
+maybe_chain_validate(#{client_cert_ders := ClientDers} = Params, CaDers) ->
     Depth = maps:get(<<"depth">>, maps:get(ssl_options, Params, #{}), undefined),
     case validate_chain(ClientDers, CaDers, Depth) of
         ok -> maybe_extract_username(Params);
         {error, _, _} = Err -> Err
     end;
-maybe_chain_validate(_Params, _CaPem) ->
+maybe_chain_validate(_Params, _CaDers) ->
     %% No client_cert: existing CA-only validation already passed.
     ok.
 
 %% Validate the client certificate chain against the CA trust anchors using
-%% public_key:pkix_path_validation/3. ClientDers is leaf-first; CaDers is the
+%% public_key:pkix_path_validation/3. ClientDers is leaf-first (the leaf cert
+%% MUST be the first element; the tail may be in any order). CaDers is the
 %% trust anchor pool. Depth caps intermediate chain length when set.
--spec validate_chain([binary()], [binary()] | skip, integer() | undefined) ->
+%%
+%% The implementation rebuilds an ordered chain from the leaf outward by
+%% issuer/subject matching (tolerating arbitrarily ordered intermediates in the
+%% tail), then finds ALL self-signed bundle certs whose subject matches the
+%% top-most cert's issuer, and tries each candidate anchor until one validates.
+%% This mirrors the broker's path-iteration behavior on key rollover.
+-spec validate_chain([binary()], [binary()], integer() | undefined) ->
     ok | {error, auth_failed | input_invalid, binary()}.
-validate_chain(_ClientDers, skip, _Depth) ->
-    %% No CA certs decoded (should not reach here -- decode_and_check catches it).
-    {error, auth_failed, ?REASON_CHAIN_FAILED};
 validate_chain(ClientDers, CaDers, Depth) ->
     try
         Opts =
@@ -588,48 +674,195 @@ validate_chain(ClientDers, CaDers, Depth) ->
                 undefined -> [];
                 N when is_integer(N), N >= 0 -> [{max_path_length, N}]
             end,
-        %% pkix_path_validation wants: TrustAnchor (DER), Chain (Options).
-        %% ClientDers is leaf-first ([leaf, intermediates...]); the topmost cert
-        %% (lists:last) is the one issued by a bundle CA, so match the anchor
-        %% against its issuer. The chain itself must be passed anchor-closest
-        %% first (the cert the anchor issued down to the leaf), which is the
-        %% reverse of the leaf-first ClientDers.
-        TopCert = lists:last(ClientDers),
-        Chain = lists:reverse(ClientDers),
-        case find_trust_anchor(TopCert, CaDers) of
-            {ok, AnchorDer} ->
-                case public_key:pkix_path_validation(AnchorDer, Chain, Opts) of
-                    {ok, _} ->
-                        ok;
-                    {error, {bad_cert, cert_expired}} ->
-                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
-                    {error, {bad_cert, {cert_expired, _}}} ->
-                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
-                    {error, {bad_cert, _}} ->
-                        {error, auth_failed, ?REASON_CHAIN_FAILED}
-                end;
-            not_found ->
-                {error, auth_failed, ?REASON_CHAIN_FAILED}
+        %% Rebuild the chain in issuer-linked order starting from the leaf.
+        %% The leaf MUST be element 0; the tail is reordered by issuer linkage.
+        Reordered = order_chain(ClientDers),
+        %% A listener treats every cacerts entry as chain-building material, not
+        %% only as a trust anchor (ssl_certificate:certificate_chain/3), so a
+        %% bundle carrying [root, intermediate] completes a client that presents
+        %% the leaf alone. Extend the chain with non-self-signed bundle CAs
+        %% before searching for an anchor, or that configuration -- which a real
+        %% handshake accepts -- would be reported as not chaining.
+        OrderedDers = extend_with_bundle_intermediates(Reordered, CaDers),
+        %% The top cert (lists:last) is the one closest to (or matching) a
+        %% bundle CA. Find anchors based on its issuer. If the top cert itself
+        %% is one of the anchors (client included the root in its PEM), strip
+        %% it from the path -- pkix_path_validation expects only certs BELOW
+        %% the anchor.
+        TopCert = lists:last(OrderedDers),
+        Anchors = find_trust_anchors(TopCert, CaDers),
+        {PathDers, EffectiveAnchors} =
+            case Anchors of
+                [] ->
+                    %% No anchor matches the top cert's issuer -- fail.
+                    {OrderedDers, []};
+                _ ->
+                    case lists:member(TopCert, Anchors) of
+                        true ->
+                            %% Top cert IS the anchor; validate only the
+                            %% certs below it.
+                            Below = lists:droplast(OrderedDers),
+                            {Below, [TopCert]};
+                        false ->
+                            {OrderedDers, Anchors}
+                    end
+            end,
+        case EffectiveAnchors of
+            [] ->
+                {error, auth_failed, ?REASON_CHAIN_FAILED};
+            _ ->
+                %% pkix_path_validation wants the chain anchor-closest first.
+                Chain = lists:reverse(PathDers),
+                try_anchors(EffectiveAnchors, Chain, Opts)
         end
     catch
         _:_ -> {error, input_invalid, ?REASON_CHAIN_MALFORMED}
     end.
 
-%% Find the trust anchor in CaDers whose subject matches the issuer of TopCertDer.
-find_trust_anchor(TopCertDer, CaDers) ->
-    TopOtp = public_key:pkix_decode_cert(TopCertDer, otp),
-    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
-    find_by_subject(Issuer, CaDers).
+%% Try each candidate trust anchor; accept if ANY validates. On failure,
+%% report the most informative reason (prefer a specific diagnosis over the
+%% generic "does not chain" fallback).
+try_anchors(Anchors, Chain, Opts) ->
+    Results = [
+        public_key:pkix_path_validation(A, Chain, Opts)
+     || A <- Anchors
+    ],
+    case
+        lists:any(
+            fun
+                ({ok, _}) -> true;
+                (_) -> false
+            end,
+            Results
+        )
+    of
+        true ->
+            ok;
+        false ->
+            Reasons = [R || {error, {bad_cert, R}} <- Results],
+            pick_best_failure(Reasons)
+    end.
 
-find_by_subject(_Issuer, []) ->
+%% Select the most informative failure from a list of bad_cert reasons.
+%% Priority: specific actionable reasons first, generic "does not chain" last.
+pick_best_failure([]) ->
+    {error, auth_failed, ?REASON_CHAIN_FAILED};
+pick_best_failure(Reasons) ->
+    Classify = fun(R) ->
+        case R of
+            cert_expired -> {1, ?REASON_CHAIN_EXPIRED};
+            max_path_length_reached -> {2, ?REASON_CHAIN_DEPTH_EXCEEDED};
+            invalid_key_usage -> {3, ?REASON_CHAIN_BAD_KEY_USAGE};
+            missing_basic_constraint -> {4, ?REASON_CHAIN_MISSING_BASIC_CONSTRAINT};
+            invalid_signature -> {5, ?REASON_CHAIN_INVALID_SIGNATURE};
+            invalid_issuer -> {6, ?REASON_CHAIN_INVALID_ISSUER};
+            _ -> {99, ?REASON_CHAIN_FAILED}
+        end
+    end,
+    Classified = lists:map(Classify, Reasons),
+    {_, BestReason} = lists:min(Classified),
+    {error, auth_failed, BestReason}.
+
+%% Rebuild the client cert chain in issuer-linked order starting from the leaf
+%% (element 0). The tail certs are matched by issuer->subject linkage so an
+%% arbitrarily ordered tail (e.g. [leaf, root, int]) still produces the correct
+%% ordering [leaf, int, root] as far as the linkage allows.
+order_chain([Leaf]) ->
+    [Leaf];
+order_chain([Leaf | Tail]) ->
+    order_chain_loop(Leaf, Tail, [Leaf]).
+
+order_chain_loop(_Current, [], Acc) ->
+    lists:reverse(Acc);
+order_chain_loop(Current, Remaining, Acc) ->
+    CurrOtp = public_key:pkix_decode_cert(Current, otp),
+    Issuer = CurrOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    case find_issuer_in(Issuer, Remaining) of
+        {ok, IssuerDer, Rest} ->
+            order_chain_loop(IssuerDer, Rest, [IssuerDer | Acc]);
+        not_found ->
+            %% Remaining certs cannot be linked; append them as-is so
+            %% pkix_path_validation can reject if they do not belong.
+            lists:reverse(Acc) ++ Remaining
+    end.
+
+find_issuer_in(_Issuer, []) ->
     not_found;
-find_by_subject(Issuer, [CaDer | Rest]) ->
-    CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+find_issuer_in(Issuer, [Der | Rest]) ->
+    CaOtp = public_key:pkix_decode_cert(Der, otp),
     Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
     case public_key:pkix_normalize_name(Issuer) =:= public_key:pkix_normalize_name(Subject) of
-        true -> {ok, CaDer};
-        false -> find_by_subject(Issuer, Rest)
+        true ->
+            {ok, Der, Rest};
+        false ->
+            case find_issuer_in(Issuer, Rest) of
+                {ok, Found, Rem} -> {ok, Found, [Der | Rem]};
+                not_found -> not_found
+            end
     end.
+
+%% Extend an ordered (leaf-first) chain upward using non-self-signed CAs from
+%% the bundle, mirroring how a listener uses cacerts as chain-building material
+%% and not only as anchors. Only NON-self-signed entries are appended: a
+%% self-signed match is a trust anchor and is handled by find_trust_anchors/2,
+%% which also keeps a self-signed cert from being appended to itself.
+%%
+%% Each appended CA is removed from the candidate pool, so the recursion is
+%% bounded by the bundle size and cannot loop on a cross-signed pair.
+extend_with_bundle_intermediates(OrderedDers, CaDers) ->
+    TopCert = lists:last(OrderedDers),
+    TopOtp = public_key:pkix_decode_cert(TopCert, otp),
+    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    case take_non_self_signed_by_subject(Issuer, CaDers) of
+        {ok, IntDer, RestCaDers} ->
+            extend_with_bundle_intermediates(OrderedDers ++ [IntDer], RestCaDers);
+        not_found ->
+            OrderedDers
+    end.
+
+%% Take the first non-self-signed bundle CA whose subject matches Issuer,
+%% returning it alongside the remaining candidates.
+take_non_self_signed_by_subject(_Issuer, []) ->
+    not_found;
+take_non_self_signed_by_subject(Issuer, [CaDer | Rest]) ->
+    CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+    Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
+    Matches =
+        public_key:pkix_normalize_name(Issuer) =:=
+            public_key:pkix_normalize_name(Subject) andalso
+            not public_key:pkix_is_self_signed(CaOtp),
+    case Matches of
+        true ->
+            {ok, CaDer, Rest};
+        false ->
+            case take_non_self_signed_by_subject(Issuer, Rest) of
+                {ok, Found, Rem} -> {ok, Found, [CaDer | Rem]};
+                not_found -> not_found
+            end
+    end.
+
+%% Find ALL trust anchors in CaDers whose subject matches the issuer of
+%% TopCertDer AND that are self-signed. A non-self-signed intermediate in the
+%% bundle is not a valid trust anchor for pkix_path_validation (the broker's
+%% ssl_certificate module only accepts self-signed anchors in the default
+%% partial_chain behavior).
+find_trust_anchors(TopCertDer, CaDers) ->
+    TopOtp = public_key:pkix_decode_cert(TopCertDer, otp),
+    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    find_all_self_signed_by_subject(Issuer, CaDers).
+
+find_all_self_signed_by_subject(Issuer, CaDers) ->
+    [
+        CaDer
+     || CaDer <- CaDers,
+        begin
+            CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+            Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
+            public_key:pkix_normalize_name(Issuer) =:=
+                public_key:pkix_normalize_name(Subject) andalso
+                public_key:pkix_is_self_signed(CaOtp)
+        end
+    ].
 
 %%--------------------------------------------------------------------
 %% Layer 2: username extraction from the leaf certificate
@@ -679,8 +912,22 @@ extract_username(LeafDer, #{from := subject_alternative_name, san_type := Type, 
     case length(Filtered) > Index of
         true ->
             Raw = lists:nth(Index + 1, Filtered),
-            Value = maybe_sanitize_other_name(OtpType, Raw),
-            {ok, iolist_to_binary([Value])};
+            case maybe_sanitize_other_name(OtpType, Raw) of
+                {error, _} ->
+                    %% rabbit_cert_info:sanitize_other_name/1 returns an error
+                    %% tuple for non-DirectoryString otherName encodings (e.g.
+                    %% IA5STRING UPNs). Map to a categorized failure rather than
+                    %% crashing in iolist_to_binary.
+                    {error, auth_failed, ?REASON_EXTRACT_FAILED};
+                Value when is_binary(Value) ->
+                    {ok, Value};
+                Value when is_list(Value) ->
+                    {ok, iolist_to_binary(Value)};
+                _Other ->
+                    %% Defensive: any non-binary/non-iolist return (unexpected
+                    %% upstream shape change) gets a categorized failure.
+                    {error, auth_failed, ?REASON_EXTRACT_FAILED}
+            end;
         false ->
             {error, auth_failed, ?REASON_EXTRACT_FAILED}
     end.
@@ -706,23 +953,55 @@ maybe_sanitize_other_name(_Type, Value) ->
 %% Layer 3: user resolution (read-only lookup)
 %%--------------------------------------------------------------------
 
-%% Verify that the extracted username exists in the internal auth backend.
-%% This is a read-only mnesia/khepri lookup -- no state mutation (R3).
+%% Check whether the extracted username resolves to a known broker user.
+%%
+%% The broker's live EXTERNAL login calls rabbit_access_control:check_user_login/2,
+%% which walks ALL configured auth_backends (each entry may be a bare module or a
+%% {AuthN, AuthZ} tuple). We can only query rabbit_auth_backend_internal (a local
+%% mnesia/khepri read -- no I/O, no state mutation, R3-safe). If other backends
+%% are also configured, a not-found in the internal backend does NOT mean the user
+%% does not exist -- the broker may authenticate it via LDAP, HTTP, or OAuth.
+%%
+%% Strategy:
+%%   - internal backend unavailable -> config_conflict (cannot check at all).
+%%   - user found in internal backend -> ok (definitive positive).
+%%   - user NOT found AND internal is the only authN backend -> auth_failed.
+%%   - user NOT found AND other authN backends are configured -> config_conflict
+%%     with an honest "inconclusive" reason (we cannot check those without I/O).
 -spec resolve_user(binary()) -> ok | {error, auth_failed | config_conflict, binary()}.
 resolve_user(Username) ->
     case internal_backend_available() of
         false ->
             {error, config_conflict, ?REASON_USER_LOOKUP_UNAVAILABLE};
         true ->
-            %% Look up the RAW extracted name -- it is what the broker's own
-            %% EXTERNAL login would pass to check_user_login. Sanitization is
-            %% applied only when echoing the name in the reason (R4), so the
-            %% lookup verdict cannot diverge from the live broker's.
             case ?INTERNAL_BACKEND:exists(Username) of
-                true -> ok;
-                false -> {error, auth_failed, ?REASON_USER_NOT_FOUND(Username)}
+                true ->
+                    ok;
+                false ->
+                    case only_internal_authn_configured() of
+                        true ->
+                            {error, auth_failed, ?REASON_USER_NOT_FOUND(Username)};
+                        false ->
+                            {error, config_conflict, ?REASON_USER_LOOKUP_INCONCLUSIVE(Username)}
+                    end
             end
     end.
+
+%% Returns true only when every configured authN backend is
+%% rabbit_auth_backend_internal. The auth_backends env entries are either a bare
+%% module atom (same module for authN and authZ) or a {AuthN, _AuthZ} tuple.
+only_internal_authn_configured() ->
+    case application:get_env(rabbit, auth_backends) of
+        {ok, Backends} ->
+            lists:all(fun is_internal_authn/1, Backends);
+        undefined ->
+            %% No config at all -- treat as inconclusive (safe side).
+            false
+    end.
+
+is_internal_authn(?INTERNAL_BACKEND) -> true;
+is_internal_authn({?INTERNAL_BACKEND, _AuthZ}) -> true;
+is_internal_authn(_) -> false.
 
 internal_backend_available() ->
     module_ready(?INTERNAL_BACKEND) andalso
@@ -734,14 +1013,127 @@ module_ready(Mod) ->
         _ -> false
     end.
 
-%% Cap username length and strip control characters. The username derives from
-%% the caller's own supplied certificate (R4 basis for echoing it), but we still
-%% bound it against degenerate inputs.
+%% Cap username length and strip control characters, ensuring the result is
+%% valid UTF-8 (required for JSON-safe reason binaries in the response). The
+%% username derives from the caller's own supplied certificate (R4 basis for
+%% echoing it), but we bound it against degenerate inputs. Non-UTF-8 bytes
+%% (e.g. raw iPAddress SANs) are hex-escaped so the reason is always encodable.
+%%
+%% NOTE: iPAddress SANs are kept as raw bytes for the user LOOKUP (matching
+%% upstream rabbit_ssl/rabbit_cert_info behavior, which passes the raw value
+%% through without inet:ntoa formatting). Formatting it here into dotted-quad
+%% would create a parity divergence -- the broker would look up a different
+%% username than the endpoint checked. This function only sanitizes the ECHO
+%% path (the reason string), not the lookup key.
 -spec sanitize_username(binary()) -> binary().
 sanitize_username(Name) when is_binary(Name) ->
-    Capped =
-        case byte_size(Name) > ?MAX_USERNAME_LEN of
-            true -> binary:part(Name, 0, ?MAX_USERNAME_LEN);
-            false -> Name
-        end,
-    <<<<C>> || <<C>> <= Capped, C >= 32, C =/= 127>>.
+    %% Truncate on a UTF-8 character boundary: if the input is valid UTF-8,
+    %% find the last complete codepoint within ?MAX_USERNAME_LEN bytes. If the
+    %% input is not valid UTF-8 at all, truncate at the byte limit (the
+    %% subsequent hex-escape pass will handle the non-UTF-8 bytes).
+    Capped = truncate_utf8(Name, ?MAX_USERNAME_LEN),
+    %% Strip control characters (< 32 or DEL), then ensure UTF-8 validity:
+    %% valid codepoints pass through, invalid bytes are hex-escaped as <0xHH>.
+    Escaped = ensure_utf8(strip_control(Capped)),
+    %% Hex-escaping expands each invalid byte to 6 characters, so an all-invalid
+    %% input (e.g. 256 bytes of 0xC0) would otherwise blow past the cap by ~6x.
+    %% Re-truncate on a character boundary so ?MAX_USERNAME_LEN bounds the value
+    %% that actually reaches the response, which is the point of the cap.
+    truncate_utf8(Escaped, ?MAX_USERNAME_LEN).
+
+%% Truncate a binary to at most MaxBytes, respecting UTF-8 character boundaries.
+truncate_utf8(Bin, MaxBytes) when byte_size(Bin) =< MaxBytes ->
+    Bin;
+truncate_utf8(Bin, MaxBytes) ->
+    Candidate = binary:part(Bin, 0, MaxBytes),
+    %% Walk backwards from the cut point to find a valid UTF-8 boundary.
+    %% A UTF-8 continuation byte has the pattern 10xxxxxx (0x80-0xBF).
+    trim_trailing_partial_utf8(Candidate).
+
+trim_trailing_partial_utf8(<<>>) ->
+    <<>>;
+trim_trailing_partial_utf8(Bin) ->
+    Size = byte_size(Bin),
+    Last = binary:at(Bin, Size - 1),
+    case Last of
+        B when B < 16#80 ->
+            %% ASCII -- boundary is clean.
+            Bin;
+        B when B >= 16#C0 ->
+            %% A lead byte at the very end means the multibyte char was split.
+            binary:part(Bin, 0, Size - 1);
+        _ ->
+            %% Continuation byte -- verify the preceding sequence is complete.
+            verify_tail_sequence(Bin)
+    end.
+
+%% Walk back over continuation bytes to find the lead byte and check if the
+%% sequence is complete (expected length matches actual length).
+verify_tail_sequence(Bin) ->
+    Size = byte_size(Bin),
+    %% Count trailing continuation bytes (max 3 in valid UTF-8).
+    ContCount = count_trailing_continuations(Bin, Size - 1, 0),
+    LeadPos = Size - 1 - ContCount,
+    case LeadPos >= 0 of
+        false ->
+            %% All continuation bytes, no lead -- not valid, trim all.
+            <<>>;
+        true ->
+            Lead = binary:at(Bin, LeadPos),
+            Expected = expected_continuation_count(Lead),
+            case Expected =:= ContCount of
+                true ->
+                    %% Complete sequence.
+                    Bin;
+                false ->
+                    %% Incomplete -- trim back to before the lead byte.
+                    binary:part(Bin, 0, LeadPos)
+            end
+    end.
+
+count_trailing_continuations(_Bin, Pos, Acc) when Pos < 0 ->
+    Acc;
+count_trailing_continuations(Bin, Pos, Acc) ->
+    B = binary:at(Bin, Pos),
+    case B >= 16#80 andalso B < 16#C0 of
+        true -> count_trailing_continuations(Bin, Pos - 1, Acc + 1);
+        false -> Acc
+    end.
+
+expected_continuation_count(Lead) when Lead >= 16#F0 -> 3;
+expected_continuation_count(Lead) when Lead >= 16#E0 -> 2;
+expected_continuation_count(Lead) when Lead >= 16#C0 -> 1;
+expected_continuation_count(_) -> 0.
+
+%% Strip ASCII control characters (bytes < 32 and DEL 127) while preserving
+%% multibyte sequences intact.
+strip_control(Bin) ->
+    <<<<C>> || <<C>> <= Bin, C >= 32, C =/= 127>>.
+
+%% Ensure the result is valid UTF-8. Valid codepoints pass through; any byte
+%% that does not form part of a valid UTF-8 sequence is hex-escaped as <0xHH>.
+ensure_utf8(Bin) ->
+    case unicode:characters_to_binary(Bin) of
+        Bin -> Bin;
+        _ -> hex_escape_non_utf8(Bin, <<>>)
+    end.
+
+hex_escape_non_utf8(<<>>, Acc) ->
+    Acc;
+hex_escape_non_utf8(Bin, Acc) ->
+    case unicode:characters_to_binary(Bin) of
+        <<>> ->
+            Acc;
+        Bin ->
+            <<Acc/binary, Bin/binary>>;
+        {error, Good, <<B, Rest/binary>>} ->
+            Hex = list_to_binary(io_lib:format("<0x~2.16.0B>", [B])),
+            hex_escape_non_utf8(Rest, <<Acc/binary, Good/binary, Hex/binary>>);
+        {error, Good, <<>>} ->
+            <<Acc/binary, Good/binary>>;
+        {incomplete, Good, <<B, Rest/binary>>} ->
+            Hex = list_to_binary(io_lib:format("<0x~2.16.0B>", [B])),
+            hex_escape_non_utf8(Rest, <<Acc/binary, Good/binary, Hex/binary>>);
+        {incomplete, Good, <<>>} ->
+            <<Acc/binary, Good/binary>>
+    end.

@@ -41,9 +41,11 @@
 %%
 %% This reuses the broker's own crypto library (jose) so the signature decision
 %% matches what rabbit_auth_backend_oauth2 would compute -- a decision-parity
-%% claim analogous to the LDAP backend's, scoped to signature + exp/nbf/aud. It
-%% does NOT assert scope authorization; that stays an over-trust caveat for the
-%% customer docs, same as the LDAP dn_lookup_base and HTTP reachability checks.
+%% claim analogous to the LDAP backend's, scoped to signature + exp/nbf/aud.
+%% Scope authorization CAN now be checked via the optional `authz_check' block
+%% (delegated to aws_auth_validate_oauth_authz when the arity-4 scope API is
+%% available); see allowed_fields/0 for the full authz field set. Note: not all
+%% resource_server fields are overlaid yet -- a documented parity gap.
 %%
 %% A broker-side `client_credentials' grant (the broker fetching a token itself
 %% from a supplied token_endpoint + client_secret_arn) was considered and
