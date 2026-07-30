@@ -1168,27 +1168,20 @@ build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% every ARN fetch here. A request that references no ARN carries a default
     %% state that is never used to resolve one.
     State = maps:get(aws_state, Params, none),
-    case
-        aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)
-    of
+    %% Resolves the CA bundle and the mTLS pair together so a response can name
+    %% every ARN field that failed, not just the first.
+    case aws_auth_validate_ssl:resolve_ssl_material(Map, State) of
         {error, _, _} = Err ->
             Err;
-        {ok, CacertOpts} ->
-            case aws_auth_validate_ssl:resolve_client_cert(Map, State) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, ClientOpts} ->
-                    Opts =
-                        CacertOpts ++ ClientOpts ++
-                            aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
-                    VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    %% Mirror oauth2_client: hostname_verification defaults to
-                    %% none (strict); the RFC 6125 https match fun is applied only
-                    %% on wildcard. Defaulting to wildcard would pass an IdP cert
-                    %% the live broker rejects.
-                    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
-                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
-            end
+        {ok, MaterialOpts} ->
+            Opts = MaterialOpts ++ aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
+            VerifyExplicit = maps:is_key(<<"verify">>, Map),
+            %% Mirror oauth2_client: hostname_verification defaults to
+            %% none (strict); the RFC 6125 https match fun is applied only
+            %% on wildcard. Defaulting to wildcard would pass an IdP cert
+            %% the live broker rejects.
+            HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
+            aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
     end.
 
 connection_timeout_ms() ->

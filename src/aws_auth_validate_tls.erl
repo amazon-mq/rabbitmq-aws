@@ -94,7 +94,12 @@
     <<"ssl_options.fail_if_no_peer_cert must be true or false">>
 ).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
--define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
+%% Names the field whose ARN failed to resolve. The field name comes from the
+%% caller's own request, so it leaks nothing; the resolved content and the
+%% underlying AWS error are never included.
+-define(REASON_ARN_RESOLVE,
+    aws_auth_validate_ssl:arn_resolve_reason([<<"ssl_options.cacertfile_arn">>])
+).
 -define(REASON_NO_CERTS, <<"cacertfile ARN did not resolve to any CA certificates">>).
 -define(REASON_BAD_CERT, <<"a certificate in the CA bundle could not be parsed">>).
 -define(REASON_CERT_EXPIRED, <<"the CA bundle contains an expired certificate">>).
@@ -328,6 +333,9 @@ do_tls_validate(#{ssl_options := Map} = Params) ->
                 {ok, CaDers} -> maybe_chain_validate(Params, CaDers)
             end
     end.
+
+%% This backend takes exactly one ARN, so there is never more than one field to
+%% attribute; the shared aggregating resolver is unnecessary here.
 
 %% Decode the CA PEM and check each certificate. Returns {ok, CaDers} on
 %% success so the caller can thread the already-decoded DER list into chain

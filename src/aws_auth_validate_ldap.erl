@@ -137,7 +137,10 @@
     <<"ssl_options.hostname_verification must be wildcard or none">>
 ).
 -define(REASON_BAD_SSL_CACERT_ARN, <<"ssl_options.cacertfile_arn must be a non-empty string">>).
--define(REASON_CACERT_ARN_RESOLVE, <<"failed to resolve ssl_options.cacertfile_arn">>).
+%% ARN-RESOLUTION failures no longer have a per-field macro here: the failing
+%% fields are collected across both ARNs and rendered by
+%% aws_auth_validate_ssl:arn_resolve_reason/1 so one response can name them all.
+%% The PEM macro below is for CONTENT failures, where the ARN did resolve.
 -define(REASON_CACERT_PEM_INVALID,
     <<"ssl_options.cacertfile_arn did not resolve to a valid PEM certificate">>
 ).
@@ -145,7 +148,6 @@
 -define(REASON_CONNECTION, <<"could not connect to LDAP server">>).
 -define(REASON_TLS_HANDSHAKE, <<"TLS handshake failed">>).
 -define(REASON_AUTH, <<"LDAP simple bind rejected the supplied credentials">>).
--define(REASON_ARN_RESOLVE, <<"failed to resolve ARN">>).
 -define(REASON_ASSUME_ROLE, <<"failed to assume the configured role">>).
 -define(REASON_NO_ASSUME_ROLE, <<
     "auth validation requires an assume_role to be configured; "
@@ -207,14 +209,9 @@ validate(Body) when is_map(Body) ->
                         {error, _, _} = Err ->
                             Err;
                         {ok, Params0} ->
-                            case resolve_password(Body, Params0) of
-                                {error, _, _} = Err ->
-                                    Err;
-                                {ok, Params1} ->
-                                    case resolve_cacert(Params1) of
-                                        {error, _, _} = Err -> Err;
-                                        {ok, Params2} -> do_ldap_validate(Params2)
-                                    end
+                            case resolve_arn_material(Body, Params0) of
+                                {error, _, _} = Err -> Err;
+                                {ok, Params2} -> do_ldap_validate(Params2)
                             end
                     end
             end
@@ -332,16 +329,63 @@ parse_user_dn(Body, Acc) ->
 %% fetch. The resolved password is added to the params map and never logged
 %% or returned. Validated for shape here (rather than in parse_input) so the
 %% network call stays out of the pure pipeline.
+%% An ARN-resolution failure returns the field-tagged {arn_failed, Fields} form
+%% so resolve_arn_material/2 can aggregate it with the cacert ARN's outcome and
+%% name every failing field in one response. A SHAPE failure is unrelated to
+%% resolution and still short-circuits with its own reason.
 resolve_password(Body, #{aws_state := State} = Params) ->
     case maps:get(<<"password_arn">>, Body, undefined) of
         Arn when is_binary(Arn), byte_size(Arn) > 0 ->
             case resolve_arn(Arn, State) of
                 {ok, Password} -> {ok, Params#{password => Password}};
-                {error, _} -> {error, input_invalid, ?REASON_ARN_RESOLVE}
+                {error, _} -> {arn_failed, [<<"password_arn">>]}
             end;
         _ ->
             {error, input_invalid, ?REASON_BAD_PASSWORD_ARN}
     end.
+
+%% Resolve both ARN-backed inputs -- the bind password and (when TLS is in use)
+%% the CA bundle -- attempting BOTH so a request with two broken ARNs names both
+%% fields instead of sending the operator round the loop twice.
+%%
+%% Only resolution failures aggregate. A shape error or a PEM-content error is
+%% reported as-is: in the content case the ARN did resolve, so naming it would
+%% misdescribe the failure.
+resolve_arn_material(Body, Params) ->
+    case resolve_password(Body, Params) of
+        {error, _, _} = ShapeErr ->
+            %% A SHAPE error (password_arn missing/empty) is pure-input invalid,
+            %% so stop here rather than aggregating. Continuing would fetch the
+            %% cacert ARN for a request we have already rejected, breaking the
+            %% ARN-first ordering invariant that a malformed request triggers no
+            %% secret fetch.
+            ShapeErr;
+        PasswordRes ->
+            %% Resolve the cacert ARN against the incoming Params; the password
+            %% branch's map is merged in below. Runs even when the password ARN
+            %% failed to RESOLVE, so both failing fields can be named at once.
+            aggregate_arn_results(PasswordRes, resolve_cacert(Params))
+    end.
+
+aggregate_arn_results(PasswordRes, CacertRes) ->
+    case arn_failed_fields(PasswordRes) ++ arn_failed_fields(CacertRes) of
+        [_ | _] = Failed ->
+            {error, input_invalid, aws_auth_validate_ssl:arn_resolve_reason(Failed)};
+        [] ->
+            case {PasswordRes, CacertRes} of
+                {{error, _, _} = Err, _} ->
+                    Err;
+                {_, {error, _, _} = Err} ->
+                    Err;
+                {{ok, WithPassword}, {ok, WithCacert}} ->
+                    %% Both succeeded: keep the password from one branch and the
+                    %% decoded cacerts (under ssl_options) from the other.
+                    {ok, maps:merge(WithPassword, maps:with([ssl_options], WithCacert))}
+            end
+    end.
+
+arn_failed_fields({arn_failed, Fields}) -> Fields;
+arn_failed_fields(_Other) -> [].
 
 %% Resolve the CA-cert ARN (when ssl_options.cacertfile_arn is set) in the
 %% network phase, alongside the password ARN and after all pure validation.
@@ -379,7 +423,7 @@ resolve_cacert(#{ssl_options := SslOpts, aws_state := State} = Params) ->
                         _:_ -> {error, input_invalid, ?REASON_CACERT_PEM_INVALID}
                     end;
                 {error, _} ->
-                    {error, input_invalid, ?REASON_CACERT_ARN_RESOLVE}
+                    {arn_failed, [<<"ssl_options.cacertfile_arn">>]}
             end
     end.
 
