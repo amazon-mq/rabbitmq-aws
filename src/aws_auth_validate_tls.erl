@@ -501,6 +501,20 @@ find_non_cert_entry([{Type, _Der, _Enc} | _Rest]) ->
 
 %% Returns true when the PEM type tag identifies a private key -- either an
 %% atom from the traditional set or the tuple tag used by OpenSSH keys.
+%%
+%% The {no_asn1, _} clause is reachable at RUNTIME even though dialyzer claims
+%% otherwise: public_key's exported pem_entry() type enumerates only the ASN.1
+%% record tags, but pubkey_pem emits {no_asn1, new_openssh} for an OpenSSH
+%% private key block. Verified on this OTP:
+%%
+%%   public_key:pem_decode(<<"-----BEGIN OPENSSH PRIVATE KEY-----"...>>)
+%%   => [{{no_asn1, new_openssh}, <<...>>, not_encrypted}]
+%%
+%% So the incomplete upstream spec, not this clause, is the inaccuracy. The
+%% clause is what keeps an OpenSSH key from being reported as a generic
+%% unexpected entry instead of key material, so it must not be removed. The
+%% nowarn is scoped to this function only.
+-dialyzer({nowarn_function, is_known_key_type/1}).
 is_known_key_type(Type) when is_atom(Type) ->
     lists:member(Type, ?PRIVATE_KEY_TYPES);
 is_known_key_type({no_asn1, _}) ->
