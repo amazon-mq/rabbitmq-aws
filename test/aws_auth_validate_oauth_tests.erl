@@ -1051,6 +1051,14 @@ authz_iam_scope_alias_grants_access_test_() ->
 %% this test MUST be revisited: the assertion should flip from authz_unverified
 %% to ok, and the change landed together with the broker dependency bump.
 %%
+%% CONTROL: the authz_unverified assertion alone does not isolate the dotted-key
+%% cause -- authz_no_effective_scopes_after_prefix_test_ asserts the identical
+%% category and message for a wrong-prefix token, so ANY unresolved
+%% additional_scopes_key looks the same. The paired control case sends the SAME
+%% scopes under a NON-dotted key and asserts it reaches ok, making the dot the
+%% only variable: if the control ever stops granting, the breakage is in
+%% additional_scopes_key resolution generally, not in the dotted-key split.
+%%
 %% DORMANCY: the pin only RUNS once the broker ships the arity-4 scope API
 %% (resource_access/4). On an older dep, HAVE_OAUTH2_RESOURCE_SERVER is undefined,
 %% available/0 is false, and maybe_skip_authz/1 returns [] -- the body never
@@ -1074,35 +1082,42 @@ authz_dotted_additional_scopes_key_parity_pin_test_() ->
     {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
         maybe_skip_authz(fun() ->
             #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
-            %% Token carries scopes under a dotted claim key (OIDC/STS-style URI).
-            %% split_path/1 will incorrectly split this on dots, breaking resolution.
-            Token = Sign(#{
-                <<"exp">> => future(),
-                <<"aud">> => <<"rabbitmq">>,
-                <<"https://sts.amazonaws.com/tags">> => [
-                    <<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>
-                ]
-            }),
             JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
             mock_httpc_response(200, JwksBody),
-            Body = (jwks_body())#{
-                <<"access_token">> => Token,
-                <<"resource_server_id">> => <<"rabbitmq">>,
-                <<"scope_prefix">> => <<"rabbitmq.">>,
-                %% Point additional_scopes_key at the dotted claim.
-                <<"additional_scopes_key">> => <<"https://sts.amazonaws.com/tags">>,
-                <<"authz_check">> => #{
-                    <<"resource">> => <<"my-queue">>,
-                    <<"permission">> => <<"write">>
-                }
-            },
-            Result = aws_auth_validate_oauth:validate(Body),
+            %% Same scopes, same everything: only the claim KEY differs between the
+            %% two cases, so the dotted key is the sole variable.
+            Scopes = [<<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>],
+            Validate = fun(ClaimKey) ->
+                Token = Sign(#{
+                    <<"exp">> => future(),
+                    <<"aud">> => <<"rabbitmq">>,
+                    ClaimKey => Scopes
+                }),
+                aws_auth_validate_oauth:validate((jwks_body())#{
+                    <<"access_token">> => Token,
+                    <<"resource_server_id">> => <<"rabbitmq">>,
+                    <<"scope_prefix">> => <<"rabbitmq.">>,
+                    <<"additional_scopes_key">> => ClaimKey,
+                    <<"authz_check">> => #{
+                        <<"resource">> => <<"my-queue">>,
+                        <<"permission">> => <<"write">>
+                    }
+                })
+            end,
+            Dotted = Validate(<<"https://sts.amazonaws.com/tags">>),
+            Control = Validate(<<"tags">>),
             [
                 %% Current behavior: split_path splits the dotted key, lookup fails,
                 %% no scopes extracted -> authz_unverified. This will flip to ok once
                 %% upstream fixes the lookup.
-                ?_assertMatch({error, authz_unverified, _}, Result),
-                ?_assert(reason_contains(Result, "no scopes for this resource_server"))
+                ?_assertMatch({error, authz_unverified, _}, Dotted),
+                ?_assert(reason_contains(Dotted, "no scopes for this resource_server")),
+                %% CONTROL: the identical scopes under a NON-dotted key DO resolve and
+                %% grant. Without this, the pin cannot tell the dotted-key mis-split
+                %% from any other no-effective-scopes cause (a renamed claim, a dropped
+                %% additional_scopes_key feature), since every such case yields the same
+                %% category and message as authz_no_effective_scopes_after_prefix_test_.
+                ?_assertEqual(ok, Control)
             ]
         end)
     end}.
