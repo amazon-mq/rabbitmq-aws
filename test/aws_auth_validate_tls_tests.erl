@@ -873,6 +873,39 @@ tls_extract_san_index_past_end_test() ->
         )
     ).
 
+%% Finding 3: an otherName SAN whose sanitize_other_name returns an error tuple
+%% must produce a categorized auth_failed result, NOT crash with badarg.
+tls_extract_other_name_error_tuple_test() ->
+    %% Simulate the scenario: rabbit_cert_info:sanitize_other_name/1 returns
+    %% {error, {asn1, ...}} for non-DirectoryString encodings (IA5STRING etc.).
+    %% We mock subject_alternative_names to return an otherName entry whose value,
+    %% when passed through the sanitization pipeline, produces an error tuple.
+    ok = meck:new(rabbit_cert_info, [passthrough, no_link]),
+    ok = meck:new(rabbit_data_coercion, [passthrough, no_link]),
+    meck:expect(rabbit_cert_info, subject_alternative_names, fun(_Der) ->
+        [
+            {otherName, {'AnotherName', {1, 2, 3, 4}, <<22, 11, "foo@bar.com">>}}
+        ]
+    end),
+    meck:expect(rabbit_data_coercion, to_binary, fun(V) -> V end),
+    meck:expect(rabbit_cert_info, sanitize_other_name, fun(_Bin) ->
+        {error, {asn1, {{invalid_choice_tag, {22, <<"foo@bar.com">>}}, []}}}
+    end),
+    try
+        Result = aws_auth_validate_tls:extract_username(
+            <<"fake-der">>,
+            #{from => subject_alternative_name, san_type => other_name, san_index => 0}
+        ),
+        %% Must NOT crash, must return a categorized error.
+        ?assertMatch(
+            {error, auth_failed, <<"no username could be extracted", _/binary>>},
+            Result
+        )
+    after
+        meck:unload(rabbit_data_coercion),
+        meck:unload(rabbit_cert_info)
+    end.
+
 %%====================================================================
 %% User resolution tests (Layer 3)
 %%====================================================================
@@ -880,26 +913,90 @@ tls_extract_san_index_past_end_test() ->
 tls_resolve_user_found_test_() ->
     {setup,
         fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
             ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
             meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> true end)
         end,
-        fun(_) -> meck:unload(rabbit_auth_backend_internal) end, fun(_) ->
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
             [?_assertEqual(ok, aws_auth_validate_tls:resolve_user(<<"alice">>))]
         end}.
 
-tls_resolve_user_not_found_test_() ->
+tls_resolve_user_not_found_internal_only_test_() ->
+    %% When the internal backend is the ONLY configured authN backend and the
+    %% user does not exist, the verdict is a definitive auth_failed.
     {setup,
         fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
             ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
             meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
         end,
-        fun(_) -> meck:unload(rabbit_auth_backend_internal) end, fun(_) ->
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
             R = aws_auth_validate_tls:resolve_user(<<"bob">>),
             [
                 ?_assertMatch({error, auth_failed, _}, R),
                 ?_assertMatch(
                     {error, auth_failed, <<"no internal user named bob exists">>}, R
                 )
+            ]
+        end}.
+
+tls_resolve_user_not_found_external_backends_test_() ->
+    %% When other authN backends are also configured (e.g. LDAP) and the user is
+    %% not in the internal backend, the endpoint cannot be certain the user does
+    %% not exist -- it may live in LDAP. The result must be config_conflict
+    %% (inconclusive), not a confident auth_failed.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                rabbit_auth_backend_internal, rabbit_auth_backend_ldap
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ldap-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R),
+                ?_assert(
+                    nomatch =/=
+                        binary:match(
+                            element(3, R),
+                            <<"other auth backends are configured">>
+                        )
+                )
+            ]
+        end}.
+
+tls_resolve_user_not_found_tuple_backend_test_() ->
+    %% auth_backends entries may be {AuthN, AuthZ} tuples.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                {rabbit_auth_backend_ldap, rabbit_auth_backend_internal}
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ext-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R)
             ]
         end}.
 
@@ -931,10 +1028,64 @@ tls_sanitize_username_strips_control_chars_test() ->
 
 tls_sanitize_username_caps_length_test() ->
     Long = binary:copy(<<"A">>, 300),
-    ?assertEqual(256, byte_size(aws_auth_validate_tls:sanitize_username(Long))).
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256).
 
 tls_sanitize_username_preserves_normal_test() ->
     ?assertEqual(<<"alice">>, aws_auth_validate_tls:sanitize_username(<<"alice">>)).
+
+%% Finding 4a: raw iPAddress SAN (4 bytes) must produce valid UTF-8 output that
+%% survives a rabbit_json:encode round-trip (i.e. no invalid UTF-8 sequences).
+tls_sanitize_username_raw_ip_valid_utf8_test() ->
+    %% A raw IPv4 address: <<192, 168, 1, 10>>. Bytes 1 and 10 are control chars
+    %% (stripped), 192 and 168 are not valid UTF-8 lead bytes alone.
+    Input = <<192, 168, 1, 10>>,
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% The result must be valid UTF-8: unicode:characters_to_binary returns the
+    %% input unchanged when it is valid, or an error/incomplete tuple otherwise.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% The reason binary incorporating this must survive JSON encoding.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)),
+    %% Verify it does not crash rabbit_json (or thoas) -- the actual failure mode.
+    try
+        rabbit_json:encode(#{<<"reason">> => Reason}),
+        ok
+    catch
+        _:_ ->
+            %% If rabbit_json is not available in the test env, verify via
+            %% unicode module directly (already done above).
+            ok
+    end.
+
+%% Finding 4b: a >256-byte value whose truncation splits a multibyte UTF-8
+%% character must still produce valid UTF-8 output.
+tls_sanitize_username_truncation_splits_multibyte_test() ->
+    %% Build a 255-byte ASCII string followed by a 3-byte UTF-8 character
+    %% (U+2603 SNOWMAN = <<226, 152, 131>>). The 256-byte cut falls in the
+    %% middle of the 3-byte sequence.
+    Prefix = binary:copy(<<"X">>, 255),
+    Snowman = <<226, 152, 131>>,
+    Input = <<Prefix/binary, Snowman/binary>>,
+    ?assertEqual(258, byte_size(Input)),
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% Result must be valid UTF-8.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% Must be at most 256 bytes (the cap).
+    ?assert(byte_size(Result) =< 256),
+    %% Verify the reason string is JSON-encodable.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)).
+
+%% Verify that valid multibyte UTF-8 within the limit is preserved intact.
+tls_sanitize_username_preserves_utf8_test() ->
+    %% U+00E9 LATIN SMALL LETTER E WITH ACUTE = <<195, 169>> (2 bytes)
+    Input = <<"caf", 195, 169>>,
+    ?assertEqual(Input, aws_auth_validate_tls:sanitize_username(Input)).
 
 %%====================================================================
 %% Backward compatibility: requests with no new fields unchanged

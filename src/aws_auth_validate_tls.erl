@@ -174,6 +174,16 @@
 -define(REASON_USER_LOOKUP_UNAVAILABLE,
     <<"user-resolution check unavailable on this broker series">>
 ).
+-define(REASON_USER_LOOKUP_INCONCLUSIVE(Name),
+    iolist_to_binary([
+        <<"user ">>,
+        sanitize_username(Name),
+        <<
+            " not found in the internal backend; other auth backends are configured"
+            " and the user may exist there (cannot verify without network I/O)"
+        >>
+    ])
+).
 
 -define(INTERNAL_BACKEND, rabbit_auth_backend_internal).
 -define(MAX_USERNAME_LEN, 256).
@@ -805,8 +815,22 @@ extract_username(LeafDer, #{from := subject_alternative_name, san_type := Type, 
     case length(Filtered) > Index of
         true ->
             Raw = lists:nth(Index + 1, Filtered),
-            Value = maybe_sanitize_other_name(OtpType, Raw),
-            {ok, iolist_to_binary([Value])};
+            case maybe_sanitize_other_name(OtpType, Raw) of
+                {error, _} ->
+                    %% rabbit_cert_info:sanitize_other_name/1 returns an error
+                    %% tuple for non-DirectoryString otherName encodings (e.g.
+                    %% IA5STRING UPNs). Map to a categorized failure rather than
+                    %% crashing in iolist_to_binary.
+                    {error, auth_failed, ?REASON_EXTRACT_FAILED};
+                Value when is_binary(Value) ->
+                    {ok, Value};
+                Value when is_list(Value) ->
+                    {ok, iolist_to_binary(Value)};
+                _Other ->
+                    %% Defensive: any non-binary/non-iolist return (unexpected
+                    %% upstream shape change) gets a categorized failure.
+                    {error, auth_failed, ?REASON_EXTRACT_FAILED}
+            end;
         false ->
             {error, auth_failed, ?REASON_EXTRACT_FAILED}
     end.
@@ -832,23 +856,55 @@ maybe_sanitize_other_name(_Type, Value) ->
 %% Layer 3: user resolution (read-only lookup)
 %%--------------------------------------------------------------------
 
-%% Verify that the extracted username exists in the internal auth backend.
-%% This is a read-only mnesia/khepri lookup -- no state mutation (R3).
+%% Check whether the extracted username resolves to a known broker user.
+%%
+%% The broker's live EXTERNAL login calls rabbit_access_control:check_user_login/2,
+%% which walks ALL configured auth_backends (each entry may be a bare module or a
+%% {AuthN, AuthZ} tuple). We can only query rabbit_auth_backend_internal (a local
+%% mnesia/khepri read -- no I/O, no state mutation, R3-safe). If other backends
+%% are also configured, a not-found in the internal backend does NOT mean the user
+%% does not exist -- the broker may authenticate it via LDAP, HTTP, or OAuth.
+%%
+%% Strategy:
+%%   - internal backend unavailable -> config_conflict (cannot check at all).
+%%   - user found in internal backend -> ok (definitive positive).
+%%   - user NOT found AND internal is the only authN backend -> auth_failed.
+%%   - user NOT found AND other authN backends are configured -> config_conflict
+%%     with an honest "inconclusive" reason (we cannot check those without I/O).
 -spec resolve_user(binary()) -> ok | {error, auth_failed | config_conflict, binary()}.
 resolve_user(Username) ->
     case internal_backend_available() of
         false ->
             {error, config_conflict, ?REASON_USER_LOOKUP_UNAVAILABLE};
         true ->
-            %% Look up the RAW extracted name -- it is what the broker's own
-            %% EXTERNAL login would pass to check_user_login. Sanitization is
-            %% applied only when echoing the name in the reason (R4), so the
-            %% lookup verdict cannot diverge from the live broker's.
             case ?INTERNAL_BACKEND:exists(Username) of
-                true -> ok;
-                false -> {error, auth_failed, ?REASON_USER_NOT_FOUND(Username)}
+                true ->
+                    ok;
+                false ->
+                    case only_internal_authn_configured() of
+                        true ->
+                            {error, auth_failed, ?REASON_USER_NOT_FOUND(Username)};
+                        false ->
+                            {error, config_conflict, ?REASON_USER_LOOKUP_INCONCLUSIVE(Username)}
+                    end
             end
     end.
+
+%% Returns true only when every configured authN backend is
+%% rabbit_auth_backend_internal. The auth_backends env entries are either a bare
+%% module atom (same module for authN and authZ) or a {AuthN, _AuthZ} tuple.
+only_internal_authn_configured() ->
+    case application:get_env(rabbit, auth_backends) of
+        {ok, Backends} ->
+            lists:all(fun is_internal_authn/1, Backends);
+        undefined ->
+            %% No config at all -- treat as inconclusive (safe side).
+            false
+    end.
+
+is_internal_authn(?INTERNAL_BACKEND) -> true;
+is_internal_authn({?INTERNAL_BACKEND, _AuthZ}) -> true;
+is_internal_authn(_) -> false.
 
 internal_backend_available() ->
     module_ready(?INTERNAL_BACKEND) andalso
@@ -860,14 +916,122 @@ module_ready(Mod) ->
         _ -> false
     end.
 
-%% Cap username length and strip control characters. The username derives from
-%% the caller's own supplied certificate (R4 basis for echoing it), but we still
-%% bound it against degenerate inputs.
+%% Cap username length and strip control characters, ensuring the result is
+%% valid UTF-8 (required for JSON-safe reason binaries in the response). The
+%% username derives from the caller's own supplied certificate (R4 basis for
+%% echoing it), but we bound it against degenerate inputs. Non-UTF-8 bytes
+%% (e.g. raw iPAddress SANs) are hex-escaped so the reason is always encodable.
+%%
+%% NOTE: iPAddress SANs are kept as raw bytes for the user LOOKUP (matching
+%% upstream rabbit_ssl/rabbit_cert_info behavior, which passes the raw value
+%% through without inet:ntoa formatting). Formatting it here into dotted-quad
+%% would create a parity divergence -- the broker would look up a different
+%% username than the endpoint checked. This function only sanitizes the ECHO
+%% path (the reason string), not the lookup key.
 -spec sanitize_username(binary()) -> binary().
 sanitize_username(Name) when is_binary(Name) ->
-    Capped =
-        case byte_size(Name) > ?MAX_USERNAME_LEN of
-            true -> binary:part(Name, 0, ?MAX_USERNAME_LEN);
-            false -> Name
-        end,
-    <<<<C>> || <<C>> <= Capped, C >= 32, C =/= 127>>.
+    %% Truncate on a UTF-8 character boundary: if the input is valid UTF-8,
+    %% find the last complete codepoint within ?MAX_USERNAME_LEN bytes. If the
+    %% input is not valid UTF-8 at all, truncate at the byte limit (the
+    %% subsequent hex-escape pass will handle the non-UTF-8 bytes).
+    Capped = truncate_utf8(Name, ?MAX_USERNAME_LEN),
+    %% Strip control characters (< 32 or DEL), then ensure UTF-8 validity:
+    %% valid codepoints pass through, invalid bytes are hex-escaped as <0xHH>.
+    ensure_utf8(strip_control(Capped)).
+
+%% Truncate a binary to at most MaxBytes, respecting UTF-8 character boundaries.
+truncate_utf8(Bin, MaxBytes) when byte_size(Bin) =< MaxBytes ->
+    Bin;
+truncate_utf8(Bin, MaxBytes) ->
+    Candidate = binary:part(Bin, 0, MaxBytes),
+    %% Walk backwards from the cut point to find a valid UTF-8 boundary.
+    %% A UTF-8 continuation byte has the pattern 10xxxxxx (0x80-0xBF).
+    trim_trailing_partial_utf8(Candidate).
+
+trim_trailing_partial_utf8(<<>>) ->
+    <<>>;
+trim_trailing_partial_utf8(Bin) ->
+    Size = byte_size(Bin),
+    Last = binary:at(Bin, Size - 1),
+    case Last of
+        B when B < 16#80 ->
+            %% ASCII -- boundary is clean.
+            Bin;
+        B when B >= 16#C0 ->
+            %% A lead byte at the very end means the multibyte char was split.
+            binary:part(Bin, 0, Size - 1);
+        _ ->
+            %% Continuation byte -- verify the preceding sequence is complete.
+            verify_tail_sequence(Bin)
+    end.
+
+%% Walk back over continuation bytes to find the lead byte and check if the
+%% sequence is complete (expected length matches actual length).
+verify_tail_sequence(Bin) ->
+    Size = byte_size(Bin),
+    %% Count trailing continuation bytes (max 3 in valid UTF-8).
+    ContCount = count_trailing_continuations(Bin, Size - 1, 0),
+    LeadPos = Size - 1 - ContCount,
+    case LeadPos >= 0 of
+        false ->
+            %% All continuation bytes, no lead -- not valid, trim all.
+            <<>>;
+        true ->
+            Lead = binary:at(Bin, LeadPos),
+            Expected = expected_continuation_count(Lead),
+            case Expected =:= ContCount of
+                true ->
+                    %% Complete sequence.
+                    Bin;
+                false ->
+                    %% Incomplete -- trim back to before the lead byte.
+                    binary:part(Bin, 0, LeadPos)
+            end
+    end.
+
+count_trailing_continuations(_Bin, Pos, Acc) when Pos < 0 ->
+    Acc;
+count_trailing_continuations(Bin, Pos, Acc) ->
+    B = binary:at(Bin, Pos),
+    case B >= 16#80 andalso B < 16#C0 of
+        true -> count_trailing_continuations(Bin, Pos - 1, Acc + 1);
+        false -> Acc
+    end.
+
+expected_continuation_count(Lead) when Lead >= 16#F0 -> 3;
+expected_continuation_count(Lead) when Lead >= 16#E0 -> 2;
+expected_continuation_count(Lead) when Lead >= 16#C0 -> 1;
+expected_continuation_count(_) -> 0.
+
+%% Strip ASCII control characters (bytes < 32 and DEL 127) while preserving
+%% multibyte sequences intact.
+strip_control(Bin) ->
+    <<<<C>> || <<C>> <= Bin, C >= 32, C =/= 127>>.
+
+%% Ensure the result is valid UTF-8. Valid codepoints pass through; any byte
+%% that does not form part of a valid UTF-8 sequence is hex-escaped as <0xHH>.
+ensure_utf8(Bin) ->
+    case unicode:characters_to_binary(Bin) of
+        Bin -> Bin;
+        _ -> hex_escape_non_utf8(Bin, <<>>)
+    end.
+
+hex_escape_non_utf8(<<>>, Acc) ->
+    Acc;
+hex_escape_non_utf8(Bin, Acc) ->
+    case unicode:characters_to_binary(Bin) of
+        <<>> ->
+            Acc;
+        Bin ->
+            <<Acc/binary, Bin/binary>>;
+        {error, Good, <<B, Rest/binary>>} ->
+            Hex = list_to_binary(io_lib:format("<0x~2.16.0B>", [B])),
+            hex_escape_non_utf8(Rest, <<Acc/binary, Good/binary, Hex/binary>>);
+        {error, Good, <<>>} ->
+            <<Acc/binary, Good/binary>>;
+        {incomplete, Good, <<B, Rest/binary>>} ->
+            Hex = list_to_binary(io_lib:format("<0x~2.16.0B>", [B])),
+            hex_escape_non_utf8(Rest, <<Acc/binary, Good/binary, Hex/binary>>);
+        {incomplete, Good, <<>>} ->
+            <<Acc/binary, Good/binary>>
+    end.
