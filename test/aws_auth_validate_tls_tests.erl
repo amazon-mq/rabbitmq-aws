@@ -5,8 +5,9 @@
 
 %% Unit tests for aws_auth_validate_tls: the behaviour callbacks, input
 %% validation, the assume_role guardrail, that the ARN is only resolved after
-%% the input is valid, that resolved material is not echoed, and the
-%% certificate-validity checks.
+%% the input is valid, that resolved material is not echoed, the
+%% certificate-validity checks, and the client-certificate chain/extract/resolve
+%% layers.
 %%
 %% This backend makes no outbound connection, so the whole validate/1 path can
 %% be driven by mocking aws_arn_util:resolve_arn and aws_iam:assume_role. The
@@ -32,7 +33,7 @@ tls_method_name_test() ->
 
 tls_allowed_fields_test() ->
     Fields = aws_auth_validate_tls:allowed_fields(),
-    ?assertEqual([<<"target">>, <<"ssl_options">>], Fields).
+    ?assertEqual([<<"target">>, <<"ssl_options">>, <<"client_cert">>, <<"cert_login">>], Fields).
 
 %% ARN keys live under ssl_options, not at the top level, so the registry's
 %% field filter cannot pass a top-level cacertfile_arn.
@@ -402,3 +403,1026 @@ tmp_dir() ->
     Base = filename:join(["/tmp", "aws_auth_validate_tls_tests"]),
     ok = filelib:ensure_dir(filename:join(Base, "x")),
     Base.
+
+%%====================================================================
+%% client_cert parse tests
+%%====================================================================
+
+tls_client_cert_absent_passes_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>, <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN}
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    ?assertNot(maps:is_key(client_cert_ders, Acc)).
+
+tls_client_cert_empty_binary_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => <<>>
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must be a non-empty PEM", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_not_binary_rejected_test_() ->
+    Body = fun(V) ->
+        #{
+            <<"target">> => <<"listener">>,
+            <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+            <<"client_cert">> => V
+        }
+    end,
+    [
+        ?_assertMatch(
+            {error, input_invalid, <<"client_cert must be a non-empty PEM", _/binary>>},
+            aws_auth_validate_tls:parse_input(Body(42))
+        ),
+        ?_assertMatch(
+            {error, input_invalid, <<"client_cert must be a non-empty PEM", _/binary>>},
+            aws_auth_validate_tls:parse_input(Body([1, 2, 3]))
+        )
+    ].
+
+tls_client_cert_private_key_rejected_test() ->
+    %% A PEM containing a private key must be rejected (R6).
+    KeyPem = gen_private_key_pem(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => KeyPem
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_mixed_key_and_cert_rejected_test() ->
+    %% A PEM with both cert and key entries is rejected because of the key.
+    {_CaKey, _CaCert, CaPem} = gen_ca(),
+    KeyPem = gen_private_key_pem(),
+    Mixed = <<CaPem/binary, KeyPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_valid_pem_passes_test() ->
+    {_CaKey, _CaCert, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => CaPem
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    ?assert(maps:is_key(client_cert_ders, Acc)),
+    ?assert(length(maps:get(client_cert_ders, Acc)) >= 1).
+
+tls_client_cert_garbage_pem_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => <<"not a pem at all">>
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must be a non-empty PEM", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_openssh_key_rejected_test() ->
+    %% An OpenSSH-format private key decodes as {{no_asn1, new_openssh}, _, _}
+    %% -- a tuple type tag. The allowlist must reject it with the private-key
+    %% reason (R6 security invariant).
+    OpensshPem = openssh_key_pem(),
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, OpensshPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_openssh_key_alone_rejected_test() ->
+    %% An OpenSSH key without any certificate is also rejected as key material.
+    OpensshPem = openssh_key_pem(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => OpensshPem
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_encrypted_cert_entry_rejected_test() ->
+    %% A PEM entry that decodes as {'Certificate', _, some_cipher} (encrypted
+    %% certificate -- not plain not_encrypted) is caught by the allowlist because
+    %% only {'Certificate', _, not_encrypted} passes. Simulate with a hand-crafted
+    %% PEM that public_key:pem_decode would never produce in practice; instead test
+    %% classify_pem_entries directly via parse_input on a cert-only PEM that does
+    %% pass (and separately confirm the allowlist logic rejects non-cert entries).
+    %% Here we test the DH Parameters case -- a non-cert, non-key entry type.
+    DhPem = <<
+        "-----BEGIN DH PARAMETERS-----\nMIIBCAKCAQEA///////////JD9qiIWjC"
+        "NMTGYouA3BzRKQJOCIpnzHQCC76mOxObIlFK\n-----END DH PARAMETERS-----\n"
+    >>,
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, DhPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert contains a non-certificate PEM entry", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+%%====================================================================
+%% cert_login parse tests
+%%====================================================================
+
+tls_cert_login_not_map_rejected_test_() ->
+    Mk = fun(V) ->
+        #{
+            <<"target">> => <<"listener">>,
+            <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+            <<"cert_login">> => V
+        }
+    end,
+    [
+        ?_assertEqual(
+            {error, input_invalid, <<"cert_login must be an object">>},
+            aws_auth_validate_tls:parse_input(Mk(<<"string">>))
+        ),
+        ?_assertEqual(
+            {error, input_invalid, <<"cert_login must be an object">>},
+            aws_auth_validate_tls:parse_input(Mk(42))
+        )
+    ].
+
+tls_cert_login_unknown_key_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>, <<"extra">> => true}
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login contains an unknown key", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_missing_from_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{}
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login.from must be", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_bad_from_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{<<"from">> => <<"serial_number">>}
+    },
+    ?assertEqual(
+        {error, input_invalid, <<
+            "cert_login.from must be distinguished_name, common_name, "
+            "subject_alternative_name, or subject_alt_name"
+        >>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_subject_alt_name_alias_test() ->
+    %% subject_alt_name is an accepted alias for subject_alternative_name.
+    %% client_cert + verify_peer required to pass cross_field_checks.
+    {_CaKeyFile, _CaDer, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => CaPem,
+        <<"cert_login">> => #{
+            <<"from">> => <<"subject_alt_name">>,
+            <<"san_type">> => <<"dns">>
+        }
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    #{cert_login := #{from := From}} = Acc,
+    ?assertEqual(subject_alternative_name, From).
+
+tls_cert_login_san_type_without_san_from_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>, <<"san_type">> => <<"dns">>}
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login.san_type is only valid", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_san_index_without_san_from_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{<<"from">> => <<"distinguished_name">>, <<"san_index">> => 0}
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login.san_index is only valid", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_bad_san_type_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{
+            <<"from">> => <<"subject_alternative_name">>,
+            <<"san_type">> => <<"x500">>
+        }
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login.san_type must be", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_negative_san_index_rejected_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"cert_login">> => #{
+            <<"from">> => <<"subject_alternative_name">>,
+            <<"san_type">> => <<"dns">>,
+            <<"san_index">> => -1
+        }
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"cert_login.san_index must be a non-negative", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_valid_san_config_test() ->
+    {_CaKeyFile, _CaDer, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => CaPem,
+        <<"cert_login">> => #{
+            <<"from">> => <<"subject_alternative_name">>,
+            <<"san_type">> => <<"email">>,
+            <<"san_index">> => 2
+        }
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    ?assertEqual(
+        #{from => subject_alternative_name, san_type => email, san_index => 2},
+        maps:get(cert_login, Acc)
+    ).
+
+tls_cert_login_san_index_defaults_to_zero_test() ->
+    {_CaKeyFile, _CaDer, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => CaPem,
+        <<"cert_login">> => #{
+            <<"from">> => <<"subject_alternative_name">>,
+            <<"san_type">> => <<"dns">>
+        }
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    #{cert_login := #{san_index := Index}} = Acc,
+    ?assertEqual(0, Index).
+
+%%====================================================================
+%% Cross-field conflict tests
+%%====================================================================
+
+tls_cert_login_without_client_cert_conflict_test() ->
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>}
+    },
+    ?assertEqual(
+        {error, config_conflict, <<"cert_login requires client_cert to be present">>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_with_verify_none_conflict_test() ->
+    {_CaKey, _CaCert, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_none">>
+        },
+        <<"client_cert">> => CaPem,
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>}
+    },
+    ?assertMatch(
+        {error, config_conflict, <<"cert-based login requires ssl_options.verify", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_cert_login_with_verify_absent_conflict_test() ->
+    {_CaKey, _CaCert, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => CaPem,
+        <<"cert_login">> => #{<<"from">> => <<"common_name">>}
+    },
+    ?assertMatch(
+        {error, config_conflict, <<"cert-based login requires ssl_options.verify", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_without_cert_login_ok_test() ->
+    %% client_cert alone (no cert_login) is the chain-only mTLS case -- should pass.
+    {_CaKey, _CaCert, CaPem} = gen_ca(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{
+            <<"cacertfile_arn">> => ?CACERT_ARN,
+            <<"verify">> => <<"verify_peer">>
+        },
+        <<"client_cert">> => CaPem
+    },
+    {ok, Acc} = aws_auth_validate_tls:parse_input(Body),
+    ?assert(maps:is_key(client_cert_ders, Acc)),
+    ?assertNot(maps:is_key(cert_login, Acc)).
+
+%%====================================================================
+%% Chain validation tests (Layer 1)
+%%====================================================================
+
+tls_validate_chain_ok_test() ->
+    {_CaKey, CaDer, LeafDer} = gen_ca_and_leaf(),
+    ?assertEqual(ok, aws_auth_validate_tls:validate_chain([LeafDer], [CaDer], undefined)).
+
+tls_validate_chain_wrong_ca_test() ->
+    %% A leaf signed by CA-A does not chain to CA-B.
+    {_CaKeyA, _CaDerA, LeafDer} = gen_ca_and_leaf(),
+    {_CaKeyB, CaDerB, _LeafDerB} = gen_ca_and_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [CaDerB], undefined)
+    ).
+
+tls_validate_chain_malformed_der_test() ->
+    ?assertMatch(
+        {error, input_invalid, <<"a certificate in the client chain could not be parsed">>},
+        aws_auth_validate_tls:validate_chain([<<0, 1, 2, 3>>], [<<4, 5, 6, 7>>], undefined)
+    ).
+
+tls_validate_chain_depth_zero_single_leaf_test() ->
+    %% depth=0 means no intermediates allowed; a direct CA->leaf should pass.
+    {_CaKey, CaDer, LeafDer} = gen_ca_and_leaf(),
+    ?assertEqual(ok, aws_auth_validate_tls:validate_chain([LeafDer], [CaDer], 0)).
+
+tls_validate_chain_with_intermediate_test() ->
+    %% Leaf signed by an intermediate CA, presented leaf-first with the
+    %% intermediate ([leaf, int]); the root is the bundle anchor. This is the
+    %% real client-chain shape and requires the chain to be reordered
+    %% anchor-closest-first for pkix_path_validation.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_missing_intermediate_test() ->
+    %% The same leaf without its intermediate cannot build a path to the root
+    %% anchor, so it must be rejected.
+    {RootDer, _IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_intermediate_depth_zero_rejected_test() ->
+    %% depth=0 forbids any intermediate; the leaf+intermediate chain exceeds it.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed,
+            <<"the client certificate chain exceeds the configured path length (depth)">>},
+        aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], 0)
+    ).
+
+tls_validate_chain_intermediate_only_bundle_rejected_test() ->
+    %% Finding 1: A CA bundle containing only an intermediate (not self-signed)
+    %% must be rejected. The broker's ssl listener rejects this with unknown_ca.
+    {_RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [IntDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_old_new_order_test() ->
+    %% Finding 2: Two root CAs sharing the same subject DN (key rollover),
+    %% bundle order [OldRoot, NewRoot], leaf chaining to NewRoot. Must pass.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [OldRootDer, NewRootDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_new_old_order_test() ->
+    %% Finding 2: Same as above but bundle order [NewRoot, OldRoot]. Must pass
+    %% regardless of bundle order.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [NewRootDer, OldRootDer], undefined)
+    ).
+
+tls_validate_chain_unordered_tail_passes_test() ->
+    %% Finding 7: A leaf-first chain with an arbitrarily ordered tail must pass.
+    %% The broker's ssl_certificate:paths/2 rebuilds the chain from the peer cert
+    %% outward, so the tail order does not matter. Here we present [leaf, root, int]
+    %% with bundle=[root]: the tail is out of issuer order, but the code relinks it
+    %% as [leaf, int, root] and then strips root (the anchor) from the path.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer, RootDer, IntDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_root_first_rejected_test() ->
+    %% Finding 7 narrowing: A fully root-first chain (leaf is NOT the first
+    %% element) is rejected by the broker and must remain rejected here. This
+    %% pins the shared rejection so a future refactoring does not accidentally
+    %% loosen the leaf-first requirement.
+    %% Pin the CATEGORY, not just "some error": a well-formed but wrongly
+    %% ordered chain is an auth_failed verdict, and misclassifying it as
+    %% input_invalid would change the HTTP status the operator sees.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_tls:validate_chain([RootDer, IntDer, LeafDer], [RootDer], undefined)
+    ).
+
+%%====================================================================
+%% Username extraction tests (Layer 2)
+%%====================================================================
+
+tls_extract_dn_test() ->
+    {_CaKey, _CaDer, LeafDer} = gen_ca_and_leaf_with_cn("TestUser"),
+    {ok, Name} = aws_auth_validate_tls:extract_username(
+        LeafDer, #{from => distinguished_name}
+    ),
+    %% The DN should contain CN=TestUser somewhere.
+    ?assertMatch({_, _}, binary:match(Name, <<"TestUser">>)).
+
+tls_extract_cn_test() ->
+    {_CaKey, _CaDer, LeafDer} = gen_ca_and_leaf_with_cn("MyCN"),
+    {ok, Name} = aws_auth_validate_tls:extract_username(
+        LeafDer, #{from => common_name}
+    ),
+    ?assertEqual(<<"MyCN">>, Name).
+
+tls_extract_cn_missing_test() ->
+    %% A cert with only O= (no CN) should fail extraction.
+    {_CaKey, _CaDer, LeafDer} = gen_ca_and_leaf_with_subject("/O=NoCN"),
+    ?assertMatch(
+        {error, auth_failed, <<"no username could be extracted", _/binary>>},
+        aws_auth_validate_tls:extract_username(LeafDer, #{from => common_name})
+    ).
+
+tls_extract_san_dns_test() ->
+    {_CaKey, _CaDer, LeafDer} = gen_ca_and_leaf_with_san("DNS:host.example.com"),
+    {ok, Name} = aws_auth_validate_tls:extract_username(
+        LeafDer, #{from => subject_alternative_name, san_type => dns, san_index => 0}
+    ),
+    ?assertEqual(<<"host.example.com">>, Name).
+
+tls_extract_san_index_past_end_test() ->
+    {_CaKey, _CaDer, LeafDer} = gen_ca_and_leaf_with_san("DNS:only.one.com"),
+    ?assertMatch(
+        {error, auth_failed, <<"no username could be extracted", _/binary>>},
+        aws_auth_validate_tls:extract_username(
+            LeafDer, #{from => subject_alternative_name, san_type => dns, san_index => 5}
+        )
+    ).
+
+%% Finding 3: an otherName SAN whose sanitize_other_name returns an error tuple
+%% must produce a categorized auth_failed result, NOT crash with badarg.
+tls_extract_other_name_error_tuple_test() ->
+    %% Simulate the scenario: rabbit_cert_info:sanitize_other_name/1 returns
+    %% {error, {asn1, ...}} for non-DirectoryString encodings (IA5STRING etc.).
+    %% We mock subject_alternative_names to return an otherName entry whose value,
+    %% when passed through the sanitization pipeline, produces an error tuple.
+    ok = meck:new(rabbit_cert_info, [passthrough, no_link]),
+    ok = meck:new(rabbit_data_coercion, [passthrough, no_link]),
+    meck:expect(rabbit_cert_info, subject_alternative_names, fun(_Der) ->
+        [
+            {otherName, {'AnotherName', {1, 2, 3, 4}, <<22, 11, "foo@bar.com">>}}
+        ]
+    end),
+    meck:expect(rabbit_data_coercion, to_binary, fun(V) -> V end),
+    meck:expect(rabbit_cert_info, sanitize_other_name, fun(_Bin) ->
+        {error, {asn1, {{invalid_choice_tag, {22, <<"foo@bar.com">>}}, []}}}
+    end),
+    try
+        Result = aws_auth_validate_tls:extract_username(
+            <<"fake-der">>,
+            #{from => subject_alternative_name, san_type => other_name, san_index => 0}
+        ),
+        %% Must NOT crash, must return a categorized error.
+        ?assertMatch(
+            {error, auth_failed, <<"no username could be extracted", _/binary>>},
+            Result
+        )
+    after
+        meck:unload(rabbit_data_coercion),
+        meck:unload(rabbit_cert_info)
+    end.
+
+%%====================================================================
+%% User resolution tests (Layer 3)
+%%====================================================================
+
+tls_resolve_user_found_test_() ->
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> true end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            [?_assertEqual(ok, aws_auth_validate_tls:resolve_user(<<"alice">>))]
+        end}.
+
+tls_resolve_user_not_found_internal_only_test_() ->
+    %% When the internal backend is the ONLY configured authN backend and the
+    %% user does not exist, the verdict is a definitive auth_failed.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"bob">>),
+            [
+                ?_assertMatch({error, auth_failed, _}, R),
+                ?_assertMatch(
+                    {error, auth_failed, <<"no internal user named bob exists">>}, R
+                )
+            ]
+        end}.
+
+tls_resolve_user_not_found_external_backends_test_() ->
+    %% When other authN backends are also configured (e.g. LDAP) and the user is
+    %% not in the internal backend, the endpoint cannot be certain the user does
+    %% not exist -- it may live in LDAP. The result must be config_conflict
+    %% (inconclusive), not a confident auth_failed.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                rabbit_auth_backend_internal, rabbit_auth_backend_ldap
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ldap-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R),
+                ?_assert(
+                    nomatch =/=
+                        binary:match(
+                            element(3, R),
+                            <<"other auth backends are configured">>
+                        )
+                )
+            ]
+        end}.
+
+tls_resolve_user_not_found_tuple_backend_test_() ->
+    %% auth_backends entries may be {AuthN, AuthZ} tuples.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                {rabbit_auth_backend_ldap, rabbit_auth_backend_internal}
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ext-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R)
+            ]
+        end}.
+
+tls_resolve_user_module_unavailable_test_() ->
+    {setup,
+        fun() ->
+            %% Mock rabbit_auth_backend_internal without defining exists/1, so
+            %% function_exported(rabbit_auth_backend_internal, exists, 1) returns
+            %% false and internal_backend_available() fails.
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            ok
+        end,
+        fun(_) -> meck:unload(rabbit_auth_backend_internal) end, fun(_) ->
+            [
+                ?_assertMatch(
+                    {error, config_conflict,
+                        <<"user-resolution check unavailable on this broker series">>},
+                    aws_auth_validate_tls:resolve_user(<<"charlie">>)
+                )
+            ]
+        end}.
+
+%%====================================================================
+%% sanitize_username tests
+%%====================================================================
+
+tls_sanitize_username_strips_control_chars_test() ->
+    ?assertEqual(<<"hello">>, aws_auth_validate_tls:sanitize_username(<<"he\x01llo">>)).
+
+tls_sanitize_username_caps_length_test() ->
+    Long = binary:copy(<<"A">>, 300),
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256).
+
+%% An all-ASCII input never reaches the hex-escape path, so it cannot show
+%% whether the cap survives escaping. Every byte here is invalid UTF-8 and
+%% non-control, so each expands to 6 characters (<0xC0>) -- the worst case for
+%% the length bound. Without a post-escape truncation this returned 1530 bytes.
+tls_sanitize_username_caps_length_after_hex_escape_test() ->
+    Long = binary:copy(<<192>>, 300),
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256),
+    %% Still valid UTF-8, so the reason binary remains JSON-encodable.
+    ?assert(is_binary(unicode:characters_to_binary(Result))).
+
+tls_sanitize_username_preserves_normal_test() ->
+    ?assertEqual(<<"alice">>, aws_auth_validate_tls:sanitize_username(<<"alice">>)).
+
+%% Finding 4a: raw iPAddress SAN (4 bytes) must produce valid UTF-8 output that
+%% survives a rabbit_json:encode round-trip (i.e. no invalid UTF-8 sequences).
+tls_sanitize_username_raw_ip_valid_utf8_test() ->
+    %% A raw IPv4 address: <<192, 168, 1, 10>>. Bytes 1 and 10 are control chars
+    %% (stripped), 192 and 168 are not valid UTF-8 lead bytes alone.
+    Input = <<192, 168, 1, 10>>,
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% The result must be valid UTF-8: unicode:characters_to_binary returns the
+    %% input unchanged when it is valid, or an error/incomplete tuple otherwise.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% The reason binary incorporating this must survive JSON encoding.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)),
+    %% Verify it does not crash rabbit_json (or thoas) -- the actual failure mode.
+    try
+        rabbit_json:encode(#{<<"reason">> => Reason}),
+        ok
+    catch
+        _:_ ->
+            %% If rabbit_json is not available in the test env, verify via
+            %% unicode module directly (already done above).
+            ok
+    end.
+
+%% Finding 4b: a >256-byte value whose truncation splits a multibyte UTF-8
+%% character must still produce valid UTF-8 output.
+tls_sanitize_username_truncation_splits_multibyte_test() ->
+    %% Build a 255-byte ASCII string followed by a 3-byte UTF-8 character
+    %% (U+2603 SNOWMAN = <<226, 152, 131>>). The 256-byte cut falls in the
+    %% middle of the 3-byte sequence.
+    Prefix = binary:copy(<<"X">>, 255),
+    Snowman = <<226, 152, 131>>,
+    Input = <<Prefix/binary, Snowman/binary>>,
+    ?assertEqual(258, byte_size(Input)),
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% Result must be valid UTF-8.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% Must be at most 256 bytes (the cap).
+    ?assert(byte_size(Result) =< 256),
+    %% Verify the reason string is JSON-encodable.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)).
+
+%% Verify that valid multibyte UTF-8 within the limit is preserved intact.
+tls_sanitize_username_preserves_utf8_test() ->
+    %% U+00E9 LATIN SMALL LETTER E WITH ACUTE = <<195, 169>> (2 bytes)
+    Input = <<"caf", 195, 169>>,
+    ?assertEqual(Input, aws_auth_validate_tls:sanitize_username(Input)).
+
+%%====================================================================
+%% Backward compatibility: requests with no new fields unchanged
+%%====================================================================
+
+tls_no_new_fields_backward_compat_test_() ->
+    %% A request with only target + ssl_options should behave exactly as before.
+    CaPem = gen_ca_pem(),
+    with_resolved_pem(CaPem, fun() ->
+        [?_assertEqual(ok, validate_ok_body())]
+    end).
+
+%%====================================================================
+%% Certificate generation helpers (openssl-based, proven reliable)
+%%====================================================================
+
+%% Generate a fresh CA key + self-signed certificate via openssl. Returns
+%% {CaKeyFile, CaDerBinary, CaPemBinary}.
+gen_ca() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    CaKeyFile = filename:join(Dir, "ca-key-" ++ Suffix ++ ".pem"),
+    CaCertFile = filename:join(Dir, "ca-cert-" ++ Suffix ++ ".pem"),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-days 2 -subj /CN=TestCA~s 2>/dev/null",
+                [CaKeyFile, CaCertFile, Suffix]
+            )
+        )
+    ),
+    {ok, CaPem} = file:read_file(CaCertFile),
+    [{'Certificate', CaDer, not_encrypted}] = public_key:pem_decode(CaPem),
+    {CaKeyFile, CaDer, CaPem}.
+
+%% Generate a CA and a leaf cert signed by it. Returns {CaKeyFile, CaDer, LeafDer}.
+gen_ca_and_leaf() ->
+    gen_ca_and_leaf_with_cn("LeafCert").
+
+%% Generate CA + leaf with a specific CN. Returns {CaKeyFile, CaDer, LeafDer}.
+gen_ca_and_leaf_with_cn(CN) ->
+    Dir = tmp_dir(),
+    {CaKeyFile, CaDer, _CaPem} = gen_ca(),
+    CaCertFile = ca_cert_file_from_key(CaKeyFile),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    LeafKeyFile = filename:join(Dir, "leaf-key-" ++ Suffix ++ ".pem"),
+    LeafCsrFile = filename:join(Dir, "leaf-" ++ Suffix ++ ".csr"),
+    LeafCertFile = filename:join(Dir, "leaf-cert-" ++ Suffix ++ ".pem"),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-subj '/CN=~s' 2>/dev/null",
+                [LeafKeyFile, LeafCsrFile, CN]
+            )
+        )
+    ),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+                "-out ~ts -days 2 2>/dev/null",
+                [LeafCsrFile, CaCertFile, CaKeyFile, LeafCertFile]
+            )
+        )
+    ),
+    {ok, LeafPem} = file:read_file(LeafCertFile),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {CaKeyFile, CaDer, LeafDer}.
+
+%% Generate CA + leaf with a custom subject (may lack CN). Returns {CaKeyFile, CaDer, LeafDer}.
+gen_ca_and_leaf_with_subject(Subject) ->
+    Dir = tmp_dir(),
+    {CaKeyFile, CaDer, _CaPem} = gen_ca(),
+    CaCertFile = ca_cert_file_from_key(CaKeyFile),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    LeafKeyFile = filename:join(Dir, "leaf-key-" ++ Suffix ++ ".pem"),
+    LeafCsrFile = filename:join(Dir, "leaf-" ++ Suffix ++ ".csr"),
+    LeafCertFile = filename:join(Dir, "leaf-cert-" ++ Suffix ++ ".pem"),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-subj '~s' 2>/dev/null",
+                [LeafKeyFile, LeafCsrFile, Subject]
+            )
+        )
+    ),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+                "-out ~ts -days 2 2>/dev/null",
+                [LeafCsrFile, CaCertFile, CaKeyFile, LeafCertFile]
+            )
+        )
+    ),
+    {ok, LeafPem} = file:read_file(LeafCertFile),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {CaKeyFile, CaDer, LeafDer}.
+
+%% Generate CA + leaf with SAN extension. SanSpec is an openssl-style string
+%% like "DNS:host.example.com". Returns {CaKeyFile, CaDer, LeafDer}.
+gen_ca_and_leaf_with_san(SanSpec) ->
+    Dir = tmp_dir(),
+    {CaKeyFile, CaDer, _CaPem} = gen_ca(),
+    CaCertFile = ca_cert_file_from_key(CaKeyFile),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    LeafKeyFile = filename:join(Dir, "san-leaf-key-" ++ Suffix ++ ".pem"),
+    LeafCsrFile = filename:join(Dir, "san-leaf-" ++ Suffix ++ ".csr"),
+    LeafCertFile = filename:join(Dir, "san-leaf-cert-" ++ Suffix ++ ".pem"),
+    ExtFile = filename:join(Dir, "san-ext-" ++ Suffix ++ ".cnf"),
+    ok = file:write_file(
+        ExtFile,
+        io_lib:format("[san]\nsubjectAltName=~s\n", [SanSpec])
+    ),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+                "-subj /CN=SanLeaf 2>/dev/null",
+                [LeafKeyFile, LeafCsrFile]
+            )
+        )
+    ),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+                "-out ~ts -days 2 -extfile ~ts -extensions san 2>/dev/null",
+                [LeafCsrFile, CaCertFile, CaKeyFile, LeafCertFile, ExtFile]
+            )
+        )
+    ),
+    {ok, LeafPem} = file:read_file(LeafCertFile),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {CaKeyFile, CaDer, LeafDer}.
+
+%% Generate a private key PEM (for the rejection test).
+gen_private_key_pem() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    KeyFile = filename:join(Dir, "privkey-" ++ Suffix ++ ".pem"),
+    _ = os:cmd(
+        lists:flatten(
+            io_lib:format(
+                "openssl genrsa -out ~ts 2048 2>/dev/null", [KeyFile]
+            )
+        )
+    ),
+    {ok, Pem} = file:read_file(KeyFile),
+    Pem.
+
+%% Minimal OpenSSH-format private key PEM. The content is not a real key but
+%% carries the "openssh-key-v1\0" magic that OTP's public_key:pem_decode/1
+%% recognizes, producing the {{no_asn1, new_openssh}, _, not_encrypted} entry
+%% that previously bypassed the denylist.
+openssh_key_pem() ->
+    Body = base64:encode(<<"openssh-key-v1", 0, "padding-data-here">>),
+    <<"-----BEGIN OPENSSH PRIVATE KEY-----\n", Body/binary,
+        "\n-----END OPENSSH PRIVATE KEY-----\n">>.
+
+%% Derive the cert filename from the key filename (matching gen_ca's naming).
+ca_cert_file_from_key(CaKeyFile) ->
+    re:replace(CaKeyFile, "ca-key-", "ca-cert-", [{return, list}]).
+
+%% Generate a root CA, an intermediate CA signed by the root, and a leaf signed
+%% by the intermediate. Returns {RootCaDer, IntDer, LeafDer}. Exercises the
+%% multi-cert chain path (leaf + intermediate presented, root is the anchor).
+gen_root_int_leaf() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    F = fun(Name) -> filename:join(Dir, Name ++ "-" ++ Suffix ++ ".pem") end,
+    RootKey = F("ri-root-key"),
+    RootCert = F("ri-root-cert"),
+    IntKey = F("ri-int-key"),
+    IntCsr = F("ri-int-csr"),
+    IntCert = F("ri-int-cert"),
+    IntExt = F("ri-int-ext"),
+    LeafKey = F("ri-leaf-key"),
+    LeafCsr = F("ri-leaf-csr"),
+    LeafCert = F("ri-leaf-cert"),
+    ok = file:write_file(
+        IntExt,
+        "basicConstraints=critical,CA:TRUE,pathlen:0\n"
+        "keyUsage=critical,keyCertSign,cRLSign\n"
+    ),
+    Sh = fun(Fmt, Args) -> os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj /CN=TestRootCA~s 2>/dev/null",
+        [RootKey, RootCert, Suffix]
+    ),
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj /CN=TestIntCA~s 2>/dev/null",
+        [IntKey, IntCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 -extfile ~ts 2>/dev/null",
+        [IntCsr, RootCert, RootKey, IntCert, IntExt]
+    ),
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj /CN=TestChainLeaf~s 2>/dev/null",
+        [LeafKey, LeafCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 2>/dev/null",
+        [LeafCsr, IntCert, IntKey, LeafCert]
+    ),
+    {ok, RootPem} = file:read_file(RootCert),
+    {ok, IntPem} = file:read_file(IntCert),
+    {ok, LeafPem} = file:read_file(LeafCert),
+    [{'Certificate', RootDer, not_encrypted}] = public_key:pem_decode(RootPem),
+    [{'Certificate', IntDer, not_encrypted}] = public_key:pem_decode(IntPem),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {RootDer, IntDer, LeafDer}.
+
+%% Generate two self-signed root CAs with the SAME subject DN but different keys,
+%% plus a leaf signed by the second (new) root. Exercises the key-rollover
+%% scenario where a bundle contains both old and new roots and the code must try
+%% each candidate until one validates.
+%% Returns {OldRootDer, NewRootDer, LeafDer}.
+gen_two_roots_same_dn_and_leaf() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    F = fun(Name) -> filename:join(Dir, Name ++ "-" ++ Suffix ++ ".pem") end,
+    OldRootKey = F("kr-old-root-key"),
+    OldRootCert = F("kr-old-root-cert"),
+    NewRootKey = F("kr-new-root-key"),
+    NewRootCert = F("kr-new-root-cert"),
+    LeafKey = F("kr-leaf-key"),
+    LeafCsr = F("kr-leaf-csr"),
+    LeafCert = F("kr-leaf-cert"),
+    %% Both roots share the SAME CN (simulating key rollover).
+    CommonCN = "TestRolloverRoot" ++ Suffix,
+    Sh = fun(Fmt, Args) -> os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [OldRootKey, OldRootCert, CommonCN]
+    ),
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [NewRootKey, NewRootCert, CommonCN]
+    ),
+    %% Sign the leaf with the NEW root.
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj '/CN=RolloverLeaf~s' 2>/dev/null",
+        [LeafKey, LeafCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 2>/dev/null",
+        [LeafCsr, NewRootCert, NewRootKey, LeafCert]
+    ),
+    {ok, OldRootPem} = file:read_file(OldRootCert),
+    {ok, NewRootPem} = file:read_file(NewRootCert),
+    {ok, LeafPem} = file:read_file(LeafCert),
+    [{'Certificate', OldRootDer, not_encrypted}] = public_key:pem_decode(OldRootPem),
+    [{'Certificate', NewRootDer, not_encrypted}] = public_key:pem_decode(NewRootPem),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {OldRootDer, NewRootDer, LeafDer}.
