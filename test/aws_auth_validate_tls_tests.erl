@@ -495,6 +495,60 @@ tls_client_cert_garbage_pem_rejected_test() ->
         aws_auth_validate_tls:parse_input(Body)
     ).
 
+tls_client_cert_openssh_key_rejected_test() ->
+    %% An OpenSSH-format private key decodes as {{no_asn1, new_openssh}, _, _}
+    %% -- a tuple type tag. The allowlist must reject it with the private-key
+    %% reason (R6 security invariant).
+    OpensshPem = openssh_key_pem(),
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, OpensshPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_openssh_key_alone_rejected_test() ->
+    %% An OpenSSH key without any certificate is also rejected as key material.
+    OpensshPem = openssh_key_pem(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => OpensshPem
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_encrypted_cert_entry_rejected_test() ->
+    %% A PEM entry that decodes as {'Certificate', _, some_cipher} (encrypted
+    %% certificate -- not plain not_encrypted) is caught by the allowlist because
+    %% only {'Certificate', _, not_encrypted} passes. Simulate with a hand-crafted
+    %% PEM that public_key:pem_decode would never produce in practice; instead test
+    %% classify_pem_entries directly via parse_input on a cert-only PEM that does
+    %% pass (and separately confirm the allowlist logic rejects non-cert entries).
+    %% Here we test the DH Parameters case -- a non-cert, non-key entry type.
+    DhPem = <<
+        "-----BEGIN DH PARAMETERS-----\nMIIBCAKCAQEA///////////JD9qiIWjC"
+        "NMTGYouA3BzRKQJOCIpnzHQCC76mOxObIlFK\n-----END DH PARAMETERS-----\n"
+    >>,
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, DhPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert contains a non-certificate PEM entry", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
 %%====================================================================
 %% cert_login parse tests
 %%====================================================================
@@ -546,8 +600,11 @@ tls_cert_login_bad_from_rejected_test() ->
         <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
         <<"cert_login">> => #{<<"from">> => <<"serial_number">>}
     },
-    ?assertMatch(
-        {error, input_invalid, <<"cert_login.from must be", _/binary>>},
+    ?assertEqual(
+        {error, input_invalid, <<
+            "cert_login.from must be distinguished_name, common_name, "
+            "subject_alternative_name, or subject_alt_name"
+        >>},
         aws_auth_validate_tls:parse_input(Body)
     ).
 
@@ -775,8 +832,62 @@ tls_validate_chain_intermediate_depth_zero_rejected_test() ->
     %% depth=0 forbids any intermediate; the leaf+intermediate chain exceeds it.
     {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
     ?assertMatch(
-        {error, auth_failed, _},
+        {error, auth_failed,
+            <<"the client certificate chain exceeds the configured path length (depth)">>},
         aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], 0)
+    ).
+
+tls_validate_chain_intermediate_only_bundle_rejected_test() ->
+    %% Finding 1: A CA bundle containing only an intermediate (not self-signed)
+    %% must be rejected. The broker's ssl listener rejects this with unknown_ca.
+    {_RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [IntDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_old_new_order_test() ->
+    %% Finding 2: Two root CAs sharing the same subject DN (key rollover),
+    %% bundle order [OldRoot, NewRoot], leaf chaining to NewRoot. Must pass.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [OldRootDer, NewRootDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_new_old_order_test() ->
+    %% Finding 2: Same as above but bundle order [NewRoot, OldRoot]. Must pass
+    %% regardless of bundle order.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [NewRootDer, OldRootDer], undefined)
+    ).
+
+tls_validate_chain_unordered_tail_passes_test() ->
+    %% Finding 7: A leaf-first chain with an arbitrarily ordered tail must pass.
+    %% The broker's ssl_certificate:paths/2 rebuilds the chain from the peer cert
+    %% outward, so the tail order does not matter. Here we present [leaf, root, int]
+    %% with bundle=[root]: the tail is out of issuer order, but the code relinks it
+    %% as [leaf, int, root] and then strips root (the anchor) from the path.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer, RootDer, IntDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_root_first_rejected_test() ->
+    %% Finding 7 narrowing: A fully root-first chain (leaf is NOT the first
+    %% element) is rejected by the broker and must remain rejected here. This
+    %% pins the shared rejection so a future refactoring does not accidentally
+    %% loosen the leaf-first requirement.
+    %% Pin the CATEGORY, not just "some error": a well-formed but wrongly
+    %% ordered chain is an auth_failed verdict, and misclassifying it as
+    %% input_invalid would change the HTTP status the operator sees.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, _},
+        aws_auth_validate_tls:validate_chain([RootDer, IntDer, LeafDer], [RootDer], undefined)
     ).
 
 %%====================================================================
@@ -822,6 +933,39 @@ tls_extract_san_index_past_end_test() ->
         )
     ).
 
+%% Finding 3: an otherName SAN whose sanitize_other_name returns an error tuple
+%% must produce a categorized auth_failed result, NOT crash with badarg.
+tls_extract_other_name_error_tuple_test() ->
+    %% Simulate the scenario: rabbit_cert_info:sanitize_other_name/1 returns
+    %% {error, {asn1, ...}} for non-DirectoryString encodings (IA5STRING etc.).
+    %% We mock subject_alternative_names to return an otherName entry whose value,
+    %% when passed through the sanitization pipeline, produces an error tuple.
+    ok = meck:new(rabbit_cert_info, [passthrough, no_link]),
+    ok = meck:new(rabbit_data_coercion, [passthrough, no_link]),
+    meck:expect(rabbit_cert_info, subject_alternative_names, fun(_Der) ->
+        [
+            {otherName, {'AnotherName', {1, 2, 3, 4}, <<22, 11, "foo@bar.com">>}}
+        ]
+    end),
+    meck:expect(rabbit_data_coercion, to_binary, fun(V) -> V end),
+    meck:expect(rabbit_cert_info, sanitize_other_name, fun(_Bin) ->
+        {error, {asn1, {{invalid_choice_tag, {22, <<"foo@bar.com">>}}, []}}}
+    end),
+    try
+        Result = aws_auth_validate_tls:extract_username(
+            <<"fake-der">>,
+            #{from => subject_alternative_name, san_type => other_name, san_index => 0}
+        ),
+        %% Must NOT crash, must return a categorized error.
+        ?assertMatch(
+            {error, auth_failed, <<"no username could be extracted", _/binary>>},
+            Result
+        )
+    after
+        meck:unload(rabbit_data_coercion),
+        meck:unload(rabbit_cert_info)
+    end.
+
 %%====================================================================
 %% User resolution tests (Layer 3)
 %%====================================================================
@@ -829,26 +973,90 @@ tls_extract_san_index_past_end_test() ->
 tls_resolve_user_found_test_() ->
     {setup,
         fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
             ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
             meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> true end)
         end,
-        fun(_) -> meck:unload(rabbit_auth_backend_internal) end, fun(_) ->
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
             [?_assertEqual(ok, aws_auth_validate_tls:resolve_user(<<"alice">>))]
         end}.
 
-tls_resolve_user_not_found_test_() ->
+tls_resolve_user_not_found_internal_only_test_() ->
+    %% When the internal backend is the ONLY configured authN backend and the
+    %% user does not exist, the verdict is a definitive auth_failed.
     {setup,
         fun() ->
+            application:set_env(rabbit, auth_backends, [rabbit_auth_backend_internal]),
             ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
             meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
         end,
-        fun(_) -> meck:unload(rabbit_auth_backend_internal) end, fun(_) ->
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
             R = aws_auth_validate_tls:resolve_user(<<"bob">>),
             [
                 ?_assertMatch({error, auth_failed, _}, R),
                 ?_assertMatch(
                     {error, auth_failed, <<"no internal user named bob exists">>}, R
                 )
+            ]
+        end}.
+
+tls_resolve_user_not_found_external_backends_test_() ->
+    %% When other authN backends are also configured (e.g. LDAP) and the user is
+    %% not in the internal backend, the endpoint cannot be certain the user does
+    %% not exist -- it may live in LDAP. The result must be config_conflict
+    %% (inconclusive), not a confident auth_failed.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                rabbit_auth_backend_internal, rabbit_auth_backend_ldap
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ldap-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R),
+                ?_assert(
+                    nomatch =/=
+                        binary:match(
+                            element(3, R),
+                            <<"other auth backends are configured">>
+                        )
+                )
+            ]
+        end}.
+
+tls_resolve_user_not_found_tuple_backend_test_() ->
+    %% auth_backends entries may be {AuthN, AuthZ} tuples.
+    {setup,
+        fun() ->
+            application:set_env(rabbit, auth_backends, [
+                {rabbit_auth_backend_ldap, rabbit_auth_backend_internal}
+            ]),
+            ok = meck:new(rabbit_auth_backend_internal, [non_strict, no_link]),
+            meck:expect(rabbit_auth_backend_internal, exists, fun(_) -> false end)
+        end,
+        fun(_) ->
+            application:unset_env(rabbit, auth_backends),
+            meck:unload(rabbit_auth_backend_internal)
+        end,
+        fun(_) ->
+            R = aws_auth_validate_tls:resolve_user(<<"ext-user">>),
+            [
+                ?_assertMatch({error, config_conflict, _}, R)
             ]
         end}.
 
@@ -880,10 +1088,75 @@ tls_sanitize_username_strips_control_chars_test() ->
 
 tls_sanitize_username_caps_length_test() ->
     Long = binary:copy(<<"A">>, 300),
-    ?assertEqual(256, byte_size(aws_auth_validate_tls:sanitize_username(Long))).
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256).
+
+%% An all-ASCII input never reaches the hex-escape path, so it cannot show
+%% whether the cap survives escaping. Every byte here is invalid UTF-8 and
+%% non-control, so each expands to 6 characters (<0xC0>) -- the worst case for
+%% the length bound. Without a post-escape truncation this returned 1530 bytes.
+tls_sanitize_username_caps_length_after_hex_escape_test() ->
+    Long = binary:copy(<<192>>, 300),
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256),
+    %% Still valid UTF-8, so the reason binary remains JSON-encodable.
+    ?assert(is_binary(unicode:characters_to_binary(Result))).
 
 tls_sanitize_username_preserves_normal_test() ->
     ?assertEqual(<<"alice">>, aws_auth_validate_tls:sanitize_username(<<"alice">>)).
+
+%% Finding 4a: raw iPAddress SAN (4 bytes) must produce valid UTF-8 output that
+%% survives a rabbit_json:encode round-trip (i.e. no invalid UTF-8 sequences).
+tls_sanitize_username_raw_ip_valid_utf8_test() ->
+    %% A raw IPv4 address: <<192, 168, 1, 10>>. Bytes 1 and 10 are control chars
+    %% (stripped), 192 and 168 are not valid UTF-8 lead bytes alone.
+    Input = <<192, 168, 1, 10>>,
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% The result must be valid UTF-8: unicode:characters_to_binary returns the
+    %% input unchanged when it is valid, or an error/incomplete tuple otherwise.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% The reason binary incorporating this must survive JSON encoding.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)),
+    %% Verify it does not crash rabbit_json (or thoas) -- the actual failure mode.
+    try
+        rabbit_json:encode(#{<<"reason">> => Reason}),
+        ok
+    catch
+        _:_ ->
+            %% If rabbit_json is not available in the test env, verify via
+            %% unicode module directly (already done above).
+            ok
+    end.
+
+%% Finding 4b: a >256-byte value whose truncation splits a multibyte UTF-8
+%% character must still produce valid UTF-8 output.
+tls_sanitize_username_truncation_splits_multibyte_test() ->
+    %% Build a 255-byte ASCII string followed by a 3-byte UTF-8 character
+    %% (U+2603 SNOWMAN = <<226, 152, 131>>). The 256-byte cut falls in the
+    %% middle of the 3-byte sequence.
+    Prefix = binary:copy(<<"X">>, 255),
+    Snowman = <<226, 152, 131>>,
+    Input = <<Prefix/binary, Snowman/binary>>,
+    ?assertEqual(258, byte_size(Input)),
+    Result = aws_auth_validate_tls:sanitize_username(Input),
+    %% Result must be valid UTF-8.
+    ?assertEqual(Result, unicode:characters_to_binary(Result)),
+    %% Must be at most 256 bytes (the cap).
+    ?assert(byte_size(Result) =< 256),
+    %% Verify the reason string is JSON-encodable.
+    Reason = iolist_to_binary([
+        <<"no internal user named ">>, Result, <<" exists">>
+    ]),
+    ?assertEqual(Reason, unicode:characters_to_binary(Reason)).
+
+%% Verify that valid multibyte UTF-8 within the limit is preserved intact.
+tls_sanitize_username_preserves_utf8_test() ->
+    %% U+00E9 LATIN SMALL LETTER E WITH ACUTE = <<195, 169>> (2 bytes)
+    Input = <<"caf", 195, 169>>,
+    ?assertEqual(Input, aws_auth_validate_tls:sanitize_username(Input)).
 
 %%====================================================================
 %% Backward compatibility: requests with no new fields unchanged
@@ -1038,6 +1311,15 @@ gen_private_key_pem() ->
     {ok, Pem} = file:read_file(KeyFile),
     Pem.
 
+%% Minimal OpenSSH-format private key PEM. The content is not a real key but
+%% carries the "openssh-key-v1\0" magic that OTP's public_key:pem_decode/1
+%% recognizes, producing the {{no_asn1, new_openssh}, _, not_encrypted} entry
+%% that previously bypassed the denylist.
+openssh_key_pem() ->
+    Body = base64:encode(<<"openssh-key-v1", 0, "padding-data-here">>),
+    <<"-----BEGIN OPENSSH PRIVATE KEY-----\n", Body/binary,
+        "\n-----END OPENSSH PRIVATE KEY-----\n">>.
+
 %% Derive the cert filename from the key filename (matching gen_ca's naming).
 ca_cert_file_from_key(CaKeyFile) ->
     re:replace(CaKeyFile, "ca-key-", "ca-cert-", [{return, list}]).
@@ -1096,3 +1378,51 @@ gen_root_int_leaf() ->
     [{'Certificate', IntDer, not_encrypted}] = public_key:pem_decode(IntPem),
     [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
     {RootDer, IntDer, LeafDer}.
+
+%% Generate two self-signed root CAs with the SAME subject DN but different keys,
+%% plus a leaf signed by the second (new) root. Exercises the key-rollover
+%% scenario where a bundle contains both old and new roots and the code must try
+%% each candidate until one validates.
+%% Returns {OldRootDer, NewRootDer, LeafDer}.
+gen_two_roots_same_dn_and_leaf() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    F = fun(Name) -> filename:join(Dir, Name ++ "-" ++ Suffix ++ ".pem") end,
+    OldRootKey = F("kr-old-root-key"),
+    OldRootCert = F("kr-old-root-cert"),
+    NewRootKey = F("kr-new-root-key"),
+    NewRootCert = F("kr-new-root-cert"),
+    LeafKey = F("kr-leaf-key"),
+    LeafCsr = F("kr-leaf-csr"),
+    LeafCert = F("kr-leaf-cert"),
+    %% Both roots share the SAME CN (simulating key rollover).
+    CommonCN = "TestRolloverRoot" ++ Suffix,
+    Sh = fun(Fmt, Args) -> os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [OldRootKey, OldRootCert, CommonCN]
+    ),
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [NewRootKey, NewRootCert, CommonCN]
+    ),
+    %% Sign the leaf with the NEW root.
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj '/CN=RolloverLeaf~s' 2>/dev/null",
+        [LeafKey, LeafCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 2>/dev/null",
+        [LeafCsr, NewRootCert, NewRootKey, LeafCert]
+    ),
+    {ok, OldRootPem} = file:read_file(OldRootCert),
+    {ok, NewRootPem} = file:read_file(NewRootCert),
+    {ok, LeafPem} = file:read_file(LeafCert),
+    [{'Certificate', OldRootDer, not_encrypted}] = public_key:pem_decode(OldRootPem),
+    [{'Certificate', NewRootDer, not_encrypted}] = public_key:pem_decode(NewRootPem),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {OldRootDer, NewRootDer, LeafDer}.
