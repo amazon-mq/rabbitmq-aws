@@ -109,7 +109,7 @@
 
 %% client_cert / cert_login reason strings (Layer 1-3 validation).
 -define(REASON_BAD_CLIENT_CERT,
-    <<"client_cert must be a non-empty PEM-encoded certificate chain">>
+    <<"client_cert must be a non-empty PEM-encoded certificate chain (leaf certificate first)">>
 ).
 -define(REASON_CLIENT_CERT_PRIVATE_KEY,
     <<"client_cert must not contain private key material; send only certificate entries">>
@@ -141,6 +141,21 @@
 ).
 -define(REASON_CHAIN_FAILED,
     <<"the client certificate does not chain to the supplied CA bundle">>
+).
+-define(REASON_CHAIN_DEPTH_EXCEEDED,
+    <<"the client certificate chain exceeds the configured path length (depth)">>
+).
+-define(REASON_CHAIN_INVALID_SIGNATURE,
+    <<"a certificate in the client chain has an invalid signature">>
+).
+-define(REASON_CHAIN_INVALID_ISSUER,
+    <<"a certificate in the client chain has an invalid issuer">>
+).
+-define(REASON_CHAIN_BAD_KEY_USAGE,
+    <<"a certificate in the client chain has invalid key usage">>
+).
+-define(REASON_CHAIN_MISSING_BASIC_CONSTRAINT,
+    <<"a certificate in the client chain is missing a required basic constraint">>
 ).
 -define(REASON_CHAIN_EXPIRED,
     <<"the client certificate chain contains an expired or not-yet-valid certificate">>
@@ -289,11 +304,13 @@ do_tls_validate(#{ssl_options := Map} = Params) ->
         {ok, Pem} ->
             case decode_and_check(Pem) of
                 {error, _, _} = Err -> Err;
-                ok -> maybe_chain_validate(Params, Pem)
+                {ok, CaDers} -> maybe_chain_validate(Params, CaDers)
             end
     end.
 
-%% Decode the CA PEM and check each certificate. The decode is wrapped because
+%% Decode the CA PEM and check each certificate. Returns {ok, CaDers} on
+%% success so the caller can thread the already-decoded DER list into chain
+%% validation without a redundant second decode. The decode is wrapped because
 %% public_key:pem_decode/1 raises (rather than returning `skip') on a
 %% cert-framed PEM with a malformed base64 body -- one of the misconfigurations
 %% this catches -- so it must map to input_invalid, not crash.
@@ -305,9 +322,15 @@ decode_and_check(Pem) ->
             _Class:_Reason -> error
         end,
     case Decoded of
-        error -> {error, input_invalid, ?REASON_NO_CERTS};
-        skip -> {error, input_invalid, ?REASON_NO_CERTS};
-        Ders -> check_cert_validity(Ders)
+        error ->
+            {error, input_invalid, ?REASON_NO_CERTS};
+        skip ->
+            {error, input_invalid, ?REASON_NO_CERTS};
+        Ders ->
+            case check_cert_validity(Ders) of
+                ok -> {ok, Ders};
+                {error, _, _} = Err -> Err
+            end
     end.
 
 %% Check every certificate's [notBefore, notAfter] window against now, failing
@@ -562,25 +585,28 @@ check_verify_for_cert_login(#{ssl_options := SslMap} = Acc) ->
 %% Otherwise the existing CA-only validation already passed and we are done
 %% (unless cert_login is present, which cross_field_checks already guarantees
 %% cannot happen without client_cert_ders).
-maybe_chain_validate(#{client_cert_ders := ClientDers} = Params, CaPem) ->
-    CaDers = aws_auth_validate_ssl:decode_pem_cacerts(CaPem),
+maybe_chain_validate(#{client_cert_ders := ClientDers} = Params, CaDers) ->
     Depth = maps:get(<<"depth">>, maps:get(ssl_options, Params, #{}), undefined),
     case validate_chain(ClientDers, CaDers, Depth) of
         ok -> maybe_extract_username(Params);
         {error, _, _} = Err -> Err
     end;
-maybe_chain_validate(_Params, _CaPem) ->
+maybe_chain_validate(_Params, _CaDers) ->
     %% No client_cert: existing CA-only validation already passed.
     ok.
 
 %% Validate the client certificate chain against the CA trust anchors using
-%% public_key:pkix_path_validation/3. ClientDers is leaf-first; CaDers is the
+%% public_key:pkix_path_validation/3. ClientDers is leaf-first (the leaf cert
+%% MUST be the first element; the tail may be in any order). CaDers is the
 %% trust anchor pool. Depth caps intermediate chain length when set.
--spec validate_chain([binary()], [binary()] | skip, integer() | undefined) ->
+%%
+%% The implementation rebuilds an ordered chain from the leaf outward by
+%% issuer/subject matching (tolerating arbitrarily ordered intermediates in the
+%% tail), then finds ALL self-signed bundle certs whose subject matches the
+%% top-most cert's issuer, and tries each candidate anchor until one validates.
+%% This mirrors the broker's path-iteration behavior on key rollover.
+-spec validate_chain([binary()], [binary()], integer() | undefined) ->
     ok | {error, auth_failed | input_invalid, binary()}.
-validate_chain(_ClientDers, skip, _Depth) ->
-    %% No CA certs decoded (should not reach here -- decode_and_check catches it).
-    {error, auth_failed, ?REASON_CHAIN_FAILED};
 validate_chain(ClientDers, CaDers, Depth) ->
     try
         Opts =
@@ -588,48 +614,148 @@ validate_chain(ClientDers, CaDers, Depth) ->
                 undefined -> [];
                 N when is_integer(N), N >= 0 -> [{max_path_length, N}]
             end,
-        %% pkix_path_validation wants: TrustAnchor (DER), Chain (Options).
-        %% ClientDers is leaf-first ([leaf, intermediates...]); the topmost cert
-        %% (lists:last) is the one issued by a bundle CA, so match the anchor
-        %% against its issuer. The chain itself must be passed anchor-closest
-        %% first (the cert the anchor issued down to the leaf), which is the
-        %% reverse of the leaf-first ClientDers.
-        TopCert = lists:last(ClientDers),
-        Chain = lists:reverse(ClientDers),
-        case find_trust_anchor(TopCert, CaDers) of
-            {ok, AnchorDer} ->
-                case public_key:pkix_path_validation(AnchorDer, Chain, Opts) of
-                    {ok, _} ->
-                        ok;
-                    {error, {bad_cert, cert_expired}} ->
-                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
-                    {error, {bad_cert, {cert_expired, _}}} ->
-                        {error, auth_failed, ?REASON_CHAIN_EXPIRED};
-                    {error, {bad_cert, _}} ->
-                        {error, auth_failed, ?REASON_CHAIN_FAILED}
-                end;
-            not_found ->
-                {error, auth_failed, ?REASON_CHAIN_FAILED}
+        %% Rebuild the chain in issuer-linked order starting from the leaf.
+        %% The leaf MUST be element 0; the tail is reordered by issuer linkage.
+        OrderedDers = order_chain(ClientDers),
+        %% The top cert (lists:last) is the one closest to (or matching) a
+        %% bundle CA. Find anchors based on its issuer. If the top cert itself
+        %% is one of the anchors (client included the root in its PEM), strip
+        %% it from the path -- pkix_path_validation expects only certs BELOW
+        %% the anchor.
+        TopCert = lists:last(OrderedDers),
+        Anchors = find_trust_anchors(TopCert, CaDers),
+        {PathDers, EffectiveAnchors} =
+            case Anchors of
+                [] ->
+                    %% No anchor matches the top cert's issuer -- fail.
+                    {OrderedDers, []};
+                _ ->
+                    case lists:member(TopCert, Anchors) of
+                        true ->
+                            %% Top cert IS the anchor; validate only the
+                            %% certs below it.
+                            Below = lists:droplast(OrderedDers),
+                            {Below, [TopCert]};
+                        false ->
+                            {OrderedDers, Anchors}
+                    end
+            end,
+        case EffectiveAnchors of
+            [] ->
+                {error, auth_failed, ?REASON_CHAIN_FAILED};
+            _ ->
+                %% pkix_path_validation wants the chain anchor-closest first.
+                Chain = lists:reverse(PathDers),
+                try_anchors(EffectiveAnchors, Chain, Opts)
         end
     catch
         _:_ -> {error, input_invalid, ?REASON_CHAIN_MALFORMED}
     end.
 
-%% Find the trust anchor in CaDers whose subject matches the issuer of TopCertDer.
-find_trust_anchor(TopCertDer, CaDers) ->
-    TopOtp = public_key:pkix_decode_cert(TopCertDer, otp),
-    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
-    find_by_subject(Issuer, CaDers).
+%% Try each candidate trust anchor; accept if ANY validates. On failure,
+%% report the most informative reason (prefer a specific diagnosis over the
+%% generic "does not chain" fallback).
+try_anchors(Anchors, Chain, Opts) ->
+    Results = [
+        public_key:pkix_path_validation(A, Chain, Opts)
+     || A <- Anchors
+    ],
+    case
+        lists:any(
+            fun
+                ({ok, _}) -> true;
+                (_) -> false
+            end,
+            Results
+        )
+    of
+        true ->
+            ok;
+        false ->
+            Reasons = [R || {error, {bad_cert, R}} <- Results],
+            pick_best_failure(Reasons)
+    end.
 
-find_by_subject(_Issuer, []) ->
+%% Select the most informative failure from a list of bad_cert reasons.
+%% Priority: specific actionable reasons first, generic "does not chain" last.
+pick_best_failure([]) ->
+    {error, auth_failed, ?REASON_CHAIN_FAILED};
+pick_best_failure(Reasons) ->
+    Classify = fun(R) ->
+        case R of
+            cert_expired -> {1, ?REASON_CHAIN_EXPIRED};
+            max_path_length_reached -> {2, ?REASON_CHAIN_DEPTH_EXCEEDED};
+            invalid_key_usage -> {3, ?REASON_CHAIN_BAD_KEY_USAGE};
+            missing_basic_constraint -> {4, ?REASON_CHAIN_MISSING_BASIC_CONSTRAINT};
+            invalid_signature -> {5, ?REASON_CHAIN_INVALID_SIGNATURE};
+            invalid_issuer -> {6, ?REASON_CHAIN_INVALID_ISSUER};
+            _ -> {99, ?REASON_CHAIN_FAILED}
+        end
+    end,
+    Classified = lists:map(Classify, Reasons),
+    {_, BestReason} = lists:min(Classified),
+    {error, auth_failed, BestReason}.
+
+%% Rebuild the client cert chain in issuer-linked order starting from the leaf
+%% (element 0). The tail certs are matched by issuer->subject linkage so an
+%% arbitrarily ordered tail (e.g. [leaf, root, int]) still produces the correct
+%% ordering [leaf, int, root] as far as the linkage allows.
+order_chain([Leaf]) ->
+    [Leaf];
+order_chain([Leaf | Tail]) ->
+    order_chain_loop(Leaf, Tail, [Leaf]).
+
+order_chain_loop(_Current, [], Acc) ->
+    lists:reverse(Acc);
+order_chain_loop(Current, Remaining, Acc) ->
+    CurrOtp = public_key:pkix_decode_cert(Current, otp),
+    Issuer = CurrOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    case find_issuer_in(Issuer, Remaining) of
+        {ok, IssuerDer, Rest} ->
+            order_chain_loop(IssuerDer, Rest, [IssuerDer | Acc]);
+        not_found ->
+            %% Remaining certs cannot be linked; append them as-is so
+            %% pkix_path_validation can reject if they do not belong.
+            lists:reverse(Acc) ++ Remaining
+    end.
+
+find_issuer_in(_Issuer, []) ->
     not_found;
-find_by_subject(Issuer, [CaDer | Rest]) ->
-    CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+find_issuer_in(Issuer, [Der | Rest]) ->
+    CaOtp = public_key:pkix_decode_cert(Der, otp),
     Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
     case public_key:pkix_normalize_name(Issuer) =:= public_key:pkix_normalize_name(Subject) of
-        true -> {ok, CaDer};
-        false -> find_by_subject(Issuer, Rest)
+        true ->
+            {ok, Der, Rest};
+        false ->
+            case find_issuer_in(Issuer, Rest) of
+                {ok, Found, Rem} -> {ok, Found, [Der | Rem]};
+                not_found -> not_found
+            end
     end.
+
+%% Find ALL trust anchors in CaDers whose subject matches the issuer of
+%% TopCertDer AND that are self-signed. A non-self-signed intermediate in the
+%% bundle is not a valid trust anchor for pkix_path_validation (the broker's
+%% ssl_certificate module only accepts self-signed anchors in the default
+%% partial_chain behavior).
+find_trust_anchors(TopCertDer, CaDers) ->
+    TopOtp = public_key:pkix_decode_cert(TopCertDer, otp),
+    Issuer = TopOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.issuer,
+    find_all_self_signed_by_subject(Issuer, CaDers).
+
+find_all_self_signed_by_subject(Issuer, CaDers) ->
+    [
+        CaDer
+     || CaDer <- CaDers,
+        begin
+            CaOtp = public_key:pkix_decode_cert(CaDer, otp),
+            Subject = CaOtp#'OTPCertificate'.tbsCertificate#'OTPTBSCertificate'.subject,
+            public_key:pkix_normalize_name(Issuer) =:=
+                public_key:pkix_normalize_name(Subject) andalso
+                public_key:pkix_is_self_signed(CaOtp)
+        end
+    ].
 
 %%--------------------------------------------------------------------
 %% Layer 2: username extraction from the leaf certificate

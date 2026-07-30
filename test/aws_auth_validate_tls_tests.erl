@@ -775,8 +775,59 @@ tls_validate_chain_intermediate_depth_zero_rejected_test() ->
     %% depth=0 forbids any intermediate; the leaf+intermediate chain exceeds it.
     {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
     ?assertMatch(
-        {error, auth_failed, _},
+        {error, auth_failed,
+            <<"the client certificate chain exceeds the configured path length (depth)">>},
         aws_auth_validate_tls:validate_chain([LeafDer, IntDer], [RootDer], 0)
+    ).
+
+tls_validate_chain_intermediate_only_bundle_rejected_test() ->
+    %% Finding 1: A CA bundle containing only an intermediate (not self-signed)
+    %% must be rejected. The broker's ssl listener rejects this with unknown_ca.
+    {_RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, auth_failed, <<"the client certificate does not chain", _/binary>>},
+        aws_auth_validate_tls:validate_chain([LeafDer], [IntDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_old_new_order_test() ->
+    %% Finding 2: Two root CAs sharing the same subject DN (key rollover),
+    %% bundle order [OldRoot, NewRoot], leaf chaining to NewRoot. Must pass.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [OldRootDer, NewRootDer], undefined)
+    ).
+
+tls_validate_chain_key_rollover_new_old_order_test() ->
+    %% Finding 2: Same as above but bundle order [NewRoot, OldRoot]. Must pass
+    %% regardless of bundle order.
+    {OldRootDer, NewRootDer, LeafDer} = gen_two_roots_same_dn_and_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer], [NewRootDer, OldRootDer], undefined)
+    ).
+
+tls_validate_chain_unordered_tail_passes_test() ->
+    %% Finding 7: A leaf-first chain with an arbitrarily ordered tail must pass.
+    %% The broker's ssl_certificate:paths/2 rebuilds the chain from the peer cert
+    %% outward, so the tail order does not matter. Here we present [leaf, root, int]
+    %% with bundle=[root]: the tail is out of issuer order, but the code relinks it
+    %% as [leaf, int, root] and then strips root (the anchor) from the path.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertEqual(
+        ok,
+        aws_auth_validate_tls:validate_chain([LeafDer, RootDer, IntDer], [RootDer], undefined)
+    ).
+
+tls_validate_chain_root_first_rejected_test() ->
+    %% Finding 7 narrowing: A fully root-first chain (leaf is NOT the first
+    %% element) is rejected by the broker and must remain rejected here. This
+    %% pins the shared rejection so a future refactoring does not accidentally
+    %% loosen the leaf-first requirement.
+    {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
+    ?assertMatch(
+        {error, _, _},
+        aws_auth_validate_tls:validate_chain([RootDer, IntDer, LeafDer], [RootDer], undefined)
     ).
 
 %%====================================================================
@@ -1096,3 +1147,51 @@ gen_root_int_leaf() ->
     [{'Certificate', IntDer, not_encrypted}] = public_key:pem_decode(IntPem),
     [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
     {RootDer, IntDer, LeafDer}.
+
+%% Generate two self-signed root CAs with the SAME subject DN but different keys,
+%% plus a leaf signed by the second (new) root. Exercises the key-rollover
+%% scenario where a bundle contains both old and new roots and the code must try
+%% each candidate until one validates.
+%% Returns {OldRootDer, NewRootDer, LeafDer}.
+gen_two_roots_same_dn_and_leaf() ->
+    Dir = tmp_dir(),
+    Suffix = integer_to_list(erlang:unique_integer([positive])),
+    F = fun(Name) -> filename:join(Dir, Name ++ "-" ++ Suffix ++ ".pem") end,
+    OldRootKey = F("kr-old-root-key"),
+    OldRootCert = F("kr-old-root-cert"),
+    NewRootKey = F("kr-new-root-key"),
+    NewRootCert = F("kr-new-root-cert"),
+    LeafKey = F("kr-leaf-key"),
+    LeafCsr = F("kr-leaf-csr"),
+    LeafCert = F("kr-leaf-cert"),
+    %% Both roots share the SAME CN (simulating key rollover).
+    CommonCN = "TestRolloverRoot" ++ Suffix,
+    Sh = fun(Fmt, Args) -> os:cmd(lists:flatten(io_lib:format(Fmt, Args))) end,
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [OldRootKey, OldRootCert, CommonCN]
+    ),
+    _ = Sh(
+        "openssl req -x509 -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-days 2 -subj '/CN=~s' 2>/dev/null",
+        [NewRootKey, NewRootCert, CommonCN]
+    ),
+    %% Sign the leaf with the NEW root.
+    _ = Sh(
+        "openssl req -new -newkey rsa:2048 -nodes -keyout ~ts -out ~ts "
+        "-subj '/CN=RolloverLeaf~s' 2>/dev/null",
+        [LeafKey, LeafCsr, Suffix]
+    ),
+    _ = Sh(
+        "openssl x509 -req -in ~ts -CA ~ts -CAkey ~ts -CAcreateserial "
+        "-out ~ts -days 2 2>/dev/null",
+        [LeafCsr, NewRootCert, NewRootKey, LeafCert]
+    ),
+    {ok, OldRootPem} = file:read_file(OldRootCert),
+    {ok, NewRootPem} = file:read_file(NewRootCert),
+    {ok, LeafPem} = file:read_file(LeafCert),
+    [{'Certificate', OldRootDer, not_encrypted}] = public_key:pem_decode(OldRootPem),
+    [{'Certificate', NewRootDer, not_encrypted}] = public_key:pem_decode(NewRootPem),
+    [{'Certificate', LeafDer, not_encrypted}] = public_key:pem_decode(LeafPem),
+    {OldRootDer, NewRootDer, LeafDer}.
