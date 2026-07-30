@@ -1034,7 +1034,12 @@ sanitize_username(Name) when is_binary(Name) ->
     Capped = truncate_utf8(Name, ?MAX_USERNAME_LEN),
     %% Strip control characters (< 32 or DEL), then ensure UTF-8 validity:
     %% valid codepoints pass through, invalid bytes are hex-escaped as <0xHH>.
-    ensure_utf8(strip_control(Capped)).
+    Escaped = ensure_utf8(strip_control(Capped)),
+    %% Hex-escaping expands each invalid byte to 6 characters, so an all-invalid
+    %% input (e.g. 256 bytes of 0xC0) would otherwise blow past the cap by ~6x.
+    %% Re-truncate on a character boundary so ?MAX_USERNAME_LEN bounds the value
+    %% that actually reaches the response, which is the point of the cap.
+    truncate_utf8(Escaped, ?MAX_USERNAME_LEN).
 
 %% Truncate a binary to at most MaxBytes, respecting UTF-8 character boundaries.
 truncate_utf8(Bin, MaxBytes) when byte_size(Bin) =< MaxBytes ->

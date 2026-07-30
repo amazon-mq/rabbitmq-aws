@@ -881,9 +881,12 @@ tls_validate_chain_root_first_rejected_test() ->
     %% element) is rejected by the broker and must remain rejected here. This
     %% pins the shared rejection so a future refactoring does not accidentally
     %% loosen the leaf-first requirement.
+    %% Pin the CATEGORY, not just "some error": a well-formed but wrongly
+    %% ordered chain is an auth_failed verdict, and misclassifying it as
+    %% input_invalid would change the HTTP status the operator sees.
     {RootDer, IntDer, LeafDer} = gen_root_int_leaf(),
     ?assertMatch(
-        {error, _, _},
+        {error, auth_failed, _},
         aws_auth_validate_tls:validate_chain([RootDer, IntDer, LeafDer], [RootDer], undefined)
     ).
 
@@ -1087,6 +1090,17 @@ tls_sanitize_username_caps_length_test() ->
     Long = binary:copy(<<"A">>, 300),
     Result = aws_auth_validate_tls:sanitize_username(Long),
     ?assert(byte_size(Result) =< 256).
+
+%% An all-ASCII input never reaches the hex-escape path, so it cannot show
+%% whether the cap survives escaping. Every byte here is invalid UTF-8 and
+%% non-control, so each expands to 6 characters (<0xC0>) -- the worst case for
+%% the length bound. Without a post-escape truncation this returned 1530 bytes.
+tls_sanitize_username_caps_length_after_hex_escape_test() ->
+    Long = binary:copy(<<192>>, 300),
+    Result = aws_auth_validate_tls:sanitize_username(Long),
+    ?assert(byte_size(Result) =< 256),
+    %% Still valid UTF-8, so the reason binary remains JSON-encodable.
+    ?assert(is_binary(unicode:characters_to_binary(Result))).
 
 tls_sanitize_username_preserves_normal_test() ->
     ?assertEqual(<<"alice">>, aws_auth_validate_tls:sanitize_username(<<"alice">>)).
