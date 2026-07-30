@@ -114,10 +114,14 @@
 -define(REASON_CLIENT_CERT_PRIVATE_KEY,
     <<"client_cert must not contain private key material; send only certificate entries">>
 ).
--define(REASON_BAD_CERT_LOGIN, <<"cert_login must be an object">>).
--define(REASON_BAD_CERT_LOGIN_FROM,
-    <<"cert_login.from must be distinguished_name, common_name, or subject_alternative_name">>
+-define(REASON_CLIENT_CERT_UNEXPECTED_ENTRY,
+    <<"client_cert contains a non-certificate PEM entry; send only certificate entries">>
 ).
+-define(REASON_BAD_CERT_LOGIN, <<"cert_login must be an object">>).
+-define(REASON_BAD_CERT_LOGIN_FROM, <<
+    "cert_login.from must be distinguished_name, common_name, "
+    "subject_alternative_name, or subject_alt_name"
+>>).
 -define(REASON_SAN_TYPE_REQUIRES_SAN_FROM,
     <<"cert_login.san_type is only valid when from is subject_alternative_name">>
 ).
@@ -188,7 +192,14 @@
 -define(INTERNAL_BACKEND, rabbit_auth_backend_internal).
 -define(MAX_USERNAME_LEN, 256).
 
-%% Private key entry types that must be rejected from client_cert input (R6).
+%% Known private-key atom tags. Used for message selection only -- the actual
+%% rejection is allowlist-based (only 'Certificate' entries pass). When the
+%% offending entry carries one of these types or a tuple tag like
+%% {no_asn1, new_openssh}, the operator gets the specific "never send key
+%% material" reason; other unrecognized entry types get a generic rejection.
+%% EncryptedPrivateKeyInfo is listed for documentation: OTP rewrites it to
+%% PrivateKeyInfo internally before a caller sees it, but keeping it here is
+%% harmless and documents intent.
 -define(PRIVATE_KEY_TYPES, [
     'RSAPrivateKey',
     'DSAPrivateKey',
@@ -456,23 +467,46 @@ decode_client_cert_pem(Pem, Acc) ->
             classify_pem_entries(Decoded, Acc)
     end.
 
-%% Split the decoded PEM entries: reject if any private key type is present,
-%% collect Certificate DERs. An empty cert list after filtering is an error.
+%% Allowlist-structured: only plain Certificate entries are accepted. Any
+%% entry whose type is NOT 'Certificate' is rejected immediately -- this
+%% closes the class of bypass where an unenumerated key tag (e.g. the tuple
+%% {no_asn1, new_openssh} for OpenSSH-format keys) slips past a denylist.
+%% ?PRIVATE_KEY_TYPES is retained for message selection: when the offending
+%% entry IS a recognizable key type the operator gets the actionable
+%% "never send key material" reason; other unexpected entries get a generic
+%% non-certificate reason.
 classify_pem_entries(Entries, Acc) ->
-    HasKey = lists:any(
-        fun({Type, _Der, _Enc}) -> lists:member(Type, ?PRIVATE_KEY_TYPES) end,
-        Entries
-    ),
-    case HasKey of
-        true ->
-            {error, input_invalid, ?REASON_CLIENT_CERT_PRIVATE_KEY};
-        false ->
+    case find_non_cert_entry(Entries) of
+        none ->
             Ders = [Der || {'Certificate', Der, not_encrypted} <- Entries],
             case Ders of
                 [] -> {error, input_invalid, ?REASON_BAD_CLIENT_CERT};
                 _ -> {ok, Acc#{client_cert_ders => Ders}}
-            end
+            end;
+        {rejected, Reason} ->
+            {error, input_invalid, Reason}
     end.
+
+%% Scan entries for the first non-Certificate entry. Returns `none' if all
+%% entries are plain certificates, otherwise {rejected, Reason}.
+find_non_cert_entry([]) ->
+    none;
+find_non_cert_entry([{'Certificate', _Der, not_encrypted} | Rest]) ->
+    find_non_cert_entry(Rest);
+find_non_cert_entry([{Type, _Der, _Enc} | _Rest]) ->
+    case is_known_key_type(Type) of
+        true -> {rejected, ?REASON_CLIENT_CERT_PRIVATE_KEY};
+        false -> {rejected, ?REASON_CLIENT_CERT_UNEXPECTED_ENTRY}
+    end.
+
+%% Returns true when the PEM type tag identifies a private key -- either an
+%% atom from the traditional set or the tuple tag used by OpenSSH keys.
+is_known_key_type(Type) when is_atom(Type) ->
+    lists:member(Type, ?PRIVATE_KEY_TYPES);
+is_known_key_type({no_asn1, _}) ->
+    true;
+is_known_key_type(_) ->
+    false.
 
 %%--------------------------------------------------------------------
 %% Input parsing: cert_login (optional username-extraction config)
@@ -507,6 +541,8 @@ parse_cert_login_from(Map, Acc) ->
             check_no_san_fields(Map, Acc, common_name);
         <<"subject_alternative_name">> ->
             parse_san_fields(Map, Acc);
+        %% Mirrors the broker's accepted spellings: rabbit_ssl accepts both
+        %% subject_alternative_name and subject_alt_name for ssl_cert_login_from.
         <<"subject_alt_name">> ->
             parse_san_fields(Map, Acc);
         _ ->

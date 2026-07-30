@@ -495,6 +495,60 @@ tls_client_cert_garbage_pem_rejected_test() ->
         aws_auth_validate_tls:parse_input(Body)
     ).
 
+tls_client_cert_openssh_key_rejected_test() ->
+    %% An OpenSSH-format private key decodes as {{no_asn1, new_openssh}, _, _}
+    %% -- a tuple type tag. The allowlist must reject it with the private-key
+    %% reason (R6 security invariant).
+    OpensshPem = openssh_key_pem(),
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, OpensshPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_openssh_key_alone_rejected_test() ->
+    %% An OpenSSH key without any certificate is also rejected as key material.
+    OpensshPem = openssh_key_pem(),
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => OpensshPem
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert must not contain private key material", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
+tls_client_cert_encrypted_cert_entry_rejected_test() ->
+    %% A PEM entry that decodes as {'Certificate', _, some_cipher} (encrypted
+    %% certificate -- not plain not_encrypted) is caught by the allowlist because
+    %% only {'Certificate', _, not_encrypted} passes. Simulate with a hand-crafted
+    %% PEM that public_key:pem_decode would never produce in practice; instead test
+    %% classify_pem_entries directly via parse_input on a cert-only PEM that does
+    %% pass (and separately confirm the allowlist logic rejects non-cert entries).
+    %% Here we test the DH Parameters case -- a non-cert, non-key entry type.
+    DhPem = <<
+        "-----BEGIN DH PARAMETERS-----\nMIIBCAKCAQEA///////////JD9qiIWjC"
+        "NMTGYouA3BzRKQJOCIpnzHQCC76mOxObIlFK\n-----END DH PARAMETERS-----\n"
+    >>,
+    {_CaKey, _CaDer, CaPem} = gen_ca(),
+    Mixed = <<CaPem/binary, DhPem/binary>>,
+    Body = #{
+        <<"target">> => <<"listener">>,
+        <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
+        <<"client_cert">> => Mixed
+    },
+    ?assertMatch(
+        {error, input_invalid, <<"client_cert contains a non-certificate PEM entry", _/binary>>},
+        aws_auth_validate_tls:parse_input(Body)
+    ).
+
 %%====================================================================
 %% cert_login parse tests
 %%====================================================================
@@ -546,8 +600,11 @@ tls_cert_login_bad_from_rejected_test() ->
         <<"ssl_options">> => #{<<"cacertfile_arn">> => ?CACERT_ARN},
         <<"cert_login">> => #{<<"from">> => <<"serial_number">>}
     },
-    ?assertMatch(
-        {error, input_invalid, <<"cert_login.from must be", _/binary>>},
+    ?assertEqual(
+        {error, input_invalid, <<
+            "cert_login.from must be distinguished_name, common_name, "
+            "subject_alternative_name, or subject_alt_name"
+        >>},
         aws_auth_validate_tls:parse_input(Body)
     ).
 
@@ -1239,6 +1296,15 @@ gen_private_key_pem() ->
     ),
     {ok, Pem} = file:read_file(KeyFile),
     Pem.
+
+%% Minimal OpenSSH-format private key PEM. The content is not a real key but
+%% carries the "openssh-key-v1\0" magic that OTP's public_key:pem_decode/1
+%% recognizes, producing the {{no_asn1, new_openssh}, _, not_encrypted} entry
+%% that previously bypassed the denylist.
+openssh_key_pem() ->
+    Body = base64:encode(<<"openssh-key-v1", 0, "padding-data-here">>),
+    <<"-----BEGIN OPENSSH PRIVATE KEY-----\n", Body/binary,
+        "\n-----END OPENSSH PRIVATE KEY-----\n">>.
 
 %% Derive the cert filename from the key filename (matching gen_ca's naming).
 ca_cert_file_from_key(CaKeyFile) ->
