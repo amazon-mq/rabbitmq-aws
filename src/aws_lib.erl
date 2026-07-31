@@ -28,6 +28,7 @@
     local_time/0,
     api_get_request/3,
     api_post_request/5,
+    backoff_delay/3,
     endpoint/4,
     sign_headers/10,
     instance_volumes/1,
@@ -582,7 +583,7 @@ api_get_request(Service, Path, State) ->
         "",
         [],
         ?MAX_RETRIES,
-        ?LINEAR_BACK_OFF_MILLIS,
+        ?BACKOFF_BASE_MILLIS,
         State
     ).
 
@@ -606,7 +607,7 @@ api_post_request(Service, Path, Body, Headers, State) ->
         Body,
         Headers,
         ?MAX_RETRIES,
-        ?LINEAR_BACK_OFF_MILLIS,
+        ?BACKOFF_BASE_MILLIS,
         State
     ).
 
@@ -645,13 +646,14 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     Body :: body(),
     Headers :: headers(),
     Retries :: integer(),
-    WaitTime :: integer(),
+    BackoffBase :: integer(),
     State :: aws_state()
 ) ->
     {ok, list(), aws_state()} | {error, term(), aws_state()}.
-%% @doc Invoke an API call to an AWS service with retries.
+%% @doc Invoke an API call to an AWS service with retries and exponential
+%% backoff with jitter between attempts.
 %% @end
-api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, BackoffBase, State) ->
     %% Open a single connection and reuse it across the whole retry sequence
     %% instead of opening a fresh TCP+TLS connection per attempt (issue #91).
     %% When the state carries a reuse_conn (cross-request reuse, issue #107),
@@ -659,7 +661,7 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     %% start with `undefined' (nothing open yet, opened lazily on first attempt).
     Conn0 = seed_conn_from_state(State),
     api_request_with_retries(
-        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0, undefined
+        Service, Method, Path, Body, Headers, Retries, BackoffBase, State, Conn0, undefined, 0
     ).
 
 -spec api_request_with_retries(
@@ -669,14 +671,25 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime
     Body :: body(),
     Headers :: headers(),
     Retries :: integer(),
-    WaitTime :: integer(),
+    BackoffBase :: integer(),
     State :: aws_state(),
     Conn :: aws_lib_httpc:conn() | undefined,
-    LastError :: result_error() | undefined
+    LastError :: result_error() | undefined,
+    Attempt :: non_neg_integer()
 ) ->
     {ok, list(), aws_state()} | {error, term(), aws_state()}.
 api_request_with_retries(
-    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, State, Conn, LastError
+    _Service,
+    _Method,
+    _Path,
+    _Body,
+    _Headers,
+    Retries,
+    _BackoffBase,
+    State,
+    Conn,
+    LastError,
+    _Attempt
 ) when
     Retries =< 0
 ->
@@ -690,7 +703,7 @@ api_request_with_retries(
     %% rather than a generic string (issue #82).
     {error, exhausted_error(LastError), State1};
 api_request_with_retries(
-    Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0, LastError
+    Service, Method, Path, Body, Headers, Retries, BackoffBase, State0, Conn0, LastError, Attempt
 ) ->
     case ensure_credentials_valid(State0) of
         {ok, State1} ->
@@ -738,7 +751,7 @@ api_request_with_retries(
                             ?LOG_WARNING(
                                 "Will retry AWS request, remaining retries: ~b", [Retries]
                             ),
-                            timer:sleep(WaitTime),
+                            timer:sleep(backoff_delay(Attempt, BackoffBase, ?BACKOFF_CAP_MILLIS)),
                             %% perform_request_reuse/8 hands back a live connection
                             %% after an HTTP-level error (reused on the next
                             %% attempt) or `undefined' after a transport failure
@@ -754,10 +767,11 @@ api_request_with_retries(
                                 Body,
                                 Headers,
                                 Retries - 1,
-                                WaitTime,
+                                BackoffBase,
                                 State1,
                                 Conn1,
-                                keep_informative_error(LastError, Error)
+                                keep_informative_error(LastError, Error),
+                                Attempt + 1
                             )
                     end
             end;
@@ -792,6 +806,21 @@ exhausted_error({error, _Message, {_Headers, DecodedBody}}) ->
     {service_error, DecodedBody};
 exhausted_error(_) ->
     {service_error, retries_exhausted}.
+
+-spec backoff_delay(
+    Attempt :: non_neg_integer(), Base :: non_neg_integer(), Cap :: non_neg_integer()
+) ->
+    pos_integer().
+%% @doc Compute the sleep duration (ms) for a retry attempt using equal-jitter
+%% exponential backoff (aws-erlang pattern). The deterministic component
+%% (Temp/2) guarantees a minimum delay per attempt, while the random component
+%% (rand:uniform(Temp/2)) adds jitter to spread concurrent retriers. The
+%% formula: Temp = min(Cap, Base * 2^Attempt); Sleep = Temp/2 + uniform(Temp/2).
+%% @end
+backoff_delay(Attempt, Base, Cap) ->
+    Temp = min(Cap, Base * (1 bsl Attempt)),
+    HalfTemp = max(1, Temp div 2),
+    HalfTemp + rand:uniform(HalfTemp).
 
 %% Perform one request attempt on a reusable connection. Opens a connection when
 %% none is carried (or the carried one targets a different host) and reuses the

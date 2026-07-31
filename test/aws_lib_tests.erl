@@ -1175,3 +1175,110 @@ expired_imdsv2_token_test_() ->
             ?assertEqual(true, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end}
     ].
+
+%% ----------------------------------------------------------------------------
+%% backoff_delay/3 -- exponential backoff with equal jitter (issue #81)
+%% ----------------------------------------------------------------------------
+backoff_delay_test_() ->
+    [
+        {"attempt 0 with base 500 is in range [250, 500]", fun() ->
+            Results = [aws_lib:backoff_delay(0, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 250 andalso V =< 500)
+                end,
+                Results
+            )
+        end},
+        {"attempt 1 with base 500 is in range [500, 1000]", fun() ->
+            Results = [aws_lib:backoff_delay(1, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 500 andalso V =< 1000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 2 with base 500 is in range [1000, 2000]", fun() ->
+            Results = [aws_lib:backoff_delay(2, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 1000 andalso V =< 2000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 3 with base 500 is in range [2000, 4000]", fun() ->
+            Results = [aws_lib:backoff_delay(3, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 2000 andalso V =< 4000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 4 with base 500 is in range [4000, 8000]", fun() ->
+            Results = [aws_lib:backoff_delay(4, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 4000 andalso V =< 8000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 5 with base 500 is capped in range [5000, 10000]", fun() ->
+            Results = [aws_lib:backoff_delay(5, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 5000 andalso V =< 10000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 10 is capped in range [5000, 10000]", fun() ->
+            Results = [aws_lib:backoff_delay(10, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 5000 andalso V =< 10000)
+                end,
+                Results
+            )
+        end},
+        {"boundary: base=1 cap=1 does not crash", fun() ->
+            V = aws_lib:backoff_delay(0, 1, 1),
+            ?assert(V >= 1)
+        end},
+        {"boundary: base=0 cap=0 does not crash (returns >= 1 due to guard)", fun() ->
+            V = aws_lib:backoff_delay(0, 0, 0),
+            ?assert(V >= 1)
+        end},
+        {"statistical spread: jitter produces varying results", fun() ->
+            Results = [aws_lib:backoff_delay(2, 500, 10000) || _ <- lists:seq(1, 100)],
+            Unique = lists:usort(Results),
+            %% With 100 samples from a range of 1000 values, we expect more than
+            %% a single distinct value. If all are identical, jitter is broken.
+            ?assert(length(Unique) > 1)
+        end},
+        {"monotonic growth: average delay increases with attempt (up to cap)", fun() ->
+            Avg = fun(Attempt) ->
+                Vals = [aws_lib:backoff_delay(Attempt, 500, 10000) || _ <- lists:seq(1, 200)],
+                lists:sum(Vals) / length(Vals)
+            end,
+            Avg0 = Avg(0),
+            Avg1 = Avg(1),
+            Avg2 = Avg(2),
+            Avg3 = Avg(3),
+            ?assert(Avg1 >= Avg0),
+            ?assert(Avg2 >= Avg1),
+            ?assert(Avg3 >= Avg2)
+        end},
+        {"cap less than base clips delay to cap range", fun() ->
+            Results = [aws_lib:backoff_delay(0, 5000, 100) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 51 andalso V =< 100)
+                end,
+                Results
+            )
+        end}
+    ].
