@@ -22,7 +22,8 @@
     load_imdsv2_token/0,
     instance_metadata_request_headers/1,
     region/1,
-    endpoint_url/1
+    endpoint_url/1,
+    parse_iso8601_timestamp/1
 ]).
 
 %% Export all for unit tests
@@ -111,9 +112,15 @@ credentials(Config) ->
 %%      indicating the credentials are locally configured, and are not
 %%      temporary.
 %%
-%%      If no credentials could be resolved up until this point, there will be
-%%      an attempt to contact a local EC2 instance metadata service for
-%%      credentials.
+%%      If no credentials are found in the configuration or shared credentials
+%%      files, and the profile's config file section specifies a
+%%      ``credential_process`` key, the external helper command will be invoked.
+%%      If it succeeds, those credentials are returned. If it is configured but
+%%      fails, an error is returned without consulting the instance metadata
+%%      service.
+%%
+%%      If ``credential_process`` is not configured, there will be an attempt
+%%      to contact a local EC2 instance metadata service for credentials.
 %%
 %%      When the EC2 instance metadata server is checked for but does not exist,
 %%      the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
@@ -602,51 +609,56 @@ lookup_credentials_from_config(_, AccessKey, SecretKey, SessionToken, Config) ->
     Credentials :: list(),
     Config :: aws_config()
 ) ->
-    {ok, aws_credentials(), aws_config()} | error().
+    {ok, aws_credentials(), aws_config()} | {error, term()}.
 %% @doc Check to see if the shared credentials file exists and if it does,
-%%      invoke ``lookup_credentials_from_shared_creds_section/2`` to attempt to
-%%      get the credentials values out of it. If the file does not exist,
-%%      attempt to lookup the values from the EC2 instance metadata service.
+%%      invoke ``lookup_credentials_from_section/3`` to attempt to get the
+%%      credentials values out of it. If the file does not exist, attempt to
+%%      lookup values via credential_process (if configured in the profile's
+%%      config file section) or the EC2 instance metadata service.
 %% @end
-lookup_credentials_from_file(_, {error, _}, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
+lookup_credentials_from_file(Profile, {error, _}, Config) ->
+    lookup_credentials_from_credential_process(Profile, Config);
 lookup_credentials_from_file(Profile, Credentials, Config) ->
     Section = proplists:get_value(Profile, Credentials),
-    lookup_credentials_from_section(Section, Config).
+    lookup_credentials_from_section(Profile, Section, Config).
 
 -spec lookup_credentials_from_section(
+    Profile :: string(),
     Credentials :: list() | undefined,
     Config :: aws_config()
 ) ->
-    {ok, aws_credentials(), aws_config()} | error().
+    {ok, aws_credentials(), aws_config()} | {error, term()}.
 %% @doc Return the access key and secret access key if they are set in
 %%      for the specified profile from the shared credentials file. If the
 %%      profile is not set or the values are not set in the profile, attempt to
-%%      lookup the values from the EC2 instance metadata service.
+%%      lookup the values via credential_process or the EC2 instance metadata
+%%      service.
 %% @end
-lookup_credentials_from_section(undefined, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
-lookup_credentials_from_section(Credentials, Config) ->
+lookup_credentials_from_section(Profile, undefined, Config) ->
+    lookup_credentials_from_credential_process(Profile, Config);
+lookup_credentials_from_section(Profile, Credentials, Config) ->
     AccessKey = proplists:get_value(aws_access_key_id, Credentials, undefined),
     SecretKey = proplists:get_value(aws_secret_access_key, Credentials, undefined),
     SessionToken = proplists:get_value(aws_session_token, Credentials, undefined),
-    lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config).
+    lookup_credentials_from_proplist(Profile, AccessKey, SecretKey, SessionToken, Config).
 
 -spec lookup_credentials_from_proplist(
+    Profile :: string(),
     AccessKey :: access_key(),
     SecretAccessKey :: secret_access_key(),
     SessionToken :: security_token(),
     Config :: aws_config()
 ) ->
-    {ok, aws_credentials(), aws_config()} | error().
+    {ok, aws_credentials(), aws_config()} | {error, term()}.
 %% @doc Process the contents of the Credentials proplists checking if the
-%%      access key and secret access key are both set.
+%%      access key and secret access key are both set. If either is undefined,
+%%      falls through to credential_process (if configured) before IMDS.
 %% @end
-lookup_credentials_from_proplist(undefined, _, _, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
-lookup_credentials_from_proplist(_, undefined, _, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
-lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
+lookup_credentials_from_proplist(Profile, undefined, _, _, Config) ->
+    lookup_credentials_from_credential_process(Profile, Config);
+lookup_credentials_from_proplist(Profile, _, undefined, _, Config) ->
+    lookup_credentials_from_credential_process(Profile, Config);
+lookup_credentials_from_proplist(_Profile, AccessKey, SecretKey, SessionToken, Config) ->
     Creds = #aws_credentials{
         access_key = AccessKey,
         secret_key = SecretKey,
@@ -654,6 +666,58 @@ lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
         expiration = undefined
     },
     {ok, Creds, Config}.
+
+-spec lookup_credentials_from_credential_process(
+    Profile :: string(),
+    Config :: aws_config()
+) ->
+    {ok, aws_credentials(), aws_config()} | {error, term()}.
+%% @doc Check the config file for a credential_process setting in the active
+%%      profile. If present, execute it and return credentials on success or a
+%%      hard error on failure (no fallthrough to IMDS). If absent, fall through
+%%      to the instance metadata service.
+%% @end
+lookup_credentials_from_credential_process(Profile, Config) ->
+    case get_credential_process_command(Profile) of
+        undefined ->
+            lookup_credentials_from_instance_metadata(Config);
+        Command ->
+            case aws_lib_credential_process:execute(Command) of
+                {ok, Creds} ->
+                    {ok, Creds, Config};
+                {error, _} = Error ->
+                    Error
+            end
+    end.
+
+-spec get_credential_process_command(Profile :: string()) -> string() | undefined.
+%% @doc Look up the credential_process key from the config file for the given
+%%      profile. In ~/.aws/config, non-default profiles are stored under
+%%      "[profile <name>]" while the default profile is stored as "[default]".
+%% @end
+get_credential_process_command(Profile) ->
+    case config_file_data() of
+        {error, _} ->
+            undefined;
+        ConfigData ->
+            %% Try the profile section name as-is first (handles "default"),
+            %% then try with "profile " prefix (handles non-default profiles
+            %% in the config file format).
+            Section = proplists:get_value(
+                Profile,
+                ConfigData,
+                proplists:get_value(
+                    "profile " ++ Profile,
+                    ConfigData,
+                    []
+                )
+            ),
+            case proplists:get_value(credential_process, Section) of
+                undefined -> undefined;
+                Value when is_list(Value) -> Value;
+                _ -> undefined
+            end
+    end.
 
 -spec with_metadata_connection(fun((aws_lib_httpc:conn()) -> Result)) -> Result.
 %% @doc Execute a function with a shared metadata service connection

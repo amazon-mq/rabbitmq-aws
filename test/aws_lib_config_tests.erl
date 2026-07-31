@@ -105,7 +105,16 @@ config_file_data_test_() ->
                 ]},
                 {"profile only-key", [{aws_access_key_id, "foo3"}]},
                 {"profile only-secret", [{aws_secret_access_key, "foo4"}]},
-                {"profile bad-entry", [{aws_secret_access, "foo5"}]}
+                {"profile bad-entry", [{aws_secret_access, "foo5"}]},
+                {"profile credential-process", [
+                    {credential_process, "/usr/bin/test-helper --arg1 --arg2"},
+                    {region, "us-east-1"}
+                ]},
+                {"profile credential-process-with-creds", [
+                    {aws_access_key_id, "direct-key"},
+                    {aws_secret_access_key, "direct-secret"},
+                    {credential_process, "/usr/bin/should-not-run"}
+                ]}
             ],
             ?assertEqual(
                 Expectation,
@@ -762,6 +771,87 @@ maybe_imdsv2_token_headers_test_() ->
                 meck:expect(gun, await_body, fun(_, _, _) -> {ok, list_to_binary(IMDSv2Token)} end),
                 {ok, Headers, _S1} = aws_lib_config:maybe_imdsv2_token_headers(S),
                 ?assertEqual([{"X-aws-ec2-metadata-token", IMDSv2Token}], Headers)
+            end}
+        ]
+    }.
+
+credential_process_chain_test_() ->
+    {
+        foreach,
+        fun() ->
+            meck:new(gun, []),
+            meck:new(aws_lib, [passthrough]),
+            meck:new(aws_lib_credential_process, [passthrough]),
+            reset_environment(),
+            application:set_env(aws, aws_prefer_imdsv2, false),
+            [gun, aws_lib, aws_lib_credential_process]
+        end,
+        fun(Mods) ->
+            application:unset_env(aws, aws_prefer_imdsv2),
+            meck:unload(Mods)
+        end,
+        [
+            {"credential_process is invoked when direct creds are absent", fun() ->
+                setup_test_config_env_var(),
+                FakeCreds = #aws_credentials{
+                    access_key = "FROMPROCESS",
+                    secret_key = "SECRETFROMPROCESS",
+                    security_token = "TOKENFROMPROCESS",
+                    expiration = {{2026, 12, 31}, {23, 59, 59}}
+                },
+                meck:expect(aws_lib_credential_process, execute, fun(_) ->
+                    {ok, FakeCreds}
+                end),
+                S = #aws_config{},
+                {ok, Creds, _S1} = aws_lib_config:credentials("credential-process", S),
+                ?assertEqual("FROMPROCESS", Creds#aws_credentials.access_key),
+                ?assertEqual("SECRETFROMPROCESS", Creds#aws_credentials.secret_key),
+                ?assertEqual("TOKENFROMPROCESS", Creds#aws_credentials.security_token),
+                %% Verify execute was called
+                ?assert(meck:called(aws_lib_credential_process, execute, '_'))
+            end},
+            {"direct creds take priority over credential_process", fun() ->
+                setup_test_config_env_var(),
+                meck:expect(aws_lib_credential_process, execute, fun(_) ->
+                    {ok, #aws_credentials{
+                        access_key = "SHOULDNOTUSE",
+                        secret_key = "SHOULDNOTUSE",
+                        security_token = undefined,
+                        expiration = undefined
+                    }}
+                end),
+                S = #aws_config{},
+                %% The "credential-process-with-creds" profile has both direct
+                %% creds and credential_process; direct creds should win.
+                {ok, Creds, _S1} = aws_lib_config:credentials(
+                    "credential-process-with-creds", S
+                ),
+                ?assertEqual("direct-key", Creds#aws_credentials.access_key),
+                ?assertEqual("direct-secret", Creds#aws_credentials.secret_key),
+                %% execute should NOT have been called
+                ?assertNot(meck:called(aws_lib_credential_process, execute, '_'))
+            end},
+            {"credential_process failure does NOT fall through to IMDS", fun() ->
+                setup_test_config_env_var(),
+                meck:expect(aws_lib_credential_process, execute, fun(_) ->
+                    {error, {credential_process, execution_failed}}
+                end),
+                S = #aws_config{},
+                Result = aws_lib_config:credentials("credential-process", S),
+                ?assertEqual({error, {credential_process, execution_failed}}, Result),
+                %% Verify IMDS was NOT attempted (gun:open not called)
+                ?assertNot(meck:called(gun, open, '_'))
+            end},
+            {"falls through to IMDS when credential_process is not configured", fun() ->
+                setup_test_config_env_var(),
+                S = #aws_config{},
+                meck:expect(aws_lib, ensure_imdsv2_token_valid, 1, {ok, undefined, S}),
+                mock_gun_imdsv2_failure(),
+                %% "nonexistent-profile" has no entry in either config or
+                %% credentials file, and no credential_process, so should
+                %% fall through to IMDS (which we mock to fail).
+                Result = aws_lib_config:credentials("nonexistent-profile", S),
+                ?assertEqual({error, undefined}, Result)
             end}
         ]
     }.
