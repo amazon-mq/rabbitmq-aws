@@ -40,9 +40,8 @@ Checked in order by `aws_lib_config:credentials/1`:
 
 ### HTTP Client
 
-Uses Gun (HTTP/1.1 and HTTP/2). Two usage patterns:
-- **One-shot:** `request/6-8` opens connection, makes request, closes connection
-- **Pooled:** `open_connection/2` + `direct_request/7` + `close_connection/1`
+Uses Gun (HTTP/1.1 and HTTP/2). One-shot request lifecycle:
+- `request/6-8` opens connection, makes request, closes connection
 
 ### Retry Logic
 
@@ -52,7 +51,7 @@ Uses Gun (HTTP/1.1 and HTTP/2). Two usage patterns:
 
 | Module | Purpose |
 |--------|---------|
-| `aws_lib` | Main API: state management, request lifecycle, retries, connection pooling, EBS volume discovery |
+| `aws_lib` | Main API: state management, request lifecycle, retries, EBS volume discovery |
 | `aws_lib_config` | Credential/region loading from env, files, and IMDS; INI parsing; IMDSv2 token management |
 | `aws_lib_sign` | AWS Signature Version 4: canonical request, signing key derivation, authorization header |
 | `aws_lib_ops` | Higher-level EC2 operations: create/delete EBS snapshots |
