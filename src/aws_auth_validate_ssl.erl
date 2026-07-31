@@ -292,13 +292,13 @@ nonempty_or(V, ReasonKey, Opts) ->
 %% Resolve ssl_options.cacertfile_arn to the raw-DER cacerts ssl option (or [] if
 %% absent / no cert entries).
 %%
-%% A resolve failure returns the `arn_resolve_failed' sentinel rather than a
-%% finished reason string: only the caller knows which request field this ARN
-%% came from, and resolve_ssl_material/2 aggregates that attribution across all
-%% the ARNs in one request. resolve_arn_reason/1 turns the sentinel into a
-%% caller-facing binary for the single-ARN callers.
+%% A resolve failure returns the field-tagged {arn_failed, Fields} form rather
+%% than a finished reason string, so resolve_ssl_material/2 can aggregate the
+%% attribution across every ARN in the request and name them all in one
+%% response. This mirrors resolve_client_cert/2, which reports its own two
+%% fields the same way.
 -spec resolve_cacerts(term(), aws_lib:aws_state()) ->
-    {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary() | atom()}.
+    {ok, list()} | {arn_failed, [binary()]}.
 resolve_cacerts(undefined, _State) ->
     {ok, []};
 resolve_cacerts(Arn, State) when is_binary(Arn) ->
@@ -309,7 +309,7 @@ resolve_cacerts(Arn, State) when is_binary(Arn) ->
                 Certs -> {ok, [{cacerts, Certs}]}
             end;
         {error, _} ->
-            {error, input_invalid, arn_resolve_failed}
+            {arn_failed, [<<"ssl_options.cacertfile_arn">>]}
     end.
 
 %% Resolve every ARN the request references under ssl_options, attempting ALL of
@@ -328,14 +328,10 @@ resolve_cacerts(Arn, State) when is_binary(Arn) ->
 -spec resolve_ssl_material(map(), aws_lib:aws_state() | none) ->
     {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
 resolve_ssl_material(Map, State) ->
-    CacertRes =
-        case resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State) of
-            {error, input_invalid, arn_resolve_failed} ->
-                {arn_failed, [<<"ssl_options.cacertfile_arn">>]};
-            Other ->
-                Other
-        end,
-    Results = [CacertRes, resolve_client_cert(Map, State)],
+    Results = [
+        resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State),
+        resolve_client_cert(Map, State)
+    ],
     case [Fields || {arn_failed, Fields} <- Results] of
         [_ | _] = Failed ->
             {error, input_invalid, arn_resolve_reason(lists:append(Failed))};
@@ -659,9 +655,10 @@ connection_timeout_ms(#{default := Default, max := Max}) ->
 reason(Key, #{reasons := Reasons}) ->
     maps:get(Key, Reasons).
 
-%% The generic ARN-resolve reason. Retained for the PEM-decode paths, where the
-%% ARN itself resolved fine and the failure is about the CONTENT, so naming the
-%% field would misdescribe what went wrong.
+%% The generic ARN-resolve reason, used when no field attribution is available.
+%% Every current caller supplies at least one field, so this is reached only via
+%% arn_resolve_reason([]) -- kept so an empty list cannot render as a reason with
+%% a dangling "for: " and no fields.
 generic_arn_resolve() ->
     <<"failed to resolve ARN">>.
 
