@@ -125,6 +125,12 @@ init_per_testcase(TC, Config) ->
     ets:insert(conn_counter, {count, 0}),
     %% Clean application env.
     application:unset_env(rabbit, ssl_options),
+    %% Restore the global endpoint override unconditionally. A prior test case
+    %% may have unset it (e.g. to test per-service overrides) and then crashed
+    %% before restoring it.
+    true = os:putenv("AWS_ENDPOINT_URL", ?config(endpoint_url, Config)),
+    os:unsetenv("AWS_ENDPOINT_URL_S3"),
+    os:unsetenv("AWS_ENDPOINT_URL_SECRETSMANAGER"),
     Config.
 
 end_per_testcase(TC, Config) ->
@@ -157,8 +163,7 @@ multi_arn_same_host_single_connection(_Config) ->
     Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
     ct:pal("process_arn_config result: ~p", [Result]),
     ?assertMatch({ok, {iam_role_result, assumed}}, Result),
-    %% Wait briefly for any pending accepts to register.
-    timer:sleep(100),
+    %% Accept fires synchronously before gun can proceed; counter is stable.
     [{count, ConnCount}] = ets:lookup(Tab, count),
     ct:pal("TCP connections accepted: ~b (expected 1)", [ConnCount]),
     ?assertEqual(1, ConnCount).
@@ -202,7 +207,6 @@ multi_arn_different_hosts_multiple_connections(Config) ->
     Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
     ct:pal("process_arn_config result: ~p", [Result]),
     ?assertMatch({ok, {iam_role_result, assumed}}, Result),
-    timer:sleep(100),
     [{count, ConnCount}] = ets:lookup(Tab, count),
     ct:pal("TCP connections accepted: ~b (expected 2)", [ConnCount]),
     ?assertEqual(2, ConnCount),
@@ -228,7 +232,6 @@ connection_closed_after_pass(_Config) ->
     ],
     Result = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
     ?assertMatch({ok, {iam_role_result, assumed}}, Result),
-    timer:sleep(100),
     [{count, ConnCount}] = ets:lookup(Tab, count),
     ct:pal("TCP connections accepted: ~b (expected 1)", [ConnCount]),
     ?assertEqual(1, ConnCount),
@@ -241,7 +244,6 @@ connection_closed_after_pass(_Config) ->
     %% with the same ARN should open a NEW connection (count goes from 1 to 2).
     ets:insert(Tab, {count, 0}),
     _ = aws_arn_config:process_arn_config({handle_env_arn_config, {ok, ArnConfig}}),
-    timer:sleep(100),
     [{count, ConnCount2}] = ets:lookup(Tab, count),
     ct:pal("TCP connections for second pass: ~b (expected 1 -- new connection)", [ConnCount2]),
     ?assertEqual(1, ConnCount2).
