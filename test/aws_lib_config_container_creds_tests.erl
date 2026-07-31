@@ -206,7 +206,7 @@ container_auth_token_test_() ->
                 "/nonexistent/path/token"
             ),
             ?assertError(
-                {container_token_file_not_found, _},
+                {container_token_file_unreadable, enoent},
                 aws_lib_config:container_auth_token()
             )
         end},

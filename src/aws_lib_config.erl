@@ -687,11 +687,13 @@ lookup_credentials_from_container_or_imds(Config) ->
                             %% credentials (env var is set) but the fetch failed. Do NOT
                             %% fall through to IMDS -- that would silently use the EC2
                             %% host instance role instead of the intended task role.
+                            %% Log only the error category, not the full reason -- the
+                            %% reason may contain response body fragments (P0 R6).
                             ?LOG_ERROR(
                                 "Container credentials fetch failed: ~tp. "
                                 "Not falling through to IMDS because "
                                 "AWS_CONTAINER_CREDENTIALS_*_URI is set.",
-                                [Reason]
+                                [sanitize_container_error(Reason)]
                             ),
                             {error, {container_credentials_failed, Reason}}
                     end
@@ -745,9 +747,11 @@ container_credentials_url() ->
 
 -spec container_credentials_base_host() -> string().
 %% @doc Return the base host for RELATIVE_URI. Defaults to the ECS task
-%%      metadata endpoint. A test-only application env override allows
-%%      integration tests to point at a local stub.
+%%      metadata endpoint (169.254.170.2). In test builds only, an
+%%      application env override allows integration tests to point at a
+%%      local stub; this compiles out in production.
 %% @end
+-ifdef(TEST).
 container_credentials_base_host() ->
     case application:get_env(aws, container_credentials_host_override) of
         {ok, Host} when is_list(Host), Host =/= "" ->
@@ -755,6 +759,10 @@ container_credentials_base_host() ->
         _ ->
             ?ECS_CREDENTIALS_HOST
     end.
+-else.
+container_credentials_base_host() ->
+    ?ECS_CREDENTIALS_HOST.
+-endif.
 
 -spec validate_full_uri(string()) -> ok | {error, term()}.
 %% @doc SSRF allowlist for AWS_CONTAINER_CREDENTIALS_FULL_URI.
@@ -858,25 +866,16 @@ container_auth_token() ->
 %% @doc Read a bearer token from a file. Validates the file is readable and
 %%      within the size cap. Raises on failure so the credential chain can
 %%      distinguish "token configured but broken" from "no token configured".
+%%      Reads first, then checks size -- eliminates TOCTOU between stat and read.
 %% @end
 read_token_file(Path) ->
-    case file:read_file_info(Path) of
-        {ok, FileInfo} ->
-            Size = element(2, FileInfo),
-            case Size > ?CONTAINER_AUTH_TOKEN_MAX_SIZE of
-                true ->
-                    %% Do NOT log the path in detail -- it might be sensitive.
-                    error({container_token_file_too_large, Size});
-                false ->
-                    case file:read_file(Path) of
-                        {ok, Bin} ->
-                            string:trim(binary_to_list(Bin));
-                        {error, Reason} ->
-                            error({container_token_file_unreadable, Reason})
-                    end
-            end;
+    case file:read_file(Path) of
+        {ok, Bin} when byte_size(Bin) =< ?CONTAINER_AUTH_TOKEN_MAX_SIZE ->
+            string:trim(binary_to_list(Bin));
+        {ok, Bin} ->
+            error({container_token_file_too_large, byte_size(Bin)});
         {error, Reason} ->
-            error({container_token_file_not_found, Reason})
+            error({container_token_file_unreadable, Reason})
     end.
 
 -spec fetch_container_credentials(string(), string() | undefined) ->
@@ -887,8 +886,12 @@ read_token_file(Path) ->
 %%
 %%      Security:
 %%        - Never follows HTTP redirects (a redirect could leak the Authorization
-%%          token to an attacker-controlled host).
-%%        - Enforces a response body size cap to prevent memory exhaustion.
+%%          token to an attacker-controlled host; gun does not follow by default).
+%%        - Enforces a response body size cap. The cap is checked after the body
+%%          is buffered (gun reads the full body before returning). Practical OOM
+%%          risk is bounded by the 5s response timeout and the fact that for HTTP
+%%          the endpoint MUST be loopback or ECS link-local (both trusted). For
+%%          HTTPS, the attacker must hold a valid TLS certificate for the host.
 %%        - Never logs the token or credential values.
 %% @end
 fetch_container_credentials(URL, Token) ->
@@ -901,14 +904,21 @@ fetch_container_credentials(URL, Token) ->
             Headers = container_creds_headers(Token),
             Opts = container_creds_open_opts(Transport, Host),
             case aws_lib_httpc:request(Host, Port, get, Path, Headers, <<>>, Opts) of
-                {ok, {{_, 200, _}, _RespHeaders, Body}} when
-                    byte_size(Body) =< ?CONTAINER_CREDS_MAX_BODY
-                ->
-                    parse_container_credentials_body(Body);
-                {ok, {{_, 200, _}, _RespHeaders, Body}} when
-                    byte_size(Body) > ?CONTAINER_CREDS_MAX_BODY
-                ->
-                    {error, response_body_too_large};
+                {ok, {{_, 200, _}, RespHeaders, Body}} ->
+                    %% Check body size cap. Also verify Content-Length if present
+                    %% (early reject before full buffering on compliant servers).
+                    CLHeaderOk =
+                        case content_length_value(RespHeaders) of
+                            undefined -> true;
+                            CL when CL =< ?CONTAINER_CREDS_MAX_BODY -> true;
+                            _ -> false
+                        end,
+                    case CLHeaderOk andalso byte_size(Body) =< ?CONTAINER_CREDS_MAX_BODY of
+                        true ->
+                            parse_container_credentials_body(Body);
+                        false ->
+                            {error, response_body_too_large}
+                    end;
                 {ok, {{_, Status, Reason}, _RespHeaders, _Body}} ->
                     {error, {http_error, Status, Reason}};
                 {error, Reason} ->
@@ -916,6 +926,22 @@ fetch_container_credentials(URL, Token) ->
             end;
         {error, Reason} ->
             {error, {malformed_url, Reason}}
+    end.
+
+-spec content_length_value([{string(), string()}]) -> non_neg_integer() | undefined.
+%% @doc Extract the Content-Length header value, if present and parseable.
+%% @end
+content_length_value([]) ->
+    undefined;
+content_length_value([{Key, Value} | Rest]) ->
+    case string:lowercase(Key) of
+        "content-length" ->
+            case string:to_integer(string:trim(Value)) of
+                {Int, ""} when Int >= 0 -> Int;
+                _ -> undefined
+            end;
+        _ ->
+            content_length_value(Rest)
     end.
 
 -spec container_creds_headers(string() | undefined) -> headers().
@@ -932,19 +958,25 @@ container_creds_headers(Token) ->
 %%      hostname verification. For plaintext, uses plain TCP.
 %% @end
 container_creds_open_opts(tls, Host) ->
+    BaseTlsOpts = [
+        {verify, verify_peer},
+        {cacerts, public_key:cacerts_get()},
+        {customize_hostname_check, [
+            {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+        ]}
+    ],
+    %% SNI must be a DNS hostname per RFC 6066; do not set it for IP literals.
+    TlsOpts =
+        case inet:parse_address(Host) of
+            {ok, _IP} -> BaseTlsOpts;
+            {error, einval} -> [{server_name_indication, Host} | BaseTlsOpts]
+        end,
     #{
         transport => tls,
         protocols => [http],
         connect_timeout => ?CONTAINER_CREDS_CONNECT_TIMEOUT,
         timeout => ?CONTAINER_CREDS_RESPONSE_TIMEOUT,
-        tls_opts => [
-            {verify, verify_peer},
-            {cacerts, public_key:cacerts_get()},
-            {customize_hostname_check, [
-                {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
-            ]},
-            {server_name_indication, Host}
-        ]
+        tls_opts => TlsOpts
     };
 container_creds_open_opts(tcp, _Host) ->
     #{
@@ -980,9 +1012,24 @@ parse_container_credentials_body(Body) ->
                 {ok, Creds}
         end
     catch
-        _:Reason ->
-            {error, {json_decode_failed, Reason}}
+        _:_Reason ->
+            %% Do not include the exception reason in the error tuple -- it may
+            %% contain fragments of the response body (credential material, P0 R6).
+            {error, json_decode_failed}
     end.
+
+%% @doc Sanitize container credential error reasons for safe logging.
+%%      Strips inner terms that could contain response body fragments or
+%%      credential material (P0 R6). Only the error category atom is logged.
+%% @end
+sanitize_container_error({json_decode_failed, _}) -> json_decode_failed;
+sanitize_container_error({http_error, Status, _Phrase}) -> {http_error, Status};
+sanitize_container_error({transport_error, Reason}) -> {transport_error, Reason};
+sanitize_container_error(response_body_too_large) -> response_body_too_large;
+sanitize_container_error(missing_credential_fields) -> missing_credential_fields;
+sanitize_container_error({malformed_url, _}) -> malformed_url;
+sanitize_container_error(Other) when is_atom(Other) -> Other;
+sanitize_container_error(_) -> unknown_error.
 
 -spec parse_expiration(string() | undefined) -> calendar:datetime() | undefined.
 %% @doc Parse the Expiration field if present, returning undefined when absent.
