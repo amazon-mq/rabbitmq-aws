@@ -145,18 +145,19 @@ with_semaphore(T0, SourceIP, User, Method, BodyMap, Req, Context) ->
             reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
         {ok, Ref} ->
             try
-                %% Defense in depth for R6: a backend must always *return* a
-                %% fixed-category result, but if one ever raises, the escaping
-                %% exception would carry BodyMap (and any future secret it
-                %% holds) into a Cowboy crash report. Catch here, discarding the
-                %% class/reason/stacktrace so no request term is logged.
+                %% Defense in depth -- no credential leakage: a backend must
+                %% always *return* a fixed-category result, but if one ever
+                %% raises, the escaping exception would carry BodyMap (and any
+                %% future secret it holds) into a Cowboy crash report. Catch
+                %% here, discarding the class/reason/stacktrace so no request
+                %% term is logged.
                 %%
                 %% A raise here is OUR fault, not the caller's: a real
                 %% unreachable server is *returned* as connection_failed by the
-                %% backend (which has its own R6 try/catch), so reaching this
-                %% clause means an unexpected internal error. Report it as a 500
-                %% rather than a 400 connection_failed, which would wrongly tell
-                %% the caller their LDAP server is unreachable.
+                %% backend (which has its own no-credential-leakage try/catch),
+                %% so reaching this clause means an unexpected internal error.
+                %% Report it as a 500 rather than a 400 connection_failed, which
+                %% would wrongly tell the caller their LDAP server is unreachable.
                 Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
                 audit(Method, SourceIP, User, result_category(Result), T0),
                 respond(Result, Req, Context)
@@ -325,7 +326,8 @@ sanitize_byte(B) ->
 %% an OPTIONS preflight is let through unauthenticated (user=undefined), but the
 %% feature toggle short-circuits OPTIONS before any audit, so a `<<"unknown">>'
 %% here only ever reflects an unexpected shape, never a real unaudited PUT. Only
-%% the username is logged -- never tags, target host, URL, or DN (R4/R6).
+%% the username is logged -- never tags, target host, URL, or DN (to prevent
+%% information disclosure and ensure resolved secrets never reach logs).
 username(#context{user = #user{username = Name}}) when is_binary(Name) ->
     Name;
 username(_) ->

@@ -76,7 +76,8 @@
 %%                               re-mint the token and retry.
 %%   token_invalid / token_expired are safe to distinguish (unlike the coarse
 %%   reachability categories) because they describe the caller's own token, not
-%%   the broker's infra or an SSRF target, so they leak nothing R4 guards.
+%%   the broker's infra or an SSRF target, so they disclose nothing the
+%%   fixed-category rule guards against (SSRF reconnaissance / info disclosure).
 -module(aws_auth_validate_oauth).
 
 -behaviour(aws_auth_validate_backend).
@@ -142,7 +143,8 @@
     <<"hostname_verification">>
 ]).
 
-%% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
+%% Fixed, hardcoded reason strings -- never echo a URL, host, or raw error,
+%% so the endpoint cannot be used for SSRF reconnaissance.
 -define(REASON_MISSING_URL, <<"at least one of jwks_uri or issuer must be present">>).
 -define(REASON_BAD_URL, <<"a configured URL is not a valid https URL">>).
 -define(REASON_URL_NOT_ALLOWED, <<"a configured URL targets a disallowed address">>).
@@ -170,8 +172,8 @@
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
 %% Customer-supplied access-token verification (optional, activates when
-%% access_token is present). Fixed R4 reasons: no token content, claim value,
-%% or key material echoed. Pure-phase shape problems are input_invalid (400);
+%% access_token is present). Fixed reason strings: no token content, claim value,
+%% or key material is ever echoed. Pure-phase shape problems are input_invalid (400);
 %% verification outcomes use the token_invalid / token_expired categories (422)
 %% so an operator can tell a real config mismatch (token_invalid: bad signature
 %% or no matching JWKS key -- the broker will reject live tokens) from a
@@ -256,7 +258,7 @@
 
 %% Per-backend surface passed to the shared aws_auth_validate_ssl helpers.
 %% Identical shape to the HTTP backend's (both accept the mTLS pair and use the
-%% <<"sni">> key); only this backend's fixed R4 reason strings differ, kept here.
+%% <<"sni">> key); only this backend's fixed reason strings differ, kept here.
 ssl_opts() ->
     #{
         arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
@@ -739,8 +741,9 @@ in_cidr(IP, Cidr) -> aws_auth_validate_net:in_cidr(IP, Cidr).
 %%--------------------------------------------------------------------
 %%
 %% The whole network section runs inside a try/catch collapsing any raise to
-%% connection_failed, so a resolved secret can never reach a crash report (R6).
-%% All probe requests run on a dedicated ephemeral httpc profile (R3).
+%% connection_failed, so a resolved secret can never reach a crash report.
+%% All probe requests run on a dedicated ephemeral httpc profile (zero side
+%% effects -- each validation uses only ephemeral connections).
 
 do_oauth_validate(Params) ->
     case aws_auth_validate_httpc:claim_probe_profile(?PROFILE_PREFIX) of
@@ -818,11 +821,12 @@ maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) -
 %%   4. if a resource_server_id was supplied, require it in the token `aud'
 %%      (unless the broker's verify_aud is disabled).
 %% Failures map to fixed categories (no claim value, key material, or token
-%% content echoed -- R6): a bad signature or no matching JWKS key -> token_invalid
-%% (a real config mismatch the broker would also reject); an expired token ->
-%% token_expired (transient, just re-mint); an audience mismatch stays
-%% auth_failed. verify_token/3 takes the pre-decoded header so the -ifdef(TEST)
-%% export can exercise it directly.
+%% content is ever echoed -- a resolved secret must never reach a response or
+%% log): a bad signature or no matching JWKS key -> token_invalid (a real config
+%% mismatch the broker would also reject); an expired token -> token_expired
+%% (transient, just re-mint); an audience mismatch stays auth_failed.
+%% verify_token/3 takes the pre-decoded header so the -ifdef(TEST) export can
+%% exercise it directly.
 -ifdef(TEST).
 %% Test-only wrapper preserving the historical verify_token/3 contract (returns
 %% `ok' on success). Production code calls verify_token_claims/3 directly (it
@@ -883,7 +887,8 @@ select_jwk(Kid, Keys) when is_binary(Kid) ->
 %% jose_jwt:verify_strict/3 refuses any token whose alg is not the allowed one,
 %% and jose_jwk:from_map/1 builds the public key from the JWKS entry. Any raise
 %% (malformed key material, unsupported curve) is caught and treated as a
-%% signature failure -- never a crash report (R6). Returns the decoded claims.
+%% signature failure -- never a crash report, so key material cannot leak.
+%% Returns the decoded claims.
 verify_signature(Alg, JwkMap, Raw) ->
     try
         JWK = jose_jwk:from_map(JwkMap),
@@ -1134,7 +1139,8 @@ strip_trailing_slash(S) ->
 %%--------------------------------------------------------------------
 
 %% Shared classifier: TLS/cert failure -> tls_failed, else connection_failed.
-%% The raw reason is never echoed (R4).
+%% The raw reason is never echoed -- responses carry only fixed categories to
+%% prevent SSRF reconnaissance.
 classify_http_error(Reason) ->
     aws_auth_validate_ssl:classify_http_error(
         Reason, ?REASON_TLS_HANDSHAKE, ?REASON_CONNECTION

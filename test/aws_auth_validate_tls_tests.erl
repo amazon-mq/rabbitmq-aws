@@ -260,7 +260,7 @@ tls_arn_resolve_failure_test_() ->
                 R
             ),
             %% The resolved content and the underlying AWS error must never be
-            %% echoed, however specific the field attribution gets (R6/R4).
+            %% echoed, however specific the field attribution gets.
             ?_assertNot(reason_contains(R, ?SECRET)),
             ?_assertNot(reason_contains(R, <<"not_found">>))
         ]
@@ -461,7 +461,8 @@ tls_client_cert_not_binary_rejected_test_() ->
     ].
 
 tls_client_cert_private_key_rejected_test() ->
-    %% A PEM containing a private key must be rejected (R6).
+    %% A PEM containing a private key must be rejected: no credential material
+    %% may be accepted through this field.
     KeyPem = gen_private_key_pem(),
     Body = #{
         <<"target">> => <<"listener">>,
@@ -513,7 +514,7 @@ tls_client_cert_garbage_pem_rejected_test() ->
 tls_client_cert_openssh_key_rejected_test() ->
     %% An OpenSSH-format private key decodes as {{no_asn1, new_openssh}, _, _}
     %% -- a tuple type tag. The allowlist must reject it with the private-key
-    %% reason (R6 security invariant).
+    %% reason (the no-credential-leakage invariant).
     OpensshPem = openssh_key_pem(),
     {_CaKey, _CaDer, CaPem} = gen_ca(),
     Mixed = <<CaPem/binary, OpensshPem/binary>>,

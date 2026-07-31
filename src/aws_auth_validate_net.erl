@@ -13,7 +13,7 @@
 %% The validator issues outbound requests to customer-supplied URLs from the
 %% broker's network position -- a textbook SSRF / confused-deputy surface.
 %% Defense is two-phase and IDENTICAL for http and oauth; only the scheme
-%% allowlist (oauth is https-only; http allows http+https) and the fixed R4
+%% allowlist (oauth is https-only; http allows http+https) and the fixed
 %% reason strings differ, so those are parameters (a policy() map):
 %%
 %%   * PURE phase (url_allowed/2): scheme allowlist + literal-IP classification

@@ -40,11 +40,12 @@
 %% well-formed deny still proves the endpoint speaks the auth protocol.
 %%
 %% A future credentialed-probe mode (assert user_path returns `allow' for a
-%% supplied username + password_arn) is intentionally out of scope here; see
-%% http-validation-analysis.md, open question 1.
+%% supplied username + password_arn) is intentionally out of scope for this
+%% initial reachability-only implementation.
 %%
 %% Category mapping (reuses the existing aws_auth_validate_backend categories;
-%% no new category is introduced, per R4 "keep the set small"):
+%% no new category is introduced -- the fixed set is kept small so responses
+%% cannot be used for SSRF reconnaissance or information disclosure):
 %%   * connection_failed (400) -- host unreachable / DNS / connection refused.
 %%   * tls_failed        (400) -- TLS handshake / cert verification failure.
 %%   * auth_failed       (422) -- reached the server but its response is not
@@ -120,8 +121,7 @@
 %% mutual TLS (the broker's auth_http.ssl_options.certfile / .keyfile). The
 %% cert is typically an S3-hosted PEM; the key a Secrets Manager PEM. Both are
 %% resolved like cacertfile_arn and decoded into in-memory ssl {cert,_}/{key,_}
-%% options so an mTLS auth server (which the RabbitMqHttpSampleStack requires)
-%% can be validated.
+%% options so an mTLS auth server can be validated.
 -define(SSL_OPTION_KEYS, [
     <<"cacertfile_arn">>,
     <<"certfile_arn">>,
@@ -132,7 +132,8 @@
     <<"sni">>,
     <<"hostname_verification">>
 ]).
-%% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
+%% Fixed, hardcoded reason strings -- never echo a URL, host, or raw error,
+%% so the endpoint cannot be used for SSRF reconnaissance.
 -define(REASON_BAD_PATHS, <<"at least user_path must be a non-empty URL string">>).
 -define(REASON_BAD_PATH_VALUE, <<"each path must be a non-empty URL string">>).
 -define(REASON_BAD_URL, <<"a configured path is not a valid http(s) URL">>).
@@ -210,7 +211,7 @@
 %% Per-backend surface passed to the shared aws_auth_validate_ssl helpers: which
 %% ssl_options keys reference an ARN, the full allowed-key set, the customer SNI
 %% key spelling, whether the mTLS client-cert pair is accepted, and this
-%% backend's fixed R4 reason strings (kept here so wording/tests are unchanged).
+%% backend's fixed reason strings (kept here so wording/tests are unchanged).
 ssl_opts() ->
     #{
         arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
@@ -475,16 +476,18 @@ pin_url(Url, Host) -> aws_auth_validate_net:pin_url(Url, Host).
 %% auth protocol). Only a body matching NEITHER is a failure.
 %%
 %% The whole probe runs inside a try/catch that collapses any raise to
-%% connection_failed, so a resolved secret can never reach a crash report (R6).
+%% connection_failed, so a resolved secret can never reach a crash report.
 %%
 %% All probe requests for THIS validation run on a dedicated, ephemeral httpc
 %% profile that is started here and stopped in the `after' clause. This isolates
 %% each validation's TLS sessions/connections: the shared default profile pools
 %% TLS sessions, so a prior request's authenticated (e.g. mTLS) session could be
 %% reused by a later request -- producing a false success for a config that
-%% would not connect on its own (and a leaked connection across requests, an R3
-%% violation). A fresh profile has no sessions to reuse, and stopping it tears
-%% down anything opened, so each validation is hermetic.
+%% would not connect on its own (and a leaked connection across requests, which
+%% violates the zero-side-effects invariant: each validation must use only
+%% ephemeral connections and never mutate shared state). A fresh profile has no
+%% sessions to reuse, and stopping it tears down anything opened, so each
+%% validation is hermetic.
 do_http_validate(Params) ->
     case aws_auth_validate_httpc:claim_probe_profile(?PROFILE_PREFIX) of
         none ->
@@ -559,7 +562,8 @@ probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts, Profi
 
 %% Map an httpc transport error to a fixed category (shared classifier). A
 %% TLS/cert failure -> tls_failed; everything else -> connection_failed. The raw
-%% reason is never echoed (R4).
+%% reason is never echoed -- responses carry only fixed categories and hardcoded
+%% strings to prevent information disclosure.
 classify_http_error(Reason) ->
     aws_auth_validate_ssl:classify_http_error(
         Reason, ?REASON_TLS_HANDSHAKE, ?REASON_CONNECTION
@@ -631,9 +635,10 @@ is_keyword_prefix(Keyword, Resp) ->
 
 %% Build the httpc Request tuple for the configured method. For GET the query
 %% goes in the URL; for POST it is a form-encoded body, matching
-%% rabbit_auth_backend_http's request shape (R12 request-shape parity). The
-%% Host header carries the ORIGINAL hostname (the URL host is the pinned IP), so
-%% the auth server sees the name it expects -- needed for name-based vhosts.
+%% rabbit_auth_backend_http's request shape so the endpoint's decision matches
+%% the live broker's for the same inputs. The Host header carries the ORIGINAL
+%% hostname (the URL host is the pinned IP), so the auth server sees the name it
+%% expects -- needed for name-based vhosts.
 build_request(get, UrlStr, Query, Host) ->
     Sep =
         case Query of

@@ -49,7 +49,7 @@
 %%       expansion
 %%   * rabbit_oauth2_scope:{vhost,resource,topic}_access/*  -- the final match
 %%
-%% R3 (zero side effects): every function above is side-effect-free; the config
+%% Zero side effects: every function above is side-effect-free; the config
 %% comes from the record argument, so this reads nothing from broker state and
 %% mutates nothing. We construct the #resource_server{} from CUSTOMER-SUPPLIED
 %% fields, so we are validating the customer's config, not the broker's live one.
@@ -100,8 +100,8 @@
 -define(SCOPE_MOD, rabbit_oauth2_scope).
 -define(RS_MOD, rabbit_oauth2_resource_server).
 
-%% Fixed reasons. NOTE on granularity vs R4: R4's fixed-category rule guards
-%% against leaking BROKER INFRASTRUCTURE or an SSRF target (hostnames, IPs, raw
+%% Fixed reasons. NOTE on granularity: the fixed-category rule guards against
+%% leaking BROKER INFRASTRUCTURE or an SSRF target (hostnames, IPs, raw
 %% network/LDAP errors) that an attacker does not already know. The authz
 %% failure reasons below are categorically different: they describe only the
 %% CALLER'S OWN token and the CALLER'S OWN supplied authorization config (both
@@ -111,8 +111,8 @@
 %% contract but differentiate the human-readable message, which is what actually
 %% lets a customer self-diagnose the "my token is broken (it isn't)" case. The
 %% messages carry NO scope values or claim content -- they name the failing
-%% STAGE, not the data -- so no token material is echoed, and (per the design
-%% decision) the message is not audit-logged regardless.
+%% STAGE, not the data -- so no token material is echoed, and the message is not
+%% audit-logged regardless.
 -define(REASON_AUTHZ_UNAVAILABLE, <<
     "authorization evaluation requires the rabbitmq_auth_backend_oauth2 plugin "
     "to be loaded on this broker; it is not"
@@ -249,7 +249,7 @@ evaluator_compiled_in() ->
 %%       where Msg distinguishes: no effective scopes after prefix/alias
 %%       filtering, scopes present but none match, or too-many-scopes. The
 %%       CATEGORY stays authz_unverified in every failing case; only the message
-%%       differs (see the reason macros above for the R4 rationale).
+%%       differs (see the reason macros above for the granularity rationale).
 -spec maybe_check(map(), map()) -> aws_auth_validate_backend:result().
 maybe_check(#{authz_check := none}, _Claims) ->
     ok;

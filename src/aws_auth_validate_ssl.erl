@@ -667,10 +667,10 @@ generic_arn_resolve() ->
 %% Naming the FIELD is safe and is the point of the endpoint: a field name is
 %% part of the request the caller just sent us, so it discloses nothing they do
 %% not already know, and it saves them guessing which of several ARNs is broken.
-%% What must never appear is the resolved CONTENT (R6) -- and it cannot, because
+%% What must never appear is the resolved CONTENT -- and it cannot, because
 %% only these caller-supplied key paths are interpolated. The underlying AWS
 %% error is also deliberately dropped: it can carry account ids, bucket names,
-%% and IAM role details, so the categories stay fixed (R4) and the distinction
+%% and IAM role details, so the categories stay fixed and the distinction
 %% between "does not exist" and "access denied" stays hidden.
 %%
 %% Fields are emitted in the caller-supplied order (each backend passes them in

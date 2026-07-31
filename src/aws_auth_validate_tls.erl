@@ -450,7 +450,8 @@ to_str(T) when is_list(T) -> T.
 %%--------------------------------------------------------------------
 
 %% client_cert is optional; when present it must be a non-empty binary holding
-%% only certificate PEM entries (no private key material -- R6).
+%% only certificate PEM entries (no private key material, so no credential can
+%% leak through this field).
 parse_client_cert(Body, Acc) ->
     case maps:get(<<"client_cert">>, Body, undefined) of
         undefined ->
@@ -966,9 +967,10 @@ maybe_sanitize_other_name(_Type, Value) ->
 %% The broker's live EXTERNAL login calls rabbit_access_control:check_user_login/2,
 %% which walks ALL configured auth_backends (each entry may be a bare module or a
 %% {AuthN, AuthZ} tuple). We can only query rabbit_auth_backend_internal (a local
-%% mnesia/khepri read -- no I/O, no state mutation, R3-safe). If other backends
-%% are also configured, a not-found in the internal backend does NOT mean the user
-%% does not exist -- the broker may authenticate it via LDAP, HTTP, or OAuth.
+%% mnesia/khepri read -- no I/O, no state mutation, so it preserves the
+%% zero-side-effects invariant). If other backends are also configured, a
+%% not-found in the internal backend does NOT mean the user does not exist --
+%% the broker may authenticate it via LDAP, HTTP, or OAuth.
 %%
 %% Strategy:
 %%   - internal backend unavailable -> config_conflict (cannot check at all).
@@ -1023,9 +1025,10 @@ module_ready(Mod) ->
 
 %% Cap username length and strip control characters, ensuring the result is
 %% valid UTF-8 (required for JSON-safe reason binaries in the response). The
-%% username derives from the caller's own supplied certificate (R4 basis for
-%% echoing it), but we bound it against degenerate inputs. Non-UTF-8 bytes
-%% (e.g. raw iPAddress SANs) are hex-escaped so the reason is always encodable.
+%% username derives from the caller's own supplied certificate, not from broker
+%% infrastructure, which is why echoing it does not breach the fixed-category
+%% rule, but we bound it against degenerate inputs. Non-UTF-8 bytes (e.g. raw
+%% iPAddress SANs) are hex-escaped so the reason is always encodable.
 %%
 %% NOTE: iPAddress SANs are kept as raw bytes for the user LOOKUP (matching
 %% upstream rabbit_ssl/rabbit_cert_info behavior, which passes the raw value
