@@ -634,7 +634,7 @@ is_denied_ip(IP) ->
 %% BROADER than the http/oauth infra-only denylist in aws_auth_validate_net: LDAP
 %% denies ALL RFC1918/CGNAT/reserved space, not just broker infra. Sharing the
 %% classifier while keeping a distinct list means a future range or segment-math
-%% fix cannot silently apply to only one backend.
+%% fix cannot silently apply to only one backend. Mirrors #153, one layer up.
 %%   100.64.0.0/10 (RFC 6598) is carrier-grade NAT shared address space; it can
 %%     route to provider/internal infrastructure, so it is denied too.
 %%   240.0.0.0/4 is reserved/Class E, including 255.255.255.255 limited broadcast.

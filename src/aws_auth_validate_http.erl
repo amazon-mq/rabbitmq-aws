@@ -309,9 +309,9 @@ validate(Body) when is_map(Body) ->
 %% no AWS call, so it needs no role and gets a default state that is never used
 %% to resolve an ARN -- preserving the credential-free reachability check.
 %% Delegates to the shared aws_auth_validate_ssl helper. The no-ARN branch there
-%% stores the `none' credential sentinel (which resolve_arn/2 refuses), so a
-%% customer request can never resolve an ARN under the broker's ambient EC2
-%% instance role.
+%% stores the `none' credential sentinel (which resolve_arn/2 refuses), matching
+%% the fail-closed contract PR #116 introduced -- a customer request can never
+%% resolve an ARN under the broker's ambient EC2 instance role.
 resolve_request_state(Params) ->
     aws_auth_validate_ssl:resolve_request_state(Params, ssl_opts()).
 
