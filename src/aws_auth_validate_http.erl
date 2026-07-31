@@ -728,29 +728,22 @@ build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% instance role. Default to `none' (never a usable state) if the key is
     %% somehow absent, preserving the fail-closed contract.
     State = maps:get(aws_state, Params, none),
-    case
-        aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)
-    of
+    %% Resolves the CA bundle and the mTLS pair together so a response can name
+    %% every ARN field that failed, not just the first.
+    case aws_auth_validate_ssl:resolve_ssl_material(Map, State) of
         {error, _, _} = Err ->
             Err;
-        {ok, CacertOpts} ->
-            case aws_auth_validate_ssl:resolve_client_cert(Map, State) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, ClientOpts} ->
-                    Opts =
-                        CacertOpts ++ ClientOpts ++
-                            aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
-                    %% Whether the caller set verify explicitly governs the
-                    %% no-trust-anchor policy (fail vs silent default).
-                    VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    %% Mirror rabbit_auth_backend_http: the RFC 6125 https match
-                    %% fun is applied ONLY when ssl_hostname_verification =
-                    %% wildcard; unset is strict OTP matching. Defaulting to
-                    %% wildcard here would pass a cert the live broker rejects.
-                    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
-                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
-            end
+        {ok, MaterialOpts} ->
+            Opts = MaterialOpts ++ aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
+            %% Whether the caller set verify explicitly governs the
+            %% no-trust-anchor policy (fail vs silent default).
+            VerifyExplicit = maps:is_key(<<"verify">>, Map),
+            %% Mirror rabbit_auth_backend_http: the RFC 6125 https match
+            %% fun is applied ONLY when ssl_hostname_verification =
+            %% wildcard; unset is strict OTP matching. Defaulting to
+            %% wildcard here would pass a cert the live broker rejects.
+            HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
+            aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
     end.
 
 connection_timeout_ms() ->

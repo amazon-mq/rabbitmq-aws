@@ -41,6 +41,8 @@
     %% TLS-material resolution + translation (network phase)
     resolve_cacerts/2,
     resolve_client_cert/2,
+    resolve_ssl_material/2,
+    arn_resolve_reason/1,
     decode_pem_cacerts/1,
     decode_client_cert/1,
     decode_client_key/1,
@@ -64,6 +66,19 @@
     connection_timeout_ms/1,
     is_nonempty_binary/1
 ]).
+
+%% CONTENT-failure reasons for the mTLS pair: the ARN resolved but the payload
+%% holds no usable material. Distinct from an ARN-RESOLUTION failure (see
+%% arn_resolve_reason/1) so the operator is not sent looking at IAM or the ARN
+%% string when the object exists and is simply the wrong thing. Naming the field
+%% is safe for the same reason it is in arn_resolve_reason/1 -- it echoes a key
+%% the caller sent, never the resolved bytes.
+-define(REASON_CERTFILE_NO_CERT,
+    <<"ssl_options.certfile_arn resolved but contains no certificate">>
+).
+-define(REASON_KEYFILE_NO_KEY,
+    <<"ssl_options.keyfile_arn resolved but contains no usable private key">>
+).
 
 %% Accepted values for `verify' and `versions', shared by all backends.
 -define(SSL_VERIFY_VALUES, [<<"verify_peer">>, <<"verify_none">>]).
@@ -275,9 +290,15 @@ nonempty_or(V, ReasonKey, Opts) ->
 %%--------------------------------------------------------------------
 
 %% Resolve ssl_options.cacertfile_arn to the raw-DER cacerts ssl option (or [] if
-%% absent / no cert entries). Any resolve failure -> input_invalid (fixed reason).
+%% absent / no cert entries).
+%%
+%% A resolve failure returns the field-tagged {arn_failed, Fields} form rather
+%% than a finished reason string, so resolve_ssl_material/2 can aggregate the
+%% attribution across every ARN in the request and name them all in one
+%% response. This mirrors resolve_client_cert/2, which reports its own two
+%% fields the same way.
 -spec resolve_cacerts(term(), aws_lib:aws_state()) ->
-    {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+    {ok, list()} | {arn_failed, [binary()]}.
 resolve_cacerts(undefined, _State) ->
     {ok, []};
 resolve_cacerts(Arn, State) when is_binary(Arn) ->
@@ -288,35 +309,74 @@ resolve_cacerts(Arn, State) when is_binary(Arn) ->
                 Certs -> {ok, [{cacerts, Certs}]}
             end;
         {error, _} ->
-            {error, input_invalid, generic_arn_resolve()}
+            {arn_failed, [<<"ssl_options.cacertfile_arn">>]}
+    end.
+
+%% Resolve every ARN the request references under ssl_options, attempting ALL of
+%% them so a single response can name every field that failed.
+%%
+%% Short-circuiting on the first failure would force the operator into one round
+%% trip per broken ARN, which is exactly the guess-and-retry loop this endpoint
+%% exists to remove. The cost is bounded: at most three ARNs per request
+%% (cacertfile/certfile/keyfile), already gated by the assume_role guardrail and
+%% the concurrency semaphore.
+%%
+%% Resolution failures are aggregated and attributed to their fields. A CONTENT
+%% failure (the ARN resolved but the payload holds no usable material) is
+%% reported unchanged and takes precedence only when nothing failed to resolve,
+%% since at that point naming the ARN would misdescribe the problem.
+-spec resolve_ssl_material(map(), aws_lib:aws_state() | none) ->
+    {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+resolve_ssl_material(Map, State) ->
+    Results = [
+        resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State),
+        resolve_client_cert(Map, State)
+    ],
+    case [Fields || {arn_failed, Fields} <- Results] of
+        [_ | _] = Failed ->
+            {error, input_invalid, arn_resolve_reason(lists:append(Failed))};
+        [] ->
+            case [Err || {error, _, _} = Err <- Results] of
+                [Err | _] -> Err;
+                [] -> {ok, lists:append([Opts || {ok, Opts} <- Results])}
+            end
     end.
 
 %% Resolve the client certificate + private key for mutual TLS. parse_ssl_options
 %% already guaranteed both are present or both absent, so here we either resolve
 %% the pair or return no client-auth options.
+%%
+%% Both ARNs are fetched before either is decoded, so a request whose cert AND
+%% key ARNs are both broken names both fields instead of only the cert. Decoding
+%% still happens cert-then-key, since a content error is reported unchanged and
+%% needs no aggregation.
 -spec resolve_client_cert(map(), aws_lib:aws_state()) ->
-    {ok, list()} | {error, aws_auth_validate_backend:error_category(), binary()}.
+    {ok, list()}
+    | {error, aws_auth_validate_backend:error_category(), binary()}
+    | {arn_failed, [binary()]}.
 resolve_client_cert(#{<<"certfile_arn">> := CertArn, <<"keyfile_arn">> := KeyArn}, State) when
     is_binary(CertArn), is_binary(KeyArn)
 ->
-    case resolve_arn(CertArn, State) of
-        {ok, CertPem} ->
+    CertRes = resolve_arn(CertArn, State),
+    KeyRes = resolve_arn(KeyArn, State),
+    Failed =
+        [<<"ssl_options.certfile_arn">> || element(1, CertRes) =:= error] ++
+            [<<"ssl_options.keyfile_arn">> || element(1, KeyRes) =:= error],
+    case Failed of
+        [_ | _] ->
+            {arn_failed, Failed};
+        [] ->
+            {ok, CertPem} = CertRes,
+            {ok, KeyPem} = KeyRes,
             case decode_client_cert(CertPem) of
                 {error, _, _} = Err ->
                     Err;
                 {ok, CertOpt} ->
-                    case resolve_arn(KeyArn, State) of
-                        {ok, KeyPem} ->
-                            case decode_client_key(KeyPem) of
-                                {error, _, _} = Err -> Err;
-                                {ok, KeyOpt} -> {ok, [CertOpt, KeyOpt]}
-                            end;
-                        {error, _} ->
-                            {error, input_invalid, generic_arn_resolve()}
+                    case decode_client_key(KeyPem) of
+                        {error, _, _} = Err -> Err;
+                        {ok, KeyOpt} -> {ok, [CertOpt, KeyOpt]}
                     end
-            end;
-        {error, _} ->
-            {error, input_invalid, generic_arn_resolve()}
+            end
     end;
 resolve_client_cert(_Map, _State) ->
     {ok, []}.
@@ -333,17 +393,19 @@ decode_pem_cacerts(B) when is_binary(B) ->
     end.
 
 %% Decode a client-certificate PEM into an ssl {cert, [DER]} option. A PEM with
-%% no certificate entry is a resolution-shaped failure (fixed ARN category).
+%% no certificate entry is a CONTENT failure: the ARN resolved, the payload is
+%% just unusable, so the reason says so rather than blaming resolution.
 -spec decode_client_cert(binary()) ->
     {ok, {cert, [binary()]}} | {error, aws_auth_validate_backend:error_category(), binary()}.
 decode_client_cert(Pem) when is_binary(Pem) ->
     case [Der || {'Certificate', Der, not_encrypted} <- public_key:pem_decode(Pem)] of
-        [] -> {error, input_invalid, generic_arn_resolve()};
+        [] -> {error, input_invalid, ?REASON_CERTFILE_NO_CERT};
         Ders -> {ok, {cert, Ders}}
     end.
 
 %% Decode a private-key PEM into an ssl {key, {Asn1Type, DER}} option. An
-%% encrypted or absent key is a fixed ARN-category failure.
+%% encrypted or absent key is a CONTENT failure (the ARN resolved), so the reason
+%% names the field and the payload problem rather than blaming resolution.
 -spec decode_client_key(binary()) ->
     {ok, {key, {atom(), binary()}}}
     | {error, aws_auth_validate_backend:error_category(), binary()}.
@@ -357,7 +419,7 @@ decode_client_key(Pem) when is_binary(Pem) ->
     ],
     case KeyEntries of
         [{Type, Der} | _] -> {ok, {key, {Type, Der}}};
-        [] -> {error, input_invalid, generic_arn_resolve()}
+        [] -> {error, input_invalid, ?REASON_KEYFILE_NO_KEY}
     end.
 
 %% Translate the non-cacert ssl_options keys into an ssl proplist. SniKey is the
@@ -593,11 +655,35 @@ connection_timeout_ms(#{default := Default, max := Max}) ->
 reason(Key, #{reasons := Reasons}) ->
     maps:get(Key, Reasons).
 
-%% The generic ARN-resolve reason. resolve_cacerts/2, resolve_client_cert/2, and
-%% the PEM decoders all report the same fixed string across backends (all three
-%% originals used <<"failed to resolve ARN">> in these paths).
+%% The generic ARN-resolve reason, used when no field attribution is available.
+%% Every current caller supplies at least one field, so this is reached only via
+%% arn_resolve_reason([]) -- kept so an empty list cannot render as a reason with
+%% a dangling "for: " and no fields.
 generic_arn_resolve() ->
     <<"failed to resolve ARN">>.
+
+%% Build the ARN-resolution failure reason, naming which request fields failed.
+%%
+%% Naming the FIELD is safe and is the point of the endpoint: a field name is
+%% part of the request the caller just sent us, so it discloses nothing they do
+%% not already know, and it saves them guessing which of several ARNs is broken.
+%% What must never appear is the resolved CONTENT (R6) -- and it cannot, because
+%% only these caller-supplied key paths are interpolated. The underlying AWS
+%% error is also deliberately dropped: it can carry account ids, bucket names,
+%% and IAM role details, so the categories stay fixed (R4) and the distinction
+%% between "does not exist" and "access denied" stays hidden.
+%%
+%% Fields are emitted in the caller-supplied order (each backend passes them in
+%% a fixed order) so the message is deterministic and testable.
+-spec arn_resolve_reason([binary()]) -> binary().
+arn_resolve_reason([]) ->
+    %% No field attribution available -- fall back to the generic wording rather
+    %% than emitting an empty list.
+    generic_arn_resolve();
+arn_resolve_reason(Fields) ->
+    iolist_to_binary([
+        <<"ARN resolution failed for: ">>, lists:join(<<", ">>, Fields)
+    ]).
 
 no_trust_anchor() ->
     <<"verify_peer requested but no CA trust anchor is available; supply cacertfile_arn">>.
