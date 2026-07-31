@@ -92,14 +92,15 @@ collect_output(Port, Acc, Deadline) ->
     Remaining = max(0, Deadline - erlang:monotonic_time(millisecond)),
     receive
         {Port, {data, Data}} ->
-            NewAcc = <<Acc/binary, Data/binary>>,
-            case byte_size(NewAcc) > ?MAX_OUTPUT_BYTES of
+            %% Check size BEFORE allocating the combined binary to avoid
+            %% transiently exceeding the cap by one pipe-buffer chunk.
+            case byte_size(Acc) + byte_size(Data) > ?MAX_OUTPUT_BYTES of
                 true ->
                     kill_port(Port),
                     ?LOG_ERROR("credential_process: output exceeded size limit"),
                     {error, {credential_process, output_too_large}};
                 false ->
-                    collect_output(Port, NewAcc, Deadline)
+                    collect_output(Port, <<Acc/binary, Data/binary>>, Deadline)
             end;
         {Port, {exit_status, 0}} ->
             parse_output(Acc);
@@ -113,8 +114,8 @@ collect_output(Port, Acc, Deadline) ->
     end.
 
 -spec kill_port(Port :: port()) -> ok.
-%% @doc Close the port, which sends SIGKILL to the OS process on most
-%%      platforms. Ignores errors if the port is already closed.
+%% @doc Close the port, which sends SIGTERM to the OS process on Unix.
+%%      Ignores errors if the port is already closed.
 %% @end
 kill_port(Port) ->
     try
@@ -216,8 +217,15 @@ parse_expiration(Timestamp) ->
         aws_lib_config:parse_iso8601_timestamp(Timestamp)
     catch
         _:_ ->
-            ?LOG_WARNING("credential_process: could not parse Expiration timestamp"),
-            undefined
+            %% Fail-closed: unparseable expiration is treated as already expired,
+            %% forcing re-invocation of the helper on next credential use. Returning
+            %% undefined here would be fail-open (never expires), which silently
+            %% breaks when the real credentials expire at the provider.
+            ?LOG_WARNING(
+                "credential_process: could not parse Expiration timestamp, "
+                "treating credentials as already expired"
+            ),
+            {{1970, 1, 1}, {0, 0, 0}}
     end.
 
 %%====================================================================

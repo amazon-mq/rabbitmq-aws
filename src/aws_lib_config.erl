@@ -63,9 +63,15 @@
 %%      indicating the credentials are locally configured, and are not
 %%      temporary.
 %%
-%%      If no credentials could be resolved up until this point, there will be
-%%      an attempt to contact a local EC2 instance metadata service for
-%%      credentials.
+%%      If no credentials are found in the configuration or shared credentials
+%%      files, and the profile's config file section specifies a
+%%      ``credential_process`` key, the external helper command will be invoked.
+%%      If it succeeds, those credentials are returned. If it is configured but
+%%      fails, an error is returned without consulting the instance metadata
+%%      service.
+%%
+%%      If ``credential_process`` is not configured, there will be an attempt
+%%      to contact a local EC2 instance metadata service for credentials.
 %%
 %%      When the EC2 instance metadata server is checked for but does not exist,
 %%      the operation will timeout in ``?DEFAULT_IMDS_TIMEOUT``ms.
