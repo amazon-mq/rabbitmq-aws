@@ -372,9 +372,11 @@ aggregate_arn_results(PasswordRes, CacertRes) ->
         [_ | _] = Failed ->
             {error, input_invalid, aws_auth_validate_ssl:arn_resolve_reason(Failed)};
         [] ->
+            %% PasswordRes cannot be an error here: resolve_arn_material/2
+            %% short-circuits the only shape error before this point, leaving
+            %% {ok,_} once its ARN did not fail to resolve. Only the cacert
+            %% branch can still carry a CONTENT error (an invalid PEM).
             case {PasswordRes, CacertRes} of
-                {{error, _, _} = Err, _} ->
-                    Err;
                 {_, {error, _, _} = Err} ->
                     Err;
                 {{ok, WithPassword}, {ok, WithCacert}} ->

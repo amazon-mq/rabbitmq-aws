@@ -334,6 +334,9 @@ do_tls_validate(#{ssl_options := Map} = Params) ->
             end
     end.
 
+%% This backend takes exactly one ARN, so there is never more than one field to
+%% attribute; the shared aggregating resolver is unnecessary here.
+
 %% Decode the CA PEM and check each certificate. Returns {ok, CaDers} on
 %% success so the caller can thread the already-decoded DER list into chain
 %% validation without a redundant second decode. The decode is wrapped because
