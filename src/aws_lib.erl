@@ -28,9 +28,6 @@
     local_time/0,
     api_get_request/3,
     api_post_request/5,
-    open_connection/2, open_connection/3,
-    close_connection/1,
-    direct_request/7,
     endpoint/4,
     sign_headers/10,
     instance_volumes/1,
@@ -49,7 +46,6 @@
 -include_lib("kernel/include/logger.hrl").
 
 -opaque aws_state() :: #aws_state{}.
--type connection_handle() :: {aws_lib_httpc:conn(), string()}.
 
 %%====================================================================
 %% State construction and accessors
@@ -190,125 +186,6 @@ put(Service, Path, Body, Headers, Options, State) ->
 %% @end
 refresh_credentials(State) ->
     do_refresh_credentials(State).
-
-%%====================================================================
-%% New Concurrent API Functions
-%%====================================================================
-
-%% Open a connection and return handle for direct use
--spec open_connection(
-    Service :: string(),
-    State :: aws_state()
-) -> {ok, connection_handle(), aws_state()} | {error, term()}.
-open_connection(Service, State) ->
-    open_connection(Service, [], State).
-
--spec open_connection(
-    Service :: string(),
-    Options :: list(),
-    State :: aws_state()
-) -> {ok, connection_handle(), aws_state()} | {error, term()}.
-open_connection(Service, Options, State0) ->
-    % Get region from state or use default
-    Region =
-        case State0#aws_state.config of
-            #aws_config{region = R} when R =/= undefined -> R;
-            _ -> ?DEFAULT_REGION
-        end,
-
-    % Update state with region if it was default
-    State1 =
-        case State0#aws_state.config of
-            undefined ->
-                State0#aws_state{config = #aws_config{region = Region}};
-            #aws_config{region = undefined} = C ->
-                State0#aws_state{config = C#aws_config{region = Region}};
-            _ ->
-                State0
-        end,
-
-    Host = endpoint_host(Region, Service),
-    Port = 443,
-    %% The legacy two-step API always targets the real AWS endpoint over TLS; it
-    %% does not honour the endpoint-url override (see endpoint/4).
-    case aws_lib_httpc:open(Host, Port, gun_open_opts(tls, Options)) of
-        {ok, Conn} ->
-            {ok, {Conn, Service}, State1};
-        {error, _Reason} = Error ->
-            Error
-    end.
-
-%% Close a direct connection
--spec close_connection(Handle :: connection_handle()) -> ok.
-close_connection({Conn, _Service}) ->
-    aws_lib_httpc:close(Conn).
-
--spec direct_request(
-    Handle :: connection_handle(),
-    Method :: method(),
-    Path :: path(),
-    Body :: body(),
-    Headers :: headers(),
-    Options :: list(),
-    State :: aws_state()
-) -> {ok, {headers(), term()}, aws_state()} | {error, term()}.
-direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) ->
-    % Ensure we have credentials
-    State1 =
-        case has_credentials(State0) of
-            false ->
-                case refresh_credentials(State0) of
-                    {ok, S} -> S;
-                    {error, _} -> State0
-                end;
-            true ->
-                State0
-        end,
-
-    case State1#aws_state.credentials of
-        #aws_credentials{
-            access_key = AccessKey,
-            secret_key = SecretKey,
-            security_token = SecurityToken
-        } ->
-            % Get region
-            Region =
-                case State1#aws_state.config of
-                    #aws_config{region = R} when R =/= undefined -> R;
-                    _ -> ?DEFAULT_REGION
-                end,
-
-            Host = endpoint_host(Region, Service),
-            URI = create_uri(Host, Path),
-            BodyHash = proplists:get_value(payload_hash, Options),
-            case
-                sign_headers(
-                    AccessKey,
-                    SecretKey,
-                    SecurityToken,
-                    Region,
-                    Service,
-                    Method,
-                    URI,
-                    Headers,
-                    Body,
-                    BodyHash
-                )
-            of
-                {ok, SignedHeaders} ->
-                    Options1 = ensure_timeout_option(Options, State1),
-                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options1) of
-                        {ok, Response} ->
-                            {ok, Response, State1};
-                        Error ->
-                            Error
-                    end;
-                {error, _} = Error ->
-                    Error
-            end;
-        undefined ->
-            {error, no_credentials}
-    end.
 
 -spec sign_headers(
     AccessKey :: access_key(),
@@ -1105,30 +982,6 @@ gun_open_opts(Transport, Options) when Transport =:= tls; Transport =:= tcp ->
         connect_timeout => proplists:get_value(connect_timeout, Options, infinity),
         timeout => proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT)
     }.
-
-create_uri(Host, Path) when is_list(Path) ->
-    "https://" ++ Host ++ Path;
-create_uri(Host, {Bucket, Key}) ->
-    "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
-
--spec direct_gun_request(
-    Conn :: aws_lib_httpc:conn(),
-    Method :: method(),
-    Path :: path() | {term(), path()},
-    Headers :: headers(),
-    Body :: body(),
-    Options :: list()
-) -> result().
-%% Issue a request on an already-open connection (the two-step API). The Gun
-%% lifecycle lives in aws_lib_httpc; this resolves the request timeout and
-%% shapes the result. A {_, Path} tuple (S3 bucket/key) is normalized to an
-%% absolute path first.
-direct_gun_request(Conn, Method, {_, Path}, Headers, Body, Options) ->
-    direct_gun_request(Conn, Method, [$/ | Path], Headers, Body, Options);
-direct_gun_request(Conn, Method, Path, Headers, Body, Options) ->
-    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
-    Response = aws_lib_httpc:request(Conn, Method, Path, Headers, Body, Timeout),
-    aws_lib_response:format_response(Response).
 
 -spec parse_volumes_response(term()) -> {'ok', volumes_list()} | {'error', 'parse_error'}.
 %% @doc Parse the DescribeVolumes XML response into a list of volume information.
