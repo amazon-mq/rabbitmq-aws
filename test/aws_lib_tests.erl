@@ -542,7 +542,16 @@ api_get_request_test_() ->
             %% endpoint_url/1, so it must be expected. No override: target the
             %% default AWS endpoint.
             meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
-            [gun, aws_lib_config]
+            %% Stub the inter-attempt backoff sleep. These cases exercise retry
+            %% BEHAVIOUR (error surfacing, retry re-entry), not delay timing --
+            %% the delay arithmetic is covered by backoff_delay/3's own tests.
+            %% With exponential backoff a full 5-retry exhaustion would sleep up
+            %% to ~15s of real time, past eunit's 5s per-test default, so these
+            %% cases would time out. Skipping the real sleep keeps them fast
+            %% without changing what they assert.
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
         end,
         fun(Mods) ->
             teardown(ok),
@@ -851,7 +860,13 @@ connection_reuse_across_retries_test_() ->
             %% endpoint_url/1, so it must be expected. No override: target the
             %% default AWS endpoint.
             meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
-            [gun, aws_lib_config]
+            %% Stub the inter-attempt backoff sleep so exhausting retries does
+            %% not sleep ~15s of real time and trip eunit's 5s per-test default.
+            %% These cases count gun:open calls across retries; the delay itself
+            %% is irrelevant here and is covered by backoff_delay/3's own tests.
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
         end,
         fun(Mods) ->
             teardown(ok),
