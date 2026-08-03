@@ -36,13 +36,32 @@ parse_arn_empty_test() ->
 parse_arn_incomplete_test() ->
     ?assertMatch({error, {invalid_arn_format, _}}, aws_arn_util:parse_arn("arn:aws:s3")).
 
+%% A cacertfile path that is guaranteed NOT to exist. replace/5 reads the
+%% configured cacertfile and prepends its decoded certs to the resolved cacerts
+%% (aws_arn_env:maybe_add_cacertfile_to_cacerts/2), so this case only holds while
+%% the path is absent. The literal "/tmp/ca.pem" this used to name is shared,
+%% machine-global state: anything on the host creating that file made the test
+%% fail with an extra leading cert, which looked like an unrelated flake. Derive
+%% a unique path per run instead, and assert the precondition rather than
+%% assuming it.
+absent_cacertfile_path() ->
+    filename:join(unique_tmp_dir(), "absent-ca.pem").
+
+unique_tmp_dir() ->
+    filename:join(
+        "/tmp",
+        "aws_arn_config_tests-" ++ integer_to_list(erlang:unique_integer([positive]))
+    ).
+
 replace_in_env_test() ->
     ExpectedOtherKeyValue = "value",
     Expected = [<<"cacertdata">>],
+    AbsentPath = absent_cacertfile_path(),
+    ?assertNot(filelib:is_file(AbsentPath)),
     ok = application:set_env(
         rabbitmq_auth_backend_oauth2,
         key_config,
-        [{other_key, ExpectedOtherKeyValue}, {cacertfile, "/tmp/ca.pem"}]
+        [{other_key, ExpectedOtherKeyValue}, {cacertfile, AbsentPath}]
     ),
 
     ok = aws_arn_env:replace(
@@ -52,6 +71,70 @@ replace_in_env_test() ->
     {ok, KeyConfig} = application:get_env(rabbitmq_auth_backend_oauth2, key_config),
     ?assertMatch(Expected, proplists:get_value(cacerts, KeyConfig)),
     ?assertMatch(ExpectedOtherKeyValue, proplists:get_value(other_key, KeyConfig)).
+
+%% The companion case the suite was missing. When the configured cacertfile DOES
+%% exist its certs are prepended to the resolved ARN material -- exactly the
+%% behaviour that silently broke replace_in_env_test/0 whenever a stray
+%% /tmp/ca.pem existed. Pin it deliberately, using a file this test owns.
+replace_in_env_prepends_existing_cacertfile_test() ->
+    Dir = unique_tmp_dir(),
+    ok = filelib:ensure_path(Dir),
+    CacertFile = filename:join(Dir, "ca.pem"),
+    try
+        case write_self_signed_cert(CacertFile) of
+            {ok, [FileDer]} ->
+                Resolved = [<<"cacertdata">>],
+                ok = application:set_env(
+                    rabbitmq_auth_backend_oauth2,
+                    key_config,
+                    [{cacertfile, CacertFile}]
+                ),
+
+                ok = aws_arn_env:replace(
+                    rabbitmq_auth_backend_oauth2,
+                    key_config,
+                    cacertfile,
+                    cacerts,
+                    {ok, Resolved}
+                ),
+
+                {ok, KeyConfig} = application:get_env(
+                    rabbitmq_auth_backend_oauth2, key_config
+                ),
+                %% The file's cert comes first, then the resolved ARN material.
+                ?assertEqual([FileDer | Resolved], proplists:get_value(cacerts, KeyConfig)),
+                %% cacertfile is consumed, not left alongside cacerts.
+                ?assertEqual(undefined, proplists:get_value(cacertfile, KeyConfig));
+            {error, Reason} ->
+                %% openssl is unavailable in this environment. Skip rather than
+                %% fail: the absent-file case above still covers the regression
+                %% that motivated this suite change.
+                ?debugFmt("skipping prepend case, no cert material: ~p", [Reason]),
+                ok
+        end
+    after
+        _ = file:delete(CacertFile),
+        _ = file:del_dir(Dir)
+    end.
+
+%% Write a throwaway self-signed cert to Path, returning the DER list that
+%% aws_pem_util:decode_data/1 yields for it, so the expected value is derived
+%% from the same decoder production uses rather than hardcoded.
+write_self_signed_cert(Path) ->
+    KeyPath = Path ++ ".key",
+    Cmd = lists:flatten(
+        io_lib:format(
+            "openssl req -x509 -newkey rsa:2048 -keyout ~s -out ~s "
+            "-days 1 -nodes -subj /CN=aws-arn-config-tests 2>/dev/null",
+            [KeyPath, Path]
+        )
+    ),
+    _ = os:cmd(Cmd),
+    _ = file:delete(KeyPath),
+    case file:read_file(Path) of
+        {ok, Pem} -> aws_pem_util:decode_data(Pem);
+        {error, Reason} -> {error, Reason}
+    end.
 
 %%--------------------------------------------------------------------
 %% Boot-path orchestration: assume-role + ARN-handler state threading
