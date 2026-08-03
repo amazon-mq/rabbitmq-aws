@@ -45,7 +45,7 @@ Uses Gun (HTTP/1.1 and HTTP/2). One-shot request lifecycle:
 
 ### Retry Logic
 
-`api_get_request/3` and `api_post_request/5` retry up to 5 times with a fixed 500ms delay between attempts. Credentials are validated before the first attempt and re-validated before each retry. If credentials cannot be loaded, returns `{error, {credentials, Reason}}` immediately without retrying.
+`api_get_request/3` and `api_post_request/5` retry up to 5 times, sleeping between attempts for an equal-jitter exponential backoff interval: `Temp = min(10000, 500 * 2^Attempt)` ms, then a random delay in `[Temp/2, Temp]`. The delay is skipped after the final attempt, so a fully exhausted request waits at most 7.5s in total. Credentials are validated before the first attempt and re-validated before each retry. If credentials cannot be loaded, returns `{error, {credentials, Reason}}` immediately without retrying.
 
 ## Modules
 

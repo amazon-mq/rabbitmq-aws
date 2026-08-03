@@ -1297,3 +1297,98 @@ backoff_delay_test_() ->
             )
         end}
     ].
+
+%% ----------------------------------------------------------------------------
+%% maybe_backoff/3 -- no sleep before the exhaustion clause (issue #81 review)
+%% ----------------------------------------------------------------------------
+maybe_backoff_test_() ->
+    {
+        foreach,
+        fun() ->
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [timer]
+        end,
+        fun meck:unload/1,
+        [
+            {"the last attempt does not sleep", fun() ->
+                %% The caller decrements Retries after this call, so Retries =< 1
+                %% means the next recursion exhausts: sleeping would delay the
+                %% returned error without buying another attempt.
+                ?assertEqual(ok, aws_lib:maybe_backoff(1, 4, 500)),
+                ?assertEqual(ok, aws_lib:maybe_backoff(0, 4, 500)),
+                ?assertEqual(0, meck:num_calls(timer, sleep, '_'))
+            end},
+            {"an attempt with retries remaining sleeps once", fun() ->
+                ?assertEqual(ok, aws_lib:maybe_backoff(2, 0, 500)),
+                ?assertEqual(1, meck:num_calls(timer, sleep, '_'))
+            end}
+        ]
+    }.
+
+%% ----------------------------------------------------------------------------
+%% Backoff is applied between attempts only (issue #81 review)
+%% ----------------------------------------------------------------------------
+backoff_between_attempts_only_test_() ->
+    {
+        foreach,
+        fun() ->
+            setup(),
+            meck:new(gun, []),
+            meck:new(aws_lib_config, []),
+            meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
+        end,
+        fun(Mods) ->
+            teardown(ok),
+            meck:unload(Mods)
+        end,
+        [
+            {"exhausting retries sleeps once fewer than it attempts", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% Every attempt fails with a retriable 500, so the whole retry
+                %% budget is consumed.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 500, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InternalError\"}}">>}
+                end),
+
+                {error, {service_error, _}, _} = aws_lib:api_get_request("AWS", "API", State),
+                %% The sleep after the final attempt would delay the returned
+                %% error by a full backoff interval (up to ?BACKOFF_CAP_MILLIS)
+                %% without buying another attempt, so there must be exactly one
+                %% fewer sleep than attempt.
+                Attempts = meck:num_calls(gun, await, '_'),
+                ?assertEqual(?MAX_RETRIES, Attempts),
+                ?assertEqual(Attempts - 1, meck:num_calls(timer, sleep, '_'))
+            end},
+            {"a request that succeeds on the first attempt never sleeps", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) -> {ok, <<"{\"pass\": true}">>} end),
+
+                {ok, _, _} = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual(0, meck:num_calls(timer, sleep, '_'))
+            end}
+        ]
+    }.

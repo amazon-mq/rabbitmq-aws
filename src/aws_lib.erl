@@ -28,7 +28,6 @@
     local_time/0,
     api_get_request/3,
     api_post_request/5,
-    backoff_delay/3,
     endpoint/4,
     sign_headers/10,
     instance_volumes/1,
@@ -751,7 +750,7 @@ api_request_with_retries(
                             ?LOG_WARNING(
                                 "Will retry AWS request, remaining retries: ~b", [Retries]
                             ),
-                            timer:sleep(backoff_delay(Attempt, BackoffBase, ?BACKOFF_CAP_MILLIS)),
+                            maybe_backoff(Retries, Attempt, BackoffBase),
                             %% perform_request_reuse/8 hands back a live connection
                             %% after an HTTP-level error (reused on the next
                             %% attempt) or `undefined' after a transport failure
@@ -806,6 +805,20 @@ exhausted_error({error, _Message, {_Headers, DecodedBody}}) ->
     {service_error, DecodedBody};
 exhausted_error(_) ->
     {service_error, retries_exhausted}.
+
+-spec maybe_backoff(
+    Retries :: integer(), Attempt :: non_neg_integer(), Base :: non_neg_integer()
+) -> ok.
+%% Sleep between attempts, but only when another attempt will actually follow.
+%% The caller decrements Retries after this call, so Retries =< 1 means the next
+%% recursion hits the exhaustion clause: sleeping there would delay the returned
+%% error by a full backoff interval (up to ?BACKOFF_CAP_MILLIS) without buying
+%% another attempt. This matters on the broker-boot ARN resolution path, where it
+%% halves the worst-case delay for an unreachable service.
+maybe_backoff(Retries, _Attempt, _Base) when Retries =< 1 ->
+    ok;
+maybe_backoff(_Retries, Attempt, Base) ->
+    timer:sleep(backoff_delay(Attempt, Base, ?BACKOFF_CAP_MILLIS)).
 
 -spec backoff_delay(
     Attempt :: non_neg_integer(), Base :: non_neg_integer(), Cap :: non_neg_integer()
@@ -891,7 +904,7 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
             %% Shape the 2-tuple error through format_response/1 into the
             %% 3-tuple result the retry loop matches on; returning the raw
             %% {error, Reason} here would raise a case_clause in
-            %% api_request_with_retries/10.
+            %% api_request_with_retries/11.
             {aws_lib_response:format_response(Error), ConnSlot0, retriable}
     end.
 
