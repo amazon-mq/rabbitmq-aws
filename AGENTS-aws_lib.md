@@ -102,7 +102,7 @@ make t=aws_lib_tests eunit
 
 ## Configuration
 
-Application env `aws_prefer_imdsv2` (default: `true`) controls whether IMDSv2 is attempted before IMDSv1. Also exposed via Cuttlefish schema at `priv/schema/aws_lib.schema` as `aws.prefer_imdsv2` for RabbitMQ integration.
+Application env `aws_prefer_imdsv2` (default: `true`) controls whether IMDSv2 is attempted before IMDSv1. Also exposed via Cuttlefish schema at `priv/schema/aws.schema` as `aws.arns.prefer_imdsv2` for RabbitMQ integration (the bare `aws.prefer_imdsv2` key belongs to the `rabbitmq_aws` library).
 
 ## Known Issues
 
