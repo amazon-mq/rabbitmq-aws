@@ -56,6 +56,16 @@
 
 -define(BACKOFF_BASE_MILLIS, 500).
 -define(BACKOFF_CAP_MILLIS, 10000).
+
+% Maximum number of role_arn/source_profile hops allowed before we reject the
+% chain as too deep. Matches the AWS CLI default of 5.
+-define(MAX_CREDENTIAL_CHAIN_DEPTH, 5).
+
+% Regex for validating STS RoleSessionName: 2-64 characters from the set
+% [\w+=,.@-]. Used during credential chain resolution to reject invalid
+% session names BEFORE calling STS.
+-define(ROLE_SESSION_NAME_PATTERN, "^[\\w+=,.@\\-]{2,64}$").
+
 -define(MAX_RETRIES, 5).
 
 -define(AWS_CREDENTIALS_TABLE, aws_credentials).
