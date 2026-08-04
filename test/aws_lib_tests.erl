@@ -1298,33 +1298,12 @@ backoff_delay_test_() ->
         end}
     ].
 
-%% ----------------------------------------------------------------------------
-%% maybe_backoff/3 -- no sleep before the exhaustion clause (issue #81 review)
-%% ----------------------------------------------------------------------------
-maybe_backoff_test_() ->
-    {
-        foreach,
-        fun() ->
-            meck:new(timer, [passthrough, unstick]),
-            meck:expect(timer, sleep, fun(_) -> ok end),
-            [timer]
-        end,
-        fun meck:unload/1,
-        [
-            {"the last attempt does not sleep", fun() ->
-                %% The caller decrements Retries after this call, so Retries =< 1
-                %% means the next recursion exhausts: sleeping would delay the
-                %% returned error without buying another attempt.
-                ?assertEqual(ok, aws_lib:maybe_backoff(1, 4, 500)),
-                ?assertEqual(ok, aws_lib:maybe_backoff(0, 4, 500)),
-                ?assertEqual(0, meck:num_calls(timer, sleep, '_'))
-            end},
-            {"an attempt with retries remaining sleeps once", fun() ->
-                ?assertEqual(ok, aws_lib:maybe_backoff(2, 0, 500)),
-                ?assertEqual(1, meck:num_calls(timer, sleep, '_'))
-            end}
-        ]
-    }.
+%% The "no sleep before the exhaustion clause" behaviour that maybe_backoff/3
+%% used to provide now lives in aws_lib_retry:with_retries/3 (the loop was
+%% extracted in issue #85). It is covered end-to-end by
+%% backoff_between_attempts_only_test_/0 below (one fewer sleep than attempts;
+%% first-attempt success never sleeps) and at the unit level by
+%% aws_lib_retry_tests.
 
 %% ----------------------------------------------------------------------------
 %% Backoff is applied between attempts only (issue #81 review)
