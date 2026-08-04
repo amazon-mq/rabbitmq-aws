@@ -108,7 +108,7 @@ By default, IMDSv2 (session-authenticated) is preferred. Falls back to IMDSv1 on
 [{aws_lib, [{aws_prefer_imdsv2, true}]}].  %% default
 ```
 
-Also available via Cuttlefish schema (`priv/schema/aws_lib.schema`) as `aws.prefer_imdsv2` for RabbitMQ plugin integration.
+Also available via Cuttlefish schema (`priv/schema/aws.schema`) as `aws.arns.prefer_imdsv2` for RabbitMQ plugin integration. The bare `aws.prefer_imdsv2` key is owned by the `rabbitmq_aws` library, so this plugin scopes its own setting under `aws.arns` to avoid a mapping collision.
 
 ## Build
 

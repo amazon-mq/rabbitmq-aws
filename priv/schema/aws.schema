@@ -11,11 +11,16 @@
 %% See https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/configuring-instance-metadata-service.html.
 
 %% NOTE:
-%% This routes through the "aws" application env (key aws_prefer_imdsv2),
-%% which is the single OTP application for this plugin. There is no separate
-%% rabbitmq_aws / aws_lib application to read from.
-%%
-{mapping, "aws.prefer_imdsv2", "aws.aws_prefer_imdsv2",
+%% The key lives under this plugin's own "aws.arns" namespace, NOT the bare
+%% "aws.prefer_imdsv2". The bare key is owned by the rabbitmq_aws library
+%% (used by rabbitmq_peer_discovery_aws), which maps it to
+%% rabbitmq_aws.aws_prefer_imdsv2. Two cuttlefish mappings cannot share one
+%% key, so when both schemas are present -- e.g. the umbrella running the
+%% rabbitmq_aws config_schema suite with this plugin checked out -- the bare
+%% key collides and the suite fails. Using a distinct key keeps this plugin's
+%% setting independent and routes through the "aws" application env (key
+%% aws_prefer_imdsv2), which aws_lib_config reads directly.
+{mapping, "aws.arns.prefer_imdsv2", "aws.aws_prefer_imdsv2",
     [{datatype, {enum, [true, false]}}]}.
 
 %% @doc IAM role ARN to assume before fetching resources from S3
