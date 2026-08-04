@@ -54,7 +54,8 @@
 % 5-minute buffer erlcloud uses.
 -define(CREDENTIAL_REFRESH_BUFFER_SECONDS, 300).
 
--define(LINEAR_BACK_OFF_MILLIS, 500).
+-define(BACKOFF_BASE_MILLIS, 500).
+-define(BACKOFF_CAP_MILLIS, 10000).
 -define(MAX_RETRIES, 5).
 
 -define(AWS_CREDENTIALS_TABLE, aws_credentials).
