@@ -28,9 +28,6 @@
     local_time/0,
     api_get_request/3,
     api_post_request/5,
-    open_connection/2, open_connection/3,
-    close_connection/1,
-    direct_request/7,
     endpoint/4,
     sign_headers/10,
     instance_volumes/1,
@@ -49,7 +46,6 @@
 -include_lib("kernel/include/logger.hrl").
 
 -opaque aws_state() :: #aws_state{}.
--type connection_handle() :: {aws_lib_httpc:conn(), string()}.
 
 %%====================================================================
 %% State construction and accessors
@@ -190,125 +186,6 @@ put(Service, Path, Body, Headers, Options, State) ->
 %% @end
 refresh_credentials(State) ->
     do_refresh_credentials(State).
-
-%%====================================================================
-%% New Concurrent API Functions
-%%====================================================================
-
-%% Open a connection and return handle for direct use
--spec open_connection(
-    Service :: string(),
-    State :: aws_state()
-) -> {ok, connection_handle(), aws_state()} | {error, term()}.
-open_connection(Service, State) ->
-    open_connection(Service, [], State).
-
--spec open_connection(
-    Service :: string(),
-    Options :: list(),
-    State :: aws_state()
-) -> {ok, connection_handle(), aws_state()} | {error, term()}.
-open_connection(Service, Options, State0) ->
-    % Get region from state or use default
-    Region =
-        case State0#aws_state.config of
-            #aws_config{region = R} when R =/= undefined -> R;
-            _ -> ?DEFAULT_REGION
-        end,
-
-    % Update state with region if it was default
-    State1 =
-        case State0#aws_state.config of
-            undefined ->
-                State0#aws_state{config = #aws_config{region = Region}};
-            #aws_config{region = undefined} = C ->
-                State0#aws_state{config = C#aws_config{region = Region}};
-            _ ->
-                State0
-        end,
-
-    Host = endpoint_host(Region, Service),
-    Port = 443,
-    %% The legacy two-step API always targets the real AWS endpoint over TLS; it
-    %% does not honour the endpoint-url override (see endpoint/4).
-    case aws_lib_httpc:open(Host, Port, gun_open_opts(tls, Options)) of
-        {ok, Conn} ->
-            {ok, {Conn, Service}, State1};
-        {error, _Reason} = Error ->
-            Error
-    end.
-
-%% Close a direct connection
--spec close_connection(Handle :: connection_handle()) -> ok.
-close_connection({Conn, _Service}) ->
-    aws_lib_httpc:close(Conn).
-
--spec direct_request(
-    Handle :: connection_handle(),
-    Method :: method(),
-    Path :: path(),
-    Body :: body(),
-    Headers :: headers(),
-    Options :: list(),
-    State :: aws_state()
-) -> {ok, {headers(), term()}, aws_state()} | {error, term()}.
-direct_request({GunPid, Service}, Method, Path, Body, Headers, Options, State0) ->
-    % Ensure we have credentials
-    State1 =
-        case has_credentials(State0) of
-            false ->
-                case refresh_credentials(State0) of
-                    {ok, S} -> S;
-                    {error, _} -> State0
-                end;
-            true ->
-                State0
-        end,
-
-    case State1#aws_state.credentials of
-        #aws_credentials{
-            access_key = AccessKey,
-            secret_key = SecretKey,
-            security_token = SecurityToken
-        } ->
-            % Get region
-            Region =
-                case State1#aws_state.config of
-                    #aws_config{region = R} when R =/= undefined -> R;
-                    _ -> ?DEFAULT_REGION
-                end,
-
-            Host = endpoint_host(Region, Service),
-            URI = create_uri(Host, Path),
-            BodyHash = proplists:get_value(payload_hash, Options),
-            case
-                sign_headers(
-                    AccessKey,
-                    SecretKey,
-                    SecurityToken,
-                    Region,
-                    Service,
-                    Method,
-                    URI,
-                    Headers,
-                    Body,
-                    BodyHash
-                )
-            of
-                {ok, SignedHeaders} ->
-                    Options1 = ensure_timeout_option(Options, State1),
-                    case direct_gun_request(GunPid, Method, Path, SignedHeaders, Body, Options1) of
-                        {ok, Response} ->
-                            {ok, Response, State1};
-                        Error ->
-                            Error
-                    end;
-                {error, _} = Error ->
-                    Error
-            end;
-        undefined ->
-            {error, no_credentials}
-    end.
 
 -spec sign_headers(
     AccessKey :: access_key(),
@@ -705,7 +582,7 @@ api_get_request(Service, Path, State) ->
         "",
         [],
         ?MAX_RETRIES,
-        ?LINEAR_BACK_OFF_MILLIS,
+        ?BACKOFF_BASE_MILLIS,
         State
     ).
 
@@ -729,7 +606,7 @@ api_post_request(Service, Path, Body, Headers, State) ->
         Body,
         Headers,
         ?MAX_RETRIES,
-        ?LINEAR_BACK_OFF_MILLIS,
+        ?BACKOFF_BASE_MILLIS,
         State
     ).
 
@@ -768,125 +645,134 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     Body :: body(),
     Headers :: headers(),
     Retries :: integer(),
-    WaitTime :: integer(),
+    BackoffBase :: integer(),
     State :: aws_state()
 ) ->
     {ok, list(), aws_state()} | {error, term(), aws_state()}.
-%% @doc Invoke an API call to an AWS service with retries.
+%% @doc Invoke an API call to an AWS service with retries, delegating the retry
+%% loop to aws_lib_retry:with_retries/3 (issue #85). The attempt closure threads
+%% {State, Conn, LastError} as context; a credential failure short-circuits via
+%% {stop, ...}; perform_request_reuse/8 drives the HTTP attempt; and
+%% classify_response's verdict decides retriability. The inter-attempt delay is
+%% supplied as a wait_time_ms fun computing exponential backoff with jitter
+%% (issue #81); with_retries skips the sleep before the final attempt.
 %% @end
-api_request_with_retries(Service, Method, Path, Body, Headers, Retries, WaitTime, State) ->
+api_request_with_retries(Service, Method, Path, Body, Headers, Retries, BackoffBase, State) ->
     %% Open a single connection and reuse it across the whole retry sequence
     %% instead of opening a fresh TCP+TLS connection per attempt (issue #91).
     %% When the state carries a reuse_conn (cross-request reuse, issue #107),
     %% seed from it so the first attempt avoids a fresh handshake; otherwise
     %% start with `undefined' (nothing open yet, opened lazily on first attempt).
     Conn0 = seed_conn_from_state(State),
-    api_request_with_retries(
-        Service, Method, Path, Body, Headers, Retries, WaitTime, State, Conn0, undefined
-    ).
+    Ctx0 = {State, Conn0, undefined},
 
--spec api_request_with_retries(
-    Service :: string(),
-    Method :: method(),
-    Path :: path(),
-    Body :: body(),
-    Headers :: headers(),
-    Retries :: integer(),
-    WaitTime :: integer(),
-    State :: aws_state(),
-    Conn :: aws_lib_httpc:conn() | undefined,
-    LastError :: result_error() | undefined
-) ->
-    {ok, list(), aws_state()} | {error, term(), aws_state()}.
-api_request_with_retries(
-    _Service, _Method, _Path, _Body, _Headers, Retries, _WaitTime, State, Conn, LastError
-) when
-    Retries =< 0
-->
-    ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
-    %% Reconcile the carried connection into the returned state: in reuse mode a
-    %% still-live connection is handed back, a transport-dropped one (undefined)
-    %% clears the slot; in one-shot mode it is closed.
-    State1 = finish_conn(Conn, State),
-    %% Surface the last attempt's decoded AWS error so the caller can act on the
-    %% service error code (throttling vs invalid parameter vs access denied)
-    %% rather than a generic string (issue #82).
-    {error, exhausted_error(LastError), State1};
-api_request_with_retries(
-    Service, Method, Path, Body, Headers, Retries, WaitTime, State0, Conn0, LastError
-) ->
-    case ensure_credentials_valid(State0) of
-        {ok, State1} ->
-            {Result, Conn1, Verdict} =
-                perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, Conn0),
-            case Result of
-                {ok, {_Headers, Payload}, State2} ->
-                    ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    State3 = finish_conn(Conn1, State2),
-                    {ok, Payload, State3};
-                {error, Message, Response} = Error ->
-                    %% Message may be a status string (from format_response/1
-                    %% on an HTTP error) or a tuple such as
-                    %% {gun_open_failed, Reason} on a connection failure, so
-                    %% use ~tp rather than ~ts.
-                    ?LOG_WARNING("Error occurred: ~tp", [Message]),
-                    case Response of
-                        {_, Payload} ->
-                            ?LOG_WARNING("Failed AWS request: ~ts~nResponse: ~tp", [
-                                Path, Payload
-                            ]);
-                        _ ->
-                            ok
-                    end,
-                    case Verdict of
-                        not_retriable ->
-                            %% A 4xx client error that will not succeed on retry
-                            %% (issue #80): return the decoded error to the caller
-                            %% immediately rather than burning the remaining
-                            %% retries. The exchange completed cleanly, so in
-                            %% reuse mode the connection is handed back for the
-                            %% next request; in one-shot mode finish_conn/2 closes
-                            %% it.
-                            %% Log at ERROR level so log-level alerting still sees
-                            %% a permanent failure: before issue #80 short-circuited
-                            %% the retry loop, this failure would have exhausted the
-                            %% retries and reached the ?LOG_ERROR clause above.
-                            ?LOG_ERROR(
-                                "Request to AWS service has failed with a permanent error: ~tp",
-                                [Message]
-                            ),
-                            State3 = finish_conn(Conn1, State1),
-                            {error, exhausted_error(Error), State3};
-                        retriable ->
-                            ?LOG_WARNING(
-                                "Will retry AWS request, remaining retries: ~b", [Retries]
-                            ),
-                            timer:sleep(WaitTime),
-                            %% perform_request_reuse/8 hands back a live connection
-                            %% after an HTTP-level error (reused on the next
-                            %% attempt) or `undefined' after a transport failure
-                            %% (reopened next attempt). Carry the most informative
-                            %% error forward so retry exhaustion can return it: a
-                            %% decoded service-error body from an earlier attempt
-                            %% is kept even if a later attempt fails at the
-                            %% transport level with no body.
-                            api_request_with_retries(
-                                Service,
-                                Method,
-                                Path,
-                                Body,
-                                Headers,
-                                Retries - 1,
-                                WaitTime,
-                                State1,
-                                Conn1,
-                                keep_informative_error(LastError, Error)
-                            )
-                    end
-            end;
-        {error, Reason} ->
-            State1 = finish_conn(Conn0, State0),
-            {error, {credentials, Reason}, State1}
+    AttemptFun = fun({State0, ConnIn, PrevError}) ->
+        case ensure_credentials_valid(State0) of
+            {ok, State1} ->
+                {Result, Conn1, Verdict} =
+                    perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, ConnIn),
+                case Result of
+                    {ok, {_RespHeaders, Payload}, State2} ->
+                        ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
+                        State3 = finish_conn(Conn1, State2),
+                        %% finish_conn/2 has reconciled the connection into
+                        %% State3; drop it from the carried context so the outer
+                        %% success clause does not reconcile (and close) it a
+                        %% second time.
+                        {ok, Payload, {State3, undefined, PrevError}};
+                    {error, Message, Response} = Error ->
+                        %% Message may be a status string (from format_response/1
+                        %% on an HTTP error) or a tuple such as
+                        %% {gun_open_failed, Reason} on a connection failure, so
+                        %% use ~tp rather than ~ts.
+                        ?LOG_WARNING("Error occurred: ~tp", [Message]),
+                        case Response of
+                            {_, Payload} ->
+                                ?LOG_WARNING("Failed AWS request: ~ts~nResponse: ~tp", [
+                                    Path, Payload
+                                ]);
+                            _ ->
+                                ok
+                        end,
+                        case Verdict of
+                            not_retriable ->
+                                %% A 4xx client error that will not succeed on
+                                %% retry (issue #80): short-circuit rather than
+                                %% burning the remaining retries. Leave conn
+                                %% reconciliation to the outer {error, ...} clause
+                                %% so reuse mode hands the connection back and
+                                %% one-shot mode closes it (one finish_conn call
+                                %% on every exit path).
+                                %% Log at ERROR level so log-level alerting still
+                                %% sees a permanent failure.
+                                ?LOG_ERROR(
+                                    "Request to AWS service has failed with a permanent error: ~tp",
+                                    [Message]
+                                ),
+                                {stop, exhausted_error(Error), {State1, Conn1, PrevError}};
+                            retriable ->
+                                %% perform_request_reuse/8 hands back a live
+                                %% connection after an HTTP-level error (reused on
+                                %% the next attempt) or `undefined' after a
+                                %% transport failure (reopened next attempt).
+                                %% Carry the most informative error forward so
+                                %% retry exhaustion can return it: a decoded
+                                %% service-error body from an earlier attempt is
+                                %% kept even if a later attempt fails at the
+                                %% transport level with no body.
+                                NewLastError = keep_informative_error(PrevError, Error),
+                                {retry, Error, {State1, Conn1, NewLastError}}
+                        end
+                end;
+            {error, Reason} ->
+                State1 = finish_conn(ConnIn, State0),
+                {stop, {credentials, Reason}, {State1, ConnIn, PrevError}}
+        end
+    end,
+
+    OnRetry = fun(AttemptNumber, _Error, _Ctx) ->
+        %% AttemptNumber is 1-based; after N attempts, Retries - N remain.
+        Remaining = Retries - AttemptNumber,
+        ?LOG_WARNING("Will retry AWS request, remaining retries: ~b", [Remaining]),
+        ok
+    end,
+
+    OnExhausted = fun(_TotalAttempts, _LastAttemptError, {_St, _Co, LastErr}) ->
+        ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
+        %% Surface the last attempt's decoded AWS error so the caller can act on
+        %% the service error code (throttling vs invalid parameter vs access
+        %% denied) rather than a generic string (issue #82).
+        exhausted_error(LastErr)
+    end,
+
+    %% Exponential backoff with jitter (issue #81), supplied as a fun so the
+    %% retry loop stays policy-agnostic. AttemptNumber is 1-based; the first
+    %% retry's delay uses exponent 0, matching the pre-extraction attempt
+    %% counter that started at 0.
+    WaitTimeMs = fun(AttemptNumber, _Ctx) ->
+        backoff_delay(AttemptNumber - 1, BackoffBase, ?BACKOFF_CAP_MILLIS)
+    end,
+
+    Opts = #{
+        max_retries => Retries,
+        wait_time_ms => WaitTimeMs,
+        on_retry => OnRetry,
+        on_exhausted => OnExhausted
+    },
+
+    case aws_lib_retry:with_retries(AttemptFun, Opts, Ctx0) of
+        {ok, Payload, {FinalState, _FinalConn, _}} ->
+            {ok, Payload, FinalState};
+        {error, {credentials, Reason}, {FinalState, _FinalConn, _}} ->
+            %% The attempt closure already reconciled the connection on the
+            %% credential-failure path.
+            {error, {credentials, Reason}, FinalState};
+        {error, ErrorTerm, {FinalState, FinalConn, _}} ->
+            %% On a not_retriable stop or retry exhaustion the connection is
+            %% still carried in the context; reconcile it into the returned
+            %% state here (reuse mode hands it back, one-shot mode closes it).
+            State1 = finish_conn(FinalConn, FinalState),
+            {error, ErrorTerm, State1}
     end.
 
 %% Keep the more informative of two retry errors: an error carrying a decoded
@@ -915,6 +801,26 @@ exhausted_error({error, _Message, {_Headers, DecodedBody}}) ->
     {service_error, DecodedBody};
 exhausted_error(_) ->
     {service_error, retries_exhausted}.
+
+%% Note: the "skip the sleep before the final attempt" logic (issue #81 review)
+%% now lives in aws_lib_retry:with_retries/3, which owns the inter-attempt sleep
+%% after the loop was extracted (issue #85). backoff_delay/3 below stays here as
+%% the policy the wait_time_ms fun computes.
+
+-spec backoff_delay(
+    Attempt :: non_neg_integer(), Base :: non_neg_integer(), Cap :: non_neg_integer()
+) ->
+    pos_integer().
+%% @doc Compute the sleep duration (ms) for a retry attempt using equal-jitter
+%% exponential backoff (aws-erlang pattern). The deterministic component
+%% (Temp/2) guarantees a minimum delay per attempt, while the random component
+%% (rand:uniform(Temp/2)) adds jitter to spread concurrent retriers. The
+%% formula: Temp = min(Cap, Base * 2^Attempt); Sleep = Temp/2 + uniform(Temp/2).
+%% @end
+backoff_delay(Attempt, Base, Cap) ->
+    Temp = min(Cap, Base * (1 bsl Attempt)),
+    HalfTemp = max(1, Temp div 2),
+    HalfTemp + rand:uniform(HalfTemp).
 
 %% Perform one request attempt on a reusable connection. Opens a connection when
 %% none is carried (or the carried one targets a different host) and reuses the
@@ -984,8 +890,9 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
         {error, _} = Error ->
             %% Shape the 2-tuple error through format_response/1 into the
             %% 3-tuple result the retry loop matches on; returning the raw
-            %% {error, Reason} here would raise a case_clause in
-            %% api_request_with_retries/10.
+            %% {error, Reason} here would raise a case_clause in the attempt
+            %% closure api_request_with_retries/8 passes to
+            %% aws_lib_retry:with_retries/3.
             {aws_lib_response:format_response(Error), ConnSlot0, retriable}
     end.
 
@@ -1105,30 +1012,6 @@ gun_open_opts(Transport, Options) when Transport =:= tls; Transport =:= tcp ->
         connect_timeout => proplists:get_value(connect_timeout, Options, infinity),
         timeout => proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT)
     }.
-
-create_uri(Host, Path) when is_list(Path) ->
-    "https://" ++ Host ++ Path;
-create_uri(Host, {Bucket, Key}) ->
-    "https://" ++ Bucket ++ "." ++ Host ++ "/" ++ Key.
-
--spec direct_gun_request(
-    Conn :: aws_lib_httpc:conn(),
-    Method :: method(),
-    Path :: path() | {term(), path()},
-    Headers :: headers(),
-    Body :: body(),
-    Options :: list()
-) -> result().
-%% Issue a request on an already-open connection (the two-step API). The Gun
-%% lifecycle lives in aws_lib_httpc; this resolves the request timeout and
-%% shapes the result. A {_, Path} tuple (S3 bucket/key) is normalized to an
-%% absolute path first.
-direct_gun_request(Conn, Method, {_, Path}, Headers, Body, Options) ->
-    direct_gun_request(Conn, Method, [$/ | Path], Headers, Body, Options);
-direct_gun_request(Conn, Method, Path, Headers, Body, Options) ->
-    Timeout = proplists:get_value(timeout, Options, ?DEFAULT_API_TIMEOUT),
-    Response = aws_lib_httpc:request(Conn, Method, Path, Headers, Body, Timeout),
-    aws_lib_response:format_response(Response).
 
 -spec parse_volumes_response(term()) -> {'ok', volumes_list()} | {'error', 'parse_error'}.
 %% @doc Parse the DescribeVolumes XML response into a list of volume information.

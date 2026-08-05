@@ -5,7 +5,7 @@
 
 %% Unit tests for aws_auth_validate_http: pure input validation (every
 %% ?REASON_*), the SSRF literal-IP classifier reached through validate/1,
-%% ARN-first ordering + R6 no-leak (resolve_arn mocked), and the behaviour
+%% ARN-first ordering + no-secret-leakage (resolve_arn mocked), and the behaviour
 %% callbacks. The live (m)TLS probe path runs in aws_auth_validate_mgmt_SUITE /
 %% an HTTP integration suite. Internal helpers (classify_ip/1, in_cidr/2,
 %% resolve_and_pin/1, classify_http_error/1, is_tls_error/1 etc.) are exported
@@ -19,8 +19,9 @@
 %% aws_lib:aws_state() record literal). Mirror that: include eunit only.
 
 %% A unique sentinel standing in for a resolved ARN secret (CA/client-cert/key
-%% material). If it appears in a rendered result term, R6 is violated. Mirrors
-%% the ?SECRET macro and string_find/2 helper in aws_auth_validate_tests.erl.
+%% material). If it appears in a rendered result term, the no-credential-leakage
+%% invariant is violated. Mirrors the ?SECRET macro and string_find/2 helper in
+%% aws_auth_validate_tests.erl.
 %% Binary (not list) to match aws_arn_util:resolve_arn/2's return type.
 -define(SECRET, <<"S3cr3t-Sentinel-Cert-Material-DO-NOT-LEAK">>).
 
@@ -558,8 +559,87 @@ http_resolve_arn_fails_closed_on_none_sentinel_test_() ->
             },
             Result = aws_auth_validate_http:build_client_ssl_opts(Params),
             [
-                ?_assertEqual({error, input_invalid, <<"failed to resolve ARN">>}, Result),
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"ARN resolution failed for: ssl_options.cacertfile_arn">>},
+                    Result
+                ),
                 ?_assertEqual(0, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% All THREE ARN fields failing are named in one response. The point of the
+%% attribution is that an operator with several broken ARNs learns about all of
+%% them in a single call instead of one per round trip, so the resolver must
+%% attempt every ARN rather than stopping at the first failure.
+http_arn_resolve_failure_names_all_failed_fields_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) -> {error, denied, State} end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
+            Params = #{
+                ssl_options => #{
+                    <<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>,
+                    <<"certfile_arn">> => <<"arn:aws:s3:::cert">>,
+                    <<"keyfile_arn">> => <<"arn:aws:s3:::key">>
+                },
+                aws_state => fake_state
+            },
+            Result = aws_auth_validate_http:build_client_ssl_opts(Params),
+            [
+                ?_assertEqual(
+                    {error, input_invalid, <<
+                        "ARN resolution failed for: ssl_options.cacertfile_arn, "
+                        "ssl_options.certfile_arn, ssl_options.keyfile_arn"
+                    >>},
+                    Result
+                ),
+                %% Every ARN must actually be attempted -- that is what makes the
+                %% full list possible. Short-circuiting would name only the first.
+                ?_assertEqual(3, meck:num_calls(aws_arn_util, resolve_arn, '_'))
+            ]
+        end}.
+
+%% Only the fields that actually failed are named: a request whose CA bundle
+%% resolves but whose mTLS key does not must not blame the CA bundle.
+http_arn_resolve_failure_names_only_failed_fields_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_arn_util, [passthrough]),
+            meck:expect(aws_arn_util, resolve_arn, fun(Arn, State) ->
+                case lists:suffix("key", Arn) of
+                    true -> {error, denied, State};
+                    false -> {ok, ?SECRET, State}
+                end
+            end),
+            ok
+        end,
+        fun(_) -> meck:unload(aws_arn_util) end, fun(_) ->
+            Params = #{
+                ssl_options => #{
+                    <<"cacertfile_arn">> => <<"arn:aws:s3:::ca">>,
+                    <<"certfile_arn">> => <<"arn:aws:s3:::cert">>,
+                    <<"keyfile_arn">> => <<"arn:aws:s3:::key">>
+                },
+                aws_state => fake_state
+            },
+            Result = aws_auth_validate_http:build_client_ssl_opts(Params),
+            [
+                ?_assertEqual(
+                    {error, input_invalid,
+                        <<"ARN resolution failed for: ssl_options.keyfile_arn">>},
+                    Result
+                ),
+                %% The resolved material must never appear in the reason.
+                ?_assertNot(
+                    case Result of
+                        {error, _, R} -> binary:match(R, ?SECRET) =/= nomatch;
+                        _ -> false
+                    end
+                )
             ]
         end}.
 
@@ -592,7 +672,7 @@ http_arn_request_without_role_is_config_conflict_test_() ->
         end}.
 
 %%--------------------------------------------------------------------
-%% R6: a resolved secret (CA/cert/key PEM) must never reach a result term,
+%% A resolved secret (CA/cert/key PEM) must never reach a result term,
 %% log, or crash report -- even when the probe raises with the secret in scope.
 %% Mirrors ldap_bind_raise_does_not_leak_password_test_.
 %%--------------------------------------------------------------------

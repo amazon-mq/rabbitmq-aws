@@ -4,15 +4,16 @@
 %% -*- mode: erlang; -*-
 
 %% Shared SSRF / DNS-rebinding network guard for the http and oauth validation
-%% backends. (The ldap backend enforces a DIFFERENT, stricter address policy --
-%% it denies ALL private/RFC1918/CGNAT ranges, not just broker infra -- so it
-%% deliberately does NOT share this module. See aws_auth_validate_ldap's
-%% is_private_ip/1.)
+%% backends. The ldap backend shares the address classifier (classify_ip/2) and
+%% URL parser (parse_url/2) here, but passes its OWN stricter denylist -- it
+%% denies ALL private/RFC1918/CGNAT ranges, not just broker infra -- and adds a
+%% post-connect peer re-check for eldap's re-resolve. See aws_auth_validate_ldap's
+%% is_denied_ip/1.
 %%
 %% The validator issues outbound requests to customer-supplied URLs from the
 %% broker's network position -- a textbook SSRF / confused-deputy surface.
 %% Defense is two-phase and IDENTICAL for http and oauth; only the scheme
-%% allowlist (oauth is https-only; http allows http+https) and the fixed R4
+%% allowlist (oauth is https-only; http allows http+https) and the fixed
 %% reason strings differ, so those are parameters (a policy() map):
 %%
 %%   * PURE phase (url_allowed/2): scheme allowlist + literal-IP classification
@@ -25,11 +26,13 @@
 %%     caller preserves Host header + SNI) so httpc cannot re-resolve to a
 %%     different address (DNS-rebinding / TOCTOU defense).
 %%
-%% Policy: deny the broker's own infra only (IMDS, loopback, link-local,
-%% unspecified). RFC1918 / unique-local are NOT denied -- a customer auth server
-%% or IdP normally lives in their VPC. The test-only
-%% auth_validation_allow_private_networks flag relaxes ONLY loopback so an
-%% integration suite can reach a local stub; IMDS/link-local stay denied.
+%% Policy: the http/oauth denylist denies the broker's own infra only (IMDS,
+%% loopback, link-local, unspecified). RFC1918 / unique-local are NOT denied there
+%% -- a customer auth server or IdP normally lives in their VPC. (The ldap backend
+%% passes classify_ip/2 its OWN stricter denylist that DOES deny RFC1918/CGNAT;
+%% the denylist is a per-backend parameter, not a property of this module.) The
+%% test-only auth_validation_allow_private_networks flag relaxes ONLY loopback so
+%% an integration suite can reach a local stub; IMDS/link-local stay denied.
 -module(aws_auth_validate_net).
 
 -export([
@@ -39,6 +42,7 @@
     embedded_v4/1,
     resolve_and_pin/2,
     pin_url/2,
+    parse_url/2,
     in_cidr/2,
     in_any_cidr/2
 ]).
@@ -54,7 +58,25 @@
     reason_connection := binary()
 }.
 
--export_type([policy/0]).
+%% The subset classify_ip/2 actually reads: just the infra denylists. A full
+%% policy() satisfies it, and a backend that only classifies addresses (ldap)
+%% can pass a denylist-only map without dummy scheme/reason keys.
+-type cidr_policy() :: #{
+    denied_v4 := [{tuple(), non_neg_integer()}],
+    denied_v6 := [{tuple(), non_neg_integer()}],
+    _ => _
+}.
+
+%% Options for parse_url/2: the scheme allowlist (same key name as policy())
+%% plus whether a pre-existing query string or #fragment is rejected. Defaults
+%% reject both.
+-type url_opts() :: #{
+    allowed_schemes := [string()],
+    query => allow | reject,
+    fragment => allow | reject
+}.
+
+-export_type([policy/0, cidr_policy/0, url_opts/0]).
 
 %%--------------------------------------------------------------------
 %% Pure phase: scheme allowlist + literal-IP classification
@@ -85,11 +107,52 @@ classify_address(#{host := Host}, Policy) ->
         {error, _} -> allow
     end.
 
+%% Parse and minimally validate a URL against Opts, returning a normalized map
+%% the probe and the SSRF guard share. Always rejects a non-allowlisted scheme,
+%% an empty host, userinfo (embedded credentials httpc would turn into an
+%% Authorization header), and an out-of-range port (else httpc crashes at
+%% request time). A pre-existing query string or #fragment is rejected unless
+%% Opts opts in (default reject), because a caller that appends its own path or
+%% query would otherwise produce an ambiguous or mangled URL.
+-spec parse_url(binary(), url_opts()) -> {ok, map()} | {error, bad_url}.
+parse_url(Bin, Opts) when is_binary(Bin) ->
+    Str = binary_to_list(Bin),
+    case uri_string:parse(Str) of
+        #{scheme := Scheme, host := Host} = Parsed when Host =/= [] ->
+            case lists:member(Scheme, maps:get(allowed_schemes, Opts)) of
+                false ->
+                    {error, bad_url};
+                true ->
+                    Port = maps:get(port, Parsed, undefined),
+                    QueryRejected =
+                        maps:get(query, Opts, reject) =:= reject andalso
+                            maps:is_key(query, Parsed) andalso
+                            maps:get(query, Parsed) =/= [],
+                    FragmentRejected =
+                        maps:get(fragment, Opts, reject) =:= reject andalso
+                            maps:is_key(fragment, Parsed) andalso
+                            maps:get(fragment, Parsed) =/= [],
+                    case Port of
+                        P when is_integer(P), (P < 1 orelse P > 65535) ->
+                            {error, bad_url};
+                        _ when QueryRejected orelse FragmentRejected ->
+                            {error, bad_url};
+                        _ ->
+                            case maps:is_key(userinfo, Parsed) of
+                                true -> {error, bad_url};
+                                false -> {ok, Parsed#{url_string => Str}}
+                            end
+                    end
+            end;
+        _ ->
+            {error, bad_url}
+    end.
+
 %% classify_ip/2: allow | deny for a parsed IP tuple. Denies the broker-infra
 %% ranges only. A v6 address that embeds a v4 address is unwrapped via the shared
 %% embedded_v4/1 and re-classified as v4, otherwise the v6 encoding smuggles a
 %% denied v4 address (e.g. 169.254.169.254) past the v4 denylist.
--spec classify_ip(tuple(), policy()) -> allow | deny.
+-spec classify_ip(tuple(), cidr_policy()) -> allow | deny.
 classify_ip({_, _, _, _, _, _, _, _} = V6, Policy) ->
     case embedded_v4(V6) of
         {ok, V4} ->
@@ -107,9 +170,9 @@ classify_ip({_, _, _, _} = V4, Policy) ->
     end.
 
 %% embedded_v4/1: for the IPv6 notations that carry a v4 address, return
-%% {ok, V4Tuple}; otherwise `none'. Policy-independent unwrapping shared with
-%% the LDAP SSRF classifier (aws_auth_validate_ldap:is_private_ip6/1) so both
-%% classifiers decode the same encodings from one place. Covered: IPv4-mapped
+%% {ok, V4Tuple}; otherwise `none'. Policy-independent unwrapping used by
+%% classify_ip/2 (which all three backends share) so every classifier decodes
+%% the same encodings from one place. Covered: IPv4-mapped
 %% ::ffff:a.b.c.d, IPv4-compatible ::a.b.c.d, NAT64 64:ff9b::/96, 6to4 2002::/16.
 %% The unspecified :: and loopback ::1 are deliberately NOT unwrapped -- they
 %% must be classified as v6 (::1 is v6 loopback, not v4 0.0.0.1).

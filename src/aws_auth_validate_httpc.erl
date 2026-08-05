@@ -9,7 +9,8 @@
 %% This machinery exists ONLY because httpc pools TLS sessions on a global,
 %% named-profile basis: the shared default profile would let a prior request's
 %% authenticated (e.g. mTLS) session be reused by a later request -- a false
-%% success and a cross-request connection leak (R3 violation). Each in-flight
+%% success and a cross-request connection leak (violating the zero-side-effects
+%% invariant that each validation uses only ephemeral connections). Each in-flight
 %% probe therefore OWNS a distinct started profile drawn from a FIXED pool of
 %% ?PROFILE_POOL_SIZE interned atoms (a fresh atom per request would leak the
 %% atom table). A slot is claimed only by successfully starting it, so two

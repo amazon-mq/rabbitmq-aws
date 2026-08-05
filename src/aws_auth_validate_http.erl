@@ -40,11 +40,12 @@
 %% well-formed deny still proves the endpoint speaks the auth protocol.
 %%
 %% A future credentialed-probe mode (assert user_path returns `allow' for a
-%% supplied username + password_arn) is intentionally out of scope here; see
-%% http-validation-analysis.md, open question 1.
+%% supplied username + password_arn) is intentionally out of scope for this
+%% initial reachability-only implementation.
 %%
 %% Category mapping (reuses the existing aws_auth_validate_backend categories;
-%% no new category is introduced, per R4 "keep the set small"):
+%% no new category is introduced -- the fixed set is kept small so responses
+%% cannot be used for SSRF reconnaissance or information disclosure):
 %%   * connection_failed (400) -- host unreachable / DNS / connection refused.
 %%   * tls_failed        (400) -- TLS handshake / cert verification failure.
 %%   * auth_failed       (422) -- reached the server but its response is not
@@ -120,8 +121,7 @@
 %% mutual TLS (the broker's auth_http.ssl_options.certfile / .keyfile). The
 %% cert is typically an S3-hosted PEM; the key a Secrets Manager PEM. Both are
 %% resolved like cacertfile_arn and decoded into in-memory ssl {cert,_}/{key,_}
-%% options so an mTLS auth server (which the RabbitMqHttpSampleStack requires)
-%% can be validated.
+%% options so an mTLS auth server can be validated.
 -define(SSL_OPTION_KEYS, [
     <<"cacertfile_arn">>,
     <<"certfile_arn">>,
@@ -132,7 +132,8 @@
     <<"sni">>,
     <<"hostname_verification">>
 ]).
-%% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
+%% Fixed, hardcoded reason strings -- never echo a URL, host, or raw error,
+%% so the endpoint cannot be used for SSRF reconnaissance.
 -define(REASON_BAD_PATHS, <<"at least user_path must be a non-empty URL string">>).
 -define(REASON_BAD_PATH_VALUE, <<"each path must be a non-empty URL string">>).
 -define(REASON_BAD_URL, <<"a configured path is not a valid http(s) URL">>).
@@ -210,7 +211,7 @@
 %% Per-backend surface passed to the shared aws_auth_validate_ssl helpers: which
 %% ssl_options keys reference an ARN, the full allowed-key set, the customer SNI
 %% key spelling, whether the mTLS client-cert pair is accepted, and this
-%% backend's fixed R4 reason strings (kept here so wording/tests are unchanged).
+%% backend's fixed reason strings (kept here so wording/tests are unchanged).
 ssl_opts() ->
     #{
         arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
@@ -365,44 +366,14 @@ collect_paths([Key | Rest], Body, Acc, Paths) ->
             {error, input_invalid, ?REASON_BAD_PATH_VALUE}
     end.
 
-%% Parse + minimally validate an http(s) URL. Returns a normalized
-%% representation the probe and the SSRF guard can both use. Kept deliberately
-%% small here; richer parsing belongs with the guard work.
+%% Parse + minimally validate an http(s) URL via the shared
+%% aws_auth_validate_net:parse_url/2. The broker's auth_http.*_path config is
+%% query- and fragment-less and the probe appends its own ?username= params, so
+%% a pre-existing query (double-? mangling) or #fragment (probe's query dropped
+%% after the fragment) is rejected -- both are the parser's default. userinfo and
+%% out-of-range ports are always rejected.
 parse_url(Bin) when is_binary(Bin) ->
-    Str = binary_to_list(Bin),
-    case uri_string:parse(Str) of
-        #{scheme := Scheme, host := Host} = Parsed when
-            Host =/= [], (Scheme =:= "http" orelse Scheme =:= "https")
-        ->
-            %% Reject, as off-shape *_path input:
-            %%  * an out-of-range port (else httpc crashes at request time),
-            %%  * userinfo (user:pass@host) -- embedded credentials httpc would
-            %%    turn into an Authorization header,
-            %%  * a pre-existing query string OR a #fragment -- the broker's
-            %%    auth_http.*_path config is query- and fragment-less and the
-            %%    probe appends its own ?username= params. A path that already
-            %%    carried a query would be mangled into a double-? URL; a path
-            %%    with a fragment would have the probe's ?query appended AFTER
-            %%    the fragment, so httpc drops the query (fragments are not sent)
-            %%    and the probe misfires. Either way it would spuriously fail.
-            Port = maps:get(port, Parsed, undefined),
-            HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
-            HasFragment =
-                maps:is_key(fragment, Parsed) andalso maps:get(fragment, Parsed) =/= [],
-            case Port of
-                P when is_integer(P), (P < 1 orelse P > 65535) ->
-                    {error, bad_url};
-                _ when HasQuery orelse HasFragment ->
-                    {error, bad_url};
-                _ ->
-                    case maps:is_key(userinfo, Parsed) of
-                        true -> {error, bad_url};
-                        false -> {ok, Parsed#{url_string => Str}}
-                    end
-            end;
-        _ ->
-            {error, bad_url}
-    end.
+    aws_auth_validate_net:parse_url(Bin, #{allowed_schemes => ?ALLOWED_SCHEMES}).
 
 parse_http_method(Body, Acc) ->
     case maps:get(<<"http_method">>, Body, undefined) of
@@ -505,16 +476,18 @@ pin_url(Url, Host) -> aws_auth_validate_net:pin_url(Url, Host).
 %% auth protocol). Only a body matching NEITHER is a failure.
 %%
 %% The whole probe runs inside a try/catch that collapses any raise to
-%% connection_failed, so a resolved secret can never reach a crash report (R6).
+%% connection_failed, so a resolved secret can never reach a crash report.
 %%
 %% All probe requests for THIS validation run on a dedicated, ephemeral httpc
 %% profile that is started here and stopped in the `after' clause. This isolates
 %% each validation's TLS sessions/connections: the shared default profile pools
 %% TLS sessions, so a prior request's authenticated (e.g. mTLS) session could be
 %% reused by a later request -- producing a false success for a config that
-%% would not connect on its own (and a leaked connection across requests, an R3
-%% violation). A fresh profile has no sessions to reuse, and stopping it tears
-%% down anything opened, so each validation is hermetic.
+%% would not connect on its own (and a leaked connection across requests, which
+%% violates the zero-side-effects invariant: each validation must use only
+%% ephemeral connections and never mutate shared state). A fresh profile has no
+%% sessions to reuse, and stopping it tears down anything opened, so each
+%% validation is hermetic.
 do_http_validate(Params) ->
     case aws_auth_validate_httpc:claim_probe_profile(?PROFILE_PREFIX) of
         none ->
@@ -589,7 +562,8 @@ probe_one(Key, Url, #{http_method := Method, timeout := Timeout}, SslOpts, Profi
 
 %% Map an httpc transport error to a fixed category (shared classifier). A
 %% TLS/cert failure -> tls_failed; everything else -> connection_failed. The raw
-%% reason is never echoed (R4).
+%% reason is never echoed -- responses carry only fixed categories and hardcoded
+%% strings to prevent information disclosure.
 classify_http_error(Reason) ->
     aws_auth_validate_ssl:classify_http_error(
         Reason, ?REASON_TLS_HANDSHAKE, ?REASON_CONNECTION
@@ -661,9 +635,10 @@ is_keyword_prefix(Keyword, Resp) ->
 
 %% Build the httpc Request tuple for the configured method. For GET the query
 %% goes in the URL; for POST it is a form-encoded body, matching
-%% rabbit_auth_backend_http's request shape (R12 request-shape parity). The
-%% Host header carries the ORIGINAL hostname (the URL host is the pinned IP), so
-%% the auth server sees the name it expects -- needed for name-based vhosts.
+%% rabbit_auth_backend_http's request shape so the endpoint's decision matches
+%% the live broker's for the same inputs. The Host header carries the ORIGINAL
+%% hostname (the URL host is the pinned IP), so the auth server sees the name it
+%% expects -- needed for name-based vhosts.
 build_request(get, UrlStr, Query, Host) ->
     Sep =
         case Query of
@@ -758,29 +733,22 @@ build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% instance role. Default to `none' (never a usable state) if the key is
     %% somehow absent, preserving the fail-closed contract.
     State = maps:get(aws_state, Params, none),
-    case
-        aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)
-    of
+    %% Resolves the CA bundle and the mTLS pair together so a response can name
+    %% every ARN field that failed, not just the first.
+    case aws_auth_validate_ssl:resolve_ssl_material(Map, State) of
         {error, _, _} = Err ->
             Err;
-        {ok, CacertOpts} ->
-            case aws_auth_validate_ssl:resolve_client_cert(Map, State) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, ClientOpts} ->
-                    Opts =
-                        CacertOpts ++ ClientOpts ++
-                            aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
-                    %% Whether the caller set verify explicitly governs the
-                    %% no-trust-anchor policy (fail vs silent default).
-                    VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    %% Mirror rabbit_auth_backend_http: the RFC 6125 https match
-                    %% fun is applied ONLY when ssl_hostname_verification =
-                    %% wildcard; unset is strict OTP matching. Defaulting to
-                    %% wildcard here would pass a cert the live broker rejects.
-                    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
-                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
-            end
+        {ok, MaterialOpts} ->
+            Opts = MaterialOpts ++ aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
+            %% Whether the caller set verify explicitly governs the
+            %% no-trust-anchor policy (fail vs silent default).
+            VerifyExplicit = maps:is_key(<<"verify">>, Map),
+            %% Mirror rabbit_auth_backend_http: the RFC 6125 https match
+            %% fun is applied ONLY when ssl_hostname_verification =
+            %% wildcard; unset is strict OTP matching. Defaulting to
+            %% wildcard here would pass a cert the live broker rejects.
+            HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
+            aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
     end.
 
 connection_timeout_ms() ->

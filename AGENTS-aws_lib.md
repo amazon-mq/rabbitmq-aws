@@ -40,19 +40,18 @@ Checked in order by `aws_lib_config:credentials/1`:
 
 ### HTTP Client
 
-Uses Gun (HTTP/1.1 and HTTP/2). Two usage patterns:
-- **One-shot:** `request/6-8` opens connection, makes request, closes connection
-- **Pooled:** `open_connection/2` + `direct_request/7` + `close_connection/1`
+Uses Gun (HTTP/1.1 and HTTP/2). One-shot request lifecycle:
+- `request/6-8` opens connection, makes request, closes connection
 
 ### Retry Logic
 
-`api_get_request/3` and `api_post_request/5` retry up to 5 times with a fixed 500ms delay between attempts. Credentials are validated before the first attempt and re-validated before each retry. If credentials cannot be loaded, returns `{error, {credentials, Reason}}` immediately without retrying.
+`api_get_request/3` and `api_post_request/5` retry up to 5 times, sleeping between attempts for an equal-jitter exponential backoff interval: `Temp = min(10000, 500 * 2^Attempt)` ms, then a random delay in `[Temp/2, Temp]`. The delay is skipped after the final attempt, so a fully exhausted request waits at most 7.5s in total. Credentials are validated before the first attempt and re-validated before each retry. If credentials cannot be loaded, returns `{error, {credentials, Reason}}` immediately without retrying.
 
 ## Modules
 
 | Module | Purpose |
 |--------|---------|
-| `aws_lib` | Main API: state management, request lifecycle, retries, connection pooling, EBS volume discovery |
+| `aws_lib` | Main API: state management, request lifecycle, retries, EBS volume discovery |
 | `aws_lib_config` | Credential/region loading from env, files, and IMDS; INI parsing; IMDSv2 token management |
 | `aws_lib_sign` | AWS Signature Version 4: canonical request, signing key derivation, authorization header |
 | `aws_lib_ops` | Higher-level EC2 operations: create/delete EBS snapshots |
@@ -102,7 +101,7 @@ make t=aws_lib_tests eunit
 
 ## Configuration
 
-Application env `aws_prefer_imdsv2` (default: `true`) controls whether IMDSv2 is attempted before IMDSv1. Also exposed via Cuttlefish schema at `priv/schema/aws_lib.schema` as `aws.prefer_imdsv2` for RabbitMQ integration.
+Application env `aws_prefer_imdsv2` (default: `true`) controls whether IMDSv2 is attempted before IMDSv1. Also exposed via Cuttlefish schema at `priv/schema/aws.schema` as `aws.arns.prefer_imdsv2` for RabbitMQ integration (the bare `aws.prefer_imdsv2` key belongs to the `rabbitmq_aws` library).
 
 ## Known Issues
 

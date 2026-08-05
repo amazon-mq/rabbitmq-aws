@@ -91,6 +91,22 @@ issuer_with_query_rejected_test() ->
     Body = #{<<"issuer">> => <<"https://idp.example.com?foo=bar">>},
     ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:parse_input(Body)).
 
+%% A jwks_uri with a #fragment is ACCEPTED: the URL is fetched verbatim (httpc
+%% drops the fragment on the wire), so rejecting it would refuse a config the
+%% broker accepts. Pins the oauth backend's fragment-permissive behavior against
+%% the shared parser, whose default is to reject fragments (as http requires).
+jwks_uri_with_fragment_allowed_test() ->
+    Body = #{<<"jwks_uri">> => <<"https://idp.example.com/jwks#kid">>},
+    ?assertMatch({ok, #{jwks_uri := #{}}}, aws_auth_validate_oauth:parse_input(Body)).
+
+%% An issuer with a #fragment is REJECTED, unlike jwks_uri: OIDC discovery appends
+%% the well-known path to the issuer, which would land AFTER the '#' (httpc then
+%% drops it), so the discovery URL would be mangled exactly as a pre-existing
+%% query string mangles it.
+issuer_with_fragment_rejected_test() ->
+    Body = #{<<"issuer">> => <<"https://idp.example.com#frag">>},
+    ?assertMatch({error, input_invalid, _}, aws_auth_validate_oauth:parse_input(Body)).
+
 %% A URL with an out-of-range port (0) is rejected.
 url_port_zero_rejected_test() ->
     Body = #{<<"jwks_uri">> => <<"https://idp.example.com:0/jwks">>},
@@ -403,7 +419,7 @@ oidc_discovery_jwks_uri_ssrf_denied_test_() ->
     end}.
 
 %%--------------------------------------------------------------------
-%% R6: no secret leakage in error results
+%% No secret leakage in error results
 %%--------------------------------------------------------------------
 
 %% A network-phase error must never include resolved secret material.
@@ -830,7 +846,7 @@ access_token_end_to_end_expired_test_() ->
         [?_assertMatch({error, token_expired, _}, aws_auth_validate_oauth:validate(Body))]
     end}.
 
-%% R6: a valid supplied token's claims must not leak into the rendered result.
+%% A valid supplied token's claims must not leak into the rendered result.
 access_token_no_leak_test_() ->
     {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
         #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
@@ -1035,48 +1051,83 @@ authz_iam_scope_alias_grants_access_test_() ->
 %% this test MUST be revisited: the assertion should flip from authz_unverified
 %% to ok, and the change landed together with the broker dependency bump.
 %%
-%% This matches the project's parity stance: document upstream behavior, pin
-%% against drift, and surface regressions as test failures the moment the
-%% dependency changes.
+%% CONTROL: the authz_unverified assertion alone does not isolate the dotted-key
+%% cause -- authz_no_effective_scopes_after_prefix_test_ asserts the identical
+%% category and message for a wrong-prefix token, so ANY unresolved
+%% additional_scopes_key looks the same. The paired control case sends the SAME
+%% scopes under a NON-dotted key and asserts it reaches ok, making the dot the
+%% only variable: if the control ever stops granting, the breakage is in
+%% additional_scopes_key resolution generally, not in the dotted-key split.
+%%
+%% DORMANCY: the pin only RUNS once the broker ships the arity-4 scope API
+%% (resource_access/4). On an older dep, HAVE_OAUTH2_RESOURCE_SERVER is undefined,
+%% available/0 is false, and maybe_skip_authz/1 returns [] -- the body never
+%% executes. So a green suite does NOT mean "still broken as expected"; it may
+%% mean the pin was skipped. Concretely, if upstream backports only the
+%% split_path fix to a dep series WITHOUT the arity-4 API, this pin stays dormant
+%% and the regression slips through here. The pin fires only on a series with the
+%% full arity-4 API; treat the parity-bump revisit as the real backstop.
+%%
+%% UNESCAPED STAYS UNRESOLVED: the #16947 fix does NOT make an unescaped dotted
+%% key resolve a flat claim -- it adds an ESCAPED form (\.) that does (see
+%% authz_escaped_dotted_additional_scopes_key_test_). So the DOTTED assertion
+%% below stays authz_unverified before AND after the fix; only the ESCAPED
+%% counterpart flips to ok. The CONTROL (non-dotted key) resolves in both worlds.
+%%
+%% FLIP SHAPE: the control scope value below is deliberately `rabbitmq.'-prefixed.
+%% extract_scope_list_from_token_value/2 takes a LIST value VERBATIM (only a map
+%% value keyed by resource_server_id is prefix-injected), so after the scope_prefix
+%% "rabbitmq." strip this yields write:*/* and the control reaches ok. An unprefixed
+%% value would be filtered to [] by the strip and never grant.
+%%
+%% This matches the project's parity stance: document upstream behavior and pin
+%% against drift, surfacing regressions as test failures once the dep ships the
+%% arity-4 API.
 %% -------------------------------------------------------------------
 authz_dotted_additional_scopes_key_parity_pin_test_() ->
     {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
         maybe_skip_authz(fun() ->
             #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
-            %% Token carries scopes under a dotted claim key (OIDC/STS-style URI).
-            %% split_path/1 will incorrectly split this on dots, breaking resolution.
-            Token = Sign(#{
-                <<"exp">> => future(),
-                <<"aud">> => <<"rabbitmq">>,
-                <<"https://sts.amazonaws.com/tags">> => [
-                    <<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>
-                ]
-            }),
             JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
             mock_httpc_response(200, JwksBody),
-            Body = (jwks_body())#{
-                <<"access_token">> => Token,
-                <<"resource_server_id">> => <<"rabbitmq">>,
-                <<"scope_prefix">> => <<"rabbitmq.">>,
-                %% Point additional_scopes_key at the dotted claim.
-                <<"additional_scopes_key">> => <<"https://sts.amazonaws.com/tags">>,
-                <<"authz_check">> => #{
-                    <<"resource">> => <<"my-queue">>,
-                    <<"permission">> => <<"write">>
-                }
-            },
-            Result = aws_auth_validate_oauth:validate(Body),
+            %% Same scopes, same everything: only the claim KEY differs between the
+            %% two cases, so the dotted key is the sole variable.
+            Scopes = [<<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>],
+            Validate = fun(ClaimKey) ->
+                Token = Sign(#{
+                    <<"exp">> => future(),
+                    <<"aud">> => <<"rabbitmq">>,
+                    ClaimKey => Scopes
+                }),
+                aws_auth_validate_oauth:validate((jwks_body())#{
+                    <<"access_token">> => Token,
+                    <<"resource_server_id">> => <<"rabbitmq">>,
+                    <<"scope_prefix">> => <<"rabbitmq.">>,
+                    <<"additional_scopes_key">> => ClaimKey,
+                    <<"authz_check">> => #{
+                        <<"resource">> => <<"my-queue">>,
+                        <<"permission">> => <<"write">>
+                    }
+                })
+            end,
+            Dotted = Validate(<<"https://sts.amazonaws.com/tags">>),
+            Control = Validate(<<"tags">>),
             [
-                %% An UNESCAPED dotted key is split into a nested path
+                %% An UNESCAPED dotted key is split on dots into a nested path
                 %% (["https://sts","amazonaws","com/tags"]) and never resolves the
-                %% flat claim -- authz_unverified. This is the intended behavior BOTH
-                %% before and after the #16947 fix: the fix does not make unescaped
-                %% dots resolve a flat key; it adds an ESCAPED form (\.) that does.
-                %% See authz_escaped_dotted_additional_scopes_key_test_ for the
-                %% escaped counterpart that resolves. If this ever flips to ok, an
-                %% upstream change altered unescaped-dot semantics -- revisit both.
-                ?_assertMatch({error, authz_unverified, _}, Result),
-                ?_assert(reason_contains(Result, "no scopes for this resource_server"))
+                %% flat claim -> authz_unverified. This stays true BOTH before and
+                %% after the #16947 fix: the fix does not make unescaped dots resolve
+                %% a flat key; it adds an ESCAPED form (\.) that does. See
+                %% authz_escaped_dotted_additional_scopes_key_test_ for the escaped
+                %% counterpart that flips to ok.
+                ?_assertMatch({error, authz_unverified, _}, Dotted),
+                ?_assert(reason_contains(Dotted, "no scopes for this resource_server")),
+                %% CONTROL: the identical scopes under a NON-dotted key DO resolve and
+                %% grant. Without this, the pin cannot tell the dotted-key mis-split
+                %% from any other no-effective-scopes cause (a renamed claim, a dropped
+                %% additional_scopes_key feature), since every such case yields the same
+                %% category and message as authz_no_effective_scopes_after_prefix_test_.
+                ?_assertEqual(ok, Control)
             ]
         end)
     end}.

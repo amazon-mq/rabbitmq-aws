@@ -41,7 +41,7 @@
 %%
 %% This reuses the broker's own crypto library (jose) so the signature decision
 %% matches what rabbit_auth_backend_oauth2 would compute -- a decision-parity
-%% claim analogous to the LDAP backend's, scoped to signature + exp/nbf/aud.
+%% claim analogous to the LDAP backend's, scoped to signature + exp/aud.
 %% Scope authorization CAN now be checked via the optional `authz_check' block
 %% (delegated to aws_auth_validate_oauth_authz when the arity-4 scope API is
 %% available); see allowed_fields/0 for the full authz field set. Note: not all
@@ -71,12 +71,15 @@
 %%                               verification, or no fetched JWKS key matched its
 %%                               kid. A REAL config mismatch: the JWKS the broker
 %%                               fetches would also reject live tokens.
-%%   * token_expired    (422) -- a supplied access_token is expired (exp) or not
-%%                               yet valid (nbf). TRANSIENT, not a config bug --
-%%                               re-mint the token and retry.
+%%   * token_expired    (422) -- a supplied access_token is expired (exp).
+%%                               TRANSIENT, not a config bug -- re-mint the token
+%%                               and retry. A post-dated token is NOT reported
+%%                               here: nbf is deliberately not checked (see
+%%                               check_token_expiry/1).
 %%   token_invalid / token_expired are safe to distinguish (unlike the coarse
 %%   reachability categories) because they describe the caller's own token, not
-%%   the broker's infra or an SSRF target, so they leak nothing R4 guards.
+%%   the broker's infra or an SSRF target, so they disclose nothing the
+%%   fixed-category rule guards against (SSRF reconnaissance / info disclosure).
 -module(aws_auth_validate_oauth).
 
 -behaviour(aws_auth_validate_backend).
@@ -142,7 +145,8 @@
     <<"hostname_verification">>
 ]).
 
-%% Fixed, hardcoded reason strings (R4): no URL, host, or raw error echoed.
+%% Fixed, hardcoded reason strings -- never echo a URL, host, or raw error,
+%% so the endpoint cannot be used for SSRF reconnaissance.
 -define(REASON_MISSING_URL, <<"at least one of jwks_uri or issuer must be present">>).
 -define(REASON_BAD_URL, <<"a configured URL is not a valid https URL">>).
 -define(REASON_URL_NOT_ALLOWED, <<"a configured URL targets a disallowed address">>).
@@ -170,8 +174,8 @@
 -define(REASON_ENDPOINT, <<"endpoint did not return a valid JWKS document">>).
 -define(REASON_DISCOVERY, <<"issuer discovery did not return a valid OpenID configuration">>).
 %% Customer-supplied access-token verification (optional, activates when
-%% access_token is present). Fixed R4 reasons: no token content, claim value,
-%% or key material echoed. Pure-phase shape problems are input_invalid (400);
+%% access_token is present). Fixed reason strings: no token content, claim value,
+%% or key material is ever echoed. Pure-phase shape problems are input_invalid (400);
 %% verification outcomes use the token_invalid / token_expired categories (422)
 %% so an operator can tell a real config mismatch (token_invalid: bad signature
 %% or no matching JWKS key -- the broker will reject live tokens) from a
@@ -256,7 +260,7 @@
 
 %% Per-backend surface passed to the shared aws_auth_validate_ssl helpers.
 %% Identical shape to the HTTP backend's (both accept the mTLS pair and use the
-%% <<"sni">> key); only this backend's fixed R4 reason strings differ, kept here.
+%% <<"sni">> key); only this backend's fixed reason strings differ, kept here.
 ssl_opts() ->
     #{
         arn_keys => [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
@@ -307,7 +311,7 @@ allowed_fields() ->
         <<"resource_server_id">>,
         <<"ssl_options">>,
         %% Optional customer-supplied access token. Present access_token
-        %% activates signature + exp/nbf/aud verification against the fetched
+        %% activates signature + exp/aud verification against the fetched
         %% JWKS. Carries no secret (the customer minted it out of band).
         <<"access_token">>,
         %% Optional authorization-evaluation layer: the customer's
@@ -433,38 +437,22 @@ parse_optional_url(V, QueryPolicy) when is_binary(V), byte_size(V) > 0 ->
 parse_optional_url(_, _QueryPolicy) ->
     {error, bad_url}.
 
-%% Parse + validate an https URL. Returns a normalized representation the probe
-%% and the SSRF guard can both use. QueryPolicy: reject_query bars a pre-existing
-%% query string (the caller appends a path, so a query would be ambiguous);
-%% allow_query permits it (the URL is fetched verbatim). userinfo and
-%% out-of-range ports are always rejected.
+%% Parse + validate an https URL via the shared aws_auth_validate_net:parse_url/2.
+%% QueryPolicy reflects this backend's two cases and governs a pre-existing query
+%% string AND a #fragment identically, because both fail for the same reason:
+%% reject_query (issuer) has the well-known path appended, so a query or fragment
+%% would be mangled (the path lands after the '#' and httpc drops it), whereas
+%% allow_query (jwks_uri) is fetched verbatim, so a query or an httpc-dropped
+%% fragment is harmless. userinfo and out-of-range ports are always rejected.
 parse_url(Bin, QueryPolicy) when is_binary(Bin) ->
-    Str = binary_to_list(Bin),
-    case uri_string:parse(Str) of
-        #{scheme := Scheme, host := Host} = Parsed when
-            Host =/= [], Scheme =:= "https"
-        ->
-            %% Reject:
-            %%   * out-of-range port (else httpc crashes at request time)
-            %%   * userinfo (embedded credentials)
-            %%   * a pre-existing query string, only under reject_query
-            Port = maps:get(port, Parsed, undefined),
-            HasQuery = maps:is_key(query, Parsed) andalso maps:get(query, Parsed) =/= [],
-            QueryRejected = HasQuery andalso QueryPolicy =:= reject_query,
-            case Port of
-                P when is_integer(P), (P < 1 orelse P > 65535) ->
-                    {error, bad_url};
-                _ when QueryRejected ->
-                    {error, bad_url};
-                _ ->
-                    case maps:is_key(userinfo, Parsed) of
-                        true -> {error, bad_url};
-                        false -> {ok, Parsed#{url_string => Str}}
-                    end
-            end;
-        _ ->
-            {error, bad_url}
-    end.
+    aws_auth_validate_net:parse_url(Bin, #{
+        allowed_schemes => ?ALLOWED_SCHEMES,
+        query => query_opt(QueryPolicy),
+        fragment => query_opt(QueryPolicy)
+    }).
+
+query_opt(allow_query) -> allow;
+query_opt(reject_query) -> reject.
 
 parse_resource_server_id(Body, Acc) ->
     case maps:get(<<"resource_server_id">>, Body, undefined) of
@@ -755,8 +743,9 @@ in_cidr(IP, Cidr) -> aws_auth_validate_net:in_cidr(IP, Cidr).
 %%--------------------------------------------------------------------
 %%
 %% The whole network section runs inside a try/catch collapsing any raise to
-%% connection_failed, so a resolved secret can never reach a crash report (R6).
-%% All probe requests run on a dedicated ephemeral httpc profile (R3).
+%% connection_failed, so a resolved secret can never reach a crash report.
+%% All probe requests run on a dedicated ephemeral httpc profile (zero side
+%% effects -- each validation uses only ephemeral connections).
 
 do_oauth_validate(Params) ->
     case aws_auth_validate_httpc:claim_probe_profile(?PROFILE_PREFIX) of
@@ -834,11 +823,12 @@ maybe_verify_token(#{token := #{raw := Raw, header := Header}} = Params, Keys) -
 %%   4. if a resource_server_id was supplied, require it in the token `aud'
 %%      (unless the broker's verify_aud is disabled).
 %% Failures map to fixed categories (no claim value, key material, or token
-%% content echoed -- R6): a bad signature or no matching JWKS key -> token_invalid
-%% (a real config mismatch the broker would also reject); an expired token ->
-%% token_expired (transient, just re-mint); an audience mismatch stays
-%% auth_failed. verify_token/3 takes the pre-decoded header so the -ifdef(TEST)
-%% export can exercise it directly.
+%% content is ever echoed -- a resolved secret must never reach a response or
+%% log): a bad signature or no matching JWKS key -> token_invalid (a real config
+%% mismatch the broker would also reject); an expired token -> token_expired
+%% (transient, just re-mint); an audience mismatch stays auth_failed.
+%% verify_token/3 takes the pre-decoded header so the -ifdef(TEST) export can
+%% exercise it directly.
 -ifdef(TEST).
 %% Test-only wrapper preserving the historical verify_token/3 contract (returns
 %% `ok' on success). Production code calls verify_token_claims/3 directly (it
@@ -899,7 +889,8 @@ select_jwk(Kid, Keys) when is_binary(Kid) ->
 %% jose_jwt:verify_strict/3 refuses any token whose alg is not the allowed one,
 %% and jose_jwk:from_map/1 builds the public key from the JWKS entry. Any raise
 %% (malformed key material, unsupported curve) is caught and treated as a
-%% signature failure -- never a crash report (R6). Returns the decoded claims.
+%% signature failure -- never a crash report, so key material cannot leak.
+%% Returns the decoded claims.
 verify_signature(Alg, JwkMap, Raw) ->
     try
         JWK = jose_jwk:from_map(JwkMap),
@@ -1150,7 +1141,8 @@ strip_trailing_slash(S) ->
 %%--------------------------------------------------------------------
 
 %% Shared classifier: TLS/cert failure -> tls_failed, else connection_failed.
-%% The raw reason is never echoed (R4).
+%% The raw reason is never echoed -- responses carry only fixed categories to
+%% prevent SSRF reconnaissance.
 classify_http_error(Reason) ->
     aws_auth_validate_ssl:classify_http_error(
         Reason, ?REASON_TLS_HANDSHAKE, ?REASON_CONNECTION
@@ -1184,27 +1176,20 @@ build_client_ssl_opts(#{ssl_options := Map} = Params) ->
     %% every ARN fetch here. A request that references no ARN carries a default
     %% state that is never used to resolve one.
     State = maps:get(aws_state, Params, none),
-    case
-        aws_auth_validate_ssl:resolve_cacerts(maps:get(<<"cacertfile_arn">>, Map, undefined), State)
-    of
+    %% Resolves the CA bundle and the mTLS pair together so a response can name
+    %% every ARN field that failed, not just the first.
+    case aws_auth_validate_ssl:resolve_ssl_material(Map, State) of
         {error, _, _} = Err ->
             Err;
-        {ok, CacertOpts} ->
-            case aws_auth_validate_ssl:resolve_client_cert(Map, State) of
-                {error, _, _} = Err ->
-                    Err;
-                {ok, ClientOpts} ->
-                    Opts =
-                        CacertOpts ++ ClientOpts ++
-                            aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
-                    VerifyExplicit = maps:is_key(<<"verify">>, Map),
-                    %% Mirror oauth2_client: hostname_verification defaults to
-                    %% none (strict); the RFC 6125 https match fun is applied only
-                    %% on wildcard. Defaulting to wildcard would pass an IdP cert
-                    %% the live broker rejects.
-                    HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
-                    aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
-            end
+        {ok, MaterialOpts} ->
+            Opts = MaterialOpts ++ aws_auth_validate_ssl:translate_ssl_opts(Map, <<"sni">>),
+            VerifyExplicit = maps:is_key(<<"verify">>, Map),
+            %% Mirror oauth2_client: hostname_verification defaults to
+            %% none (strict); the RFC 6125 https match fun is applied only
+            %% on wildcard. Defaulting to wildcard would pass an IdP cert
+            %% the live broker rejects.
+            HostnameCheck = aws_auth_validate_ssl:hostname_check_mode(Map),
+            aws_auth_validate_ssl:apply_verify_default(Opts, VerifyExplicit, HostnameCheck)
     end.
 
 connection_timeout_ms() ->

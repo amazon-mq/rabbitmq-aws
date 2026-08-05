@@ -31,7 +31,7 @@
 -include_lib("eunit/include/eunit.hrl").
 
 %% Directory layout we seed (mirrors the backend dep's base DN so the
-%% R12 parity comparison is against a realistic tree).
+%% decision-parity comparison is against a realistic tree).
 -define(BASE_DN, "dc=rabbitmq,dc=com").
 -define(ADMIN_DN, "cn=admin,dc=rabbitmq,dc=com").
 -define(ADMIN_PW, "admin").
@@ -356,7 +356,7 @@ username_runtime_placeholder_degrades_returns_ok(Config) ->
     },
     ?assertEqual(ok, validate(Config, Body)).
 
-%% R11/R12 membership parity: the endpoint's in_group decision for a resolved
+%% Membership decision parity: the endpoint's in_group decision for a resolved
 %% principal must match a direct eldap equalityMatch(member, userDN) search --
 %% the same primitive rabbit_auth_backend_ldap:in_group/3 runs. Check both the
 %% positive (admins) and negative (others) group for alice.
@@ -419,7 +419,7 @@ direct_member(Port, GroupDn, UserDn) ->
     Result.
 
 %%--------------------------------------------------------------------
-%% R12: parity with the broker's bind path
+%% Decision parity with the broker's bind path
 %%--------------------------------------------------------------------
 
 %% For the same (server, port, DN, password), the endpoint's validate

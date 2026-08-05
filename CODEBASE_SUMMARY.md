@@ -146,7 +146,7 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 ### Supported Configuration Keys
 
 **Core Settings:**
-- `aws.prefer_imdsv2` - Prefer EC2 IMDSv2 for metadata (default: true)
+- `aws.arns.prefer_imdsv2` - Prefer EC2 IMDSv2 for metadata (default: true)
 - `aws.arns.assume_role_arn` - IAM role to assume before fetching resources
 
 **RabbitMQ Core SSL:**

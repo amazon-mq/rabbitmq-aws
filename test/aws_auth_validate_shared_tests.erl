@@ -183,9 +183,9 @@ hostname_check_mode_wildcard_test() ->
     ).
 
 %%--------------------------------------------------------------------
-%% aws_auth_validate_net: embedded_v4/1 shared unwrapper. The LDAP SSRF
-%% classifier (is_private_ip6/1) shares this helper, so its decoding must cover
-%% every v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.
+%% aws_auth_validate_net: embedded_v4/1 shared unwrapper. classify_ip/2 (shared
+%% by all three backends) uses this helper, so its decoding must cover every
+%% v4-carrying v6 notation and leave native v6 (::, ::1) unwrapped.
 %%--------------------------------------------------------------------
 
 embedded_v4_ipv4_mapped_test() ->
@@ -333,10 +333,10 @@ scheme_policy_divergence_test() ->
     ?assertEqual(ok, aws_auth_validate_oauth:url_allowed(HttpsUrl)).
 
 %%--------------------------------------------------------------------
-%% aws_auth_validate_ssl:apply_verify_default/2 (R7): verify_peer is never
-%% SILENTLY downgraded. This is the false-positive the whole endpoint exists to
-%% prevent -- an operator who wrote verify_peer must not be told "reachable" by a
-%% probe that quietly fell back to verify_none. These pin every branch of the
+%% aws_auth_validate_ssl:apply_verify_default/2: verify_peer is never SILENTLY
+%% downgraded to verify_none. An explicitly requested verify_peer with no trust
+%% anchor must FAIL rather than pass, because silently downgrading would report a
+%% config as certificate-verified when it is not. These pin every branch of the
 %% policy directly, deterministically, without needing a live TLS server (the
 %% http/oauth/tls SUITEs cover it end to end but skip when no server is present).
 %%
@@ -362,9 +362,8 @@ with_empty_os_store(Fun) ->
         end,
         fun(_) -> meck:unload(public_key) end, Fun}.
 
-%% LOAD-BEARING R7 assertion: an EXPLICIT verify_peer with no trust anchor MUST
-%% fail closed with tls_failed -- it must never be silently downgraded to
-%% verify_none.
+%% LOAD-BEARING assertion: an EXPLICIT verify_peer with no trust anchor MUST fail
+%% closed with tls_failed -- it must never be silently downgraded to verify_none.
 apply_verify_default_explicit_verify_peer_without_anchor_fails_test_() ->
     with_empty_os_store(fun() ->
         Result = aws_auth_validate_ssl:apply_verify_default([{verify, verify_peer}], true),

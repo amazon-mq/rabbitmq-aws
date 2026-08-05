@@ -69,14 +69,6 @@ RequestHeaders = [{"Content-Type", "application/x-amz-json-1.0"},
 | `aws_lib:api_get_request/3` | GET with automatic retries |
 | `aws_lib:api_post_request/5` | POST with automatic retries |
 
-### Connection Pooling
-
-| Function | Description |
-|----------|-------------|
-| `aws_lib:open_connection/2-3` | Open a reusable connection to a service |
-| `aws_lib:direct_request/7` | Make request on an existing connection |
-| `aws_lib:close_connection/1` | Close a connection |
-
 ### EC2 Operations
 
 | Function | Description |
@@ -116,7 +108,7 @@ By default, IMDSv2 (session-authenticated) is preferred. Falls back to IMDSv1 on
 [{aws_lib, [{aws_prefer_imdsv2, true}]}].  %% default
 ```
 
-Also available via Cuttlefish schema (`priv/schema/aws_lib.schema`) as `aws.prefer_imdsv2` for RabbitMQ plugin integration.
+Also available via Cuttlefish schema (`priv/schema/aws.schema`) as `aws.arns.prefer_imdsv2` for RabbitMQ plugin integration. The bare `aws.prefer_imdsv2` key is owned by the `rabbitmq_aws` library, so this plugin scopes its own setting under `aws.arns` to avoid a mapping collision.
 
 ## Build
 

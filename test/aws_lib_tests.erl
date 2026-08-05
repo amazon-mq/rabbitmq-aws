@@ -542,7 +542,16 @@ api_get_request_test_() ->
             %% endpoint_url/1, so it must be expected. No override: target the
             %% default AWS endpoint.
             meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
-            [gun, aws_lib_config]
+            %% Stub the inter-attempt backoff sleep. These cases exercise retry
+            %% BEHAVIOUR (error surfacing, retry re-entry), not delay timing --
+            %% the delay arithmetic is covered by backoff_delay/3's own tests.
+            %% With exponential backoff a full 5-retry exhaustion would sleep up
+            %% to ~15s of real time, past eunit's 5s per-test default, so these
+            %% cases would time out. Skipping the real sleep keeps them fast
+            %% without changing what they assert.
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
         end,
         fun(Mods) ->
             teardown(ok),
@@ -851,7 +860,13 @@ connection_reuse_across_retries_test_() ->
             %% endpoint_url/1, so it must be expected. No override: target the
             %% default AWS endpoint.
             meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
-            [gun, aws_lib_config]
+            %% Stub the inter-attempt backoff sleep so exhausting retries does
+            %% not sleep ~15s of real time and trip eunit's 5s per-test default.
+            %% These cases count gun:open calls across retries; the delay itself
+            %% is irrelevant here and is covered by backoff_delay/3's own tests.
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
         end,
         fun(Mods) ->
             teardown(ok),
@@ -1175,3 +1190,184 @@ expired_imdsv2_token_test_() ->
             ?assertEqual(true, aws_lib:expired_imdsv2_token(Imdsv2Token))
         end}
     ].
+
+%% ----------------------------------------------------------------------------
+%% backoff_delay/3 -- exponential backoff with equal jitter (issue #81)
+%% ----------------------------------------------------------------------------
+backoff_delay_test_() ->
+    [
+        {"attempt 0 with base 500 is in range [250, 500]", fun() ->
+            Results = [aws_lib:backoff_delay(0, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 250 andalso V =< 500)
+                end,
+                Results
+            )
+        end},
+        {"attempt 1 with base 500 is in range [500, 1000]", fun() ->
+            Results = [aws_lib:backoff_delay(1, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 500 andalso V =< 1000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 2 with base 500 is in range [1000, 2000]", fun() ->
+            Results = [aws_lib:backoff_delay(2, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 1000 andalso V =< 2000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 3 with base 500 is in range [2000, 4000]", fun() ->
+            Results = [aws_lib:backoff_delay(3, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 2000 andalso V =< 4000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 4 with base 500 is in range [4000, 8000]", fun() ->
+            Results = [aws_lib:backoff_delay(4, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 4000 andalso V =< 8000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 5 with base 500 is capped in range [5000, 10000]", fun() ->
+            Results = [aws_lib:backoff_delay(5, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 5000 andalso V =< 10000)
+                end,
+                Results
+            )
+        end},
+        {"attempt 10 is capped in range [5000, 10000]", fun() ->
+            Results = [aws_lib:backoff_delay(10, 500, 10000) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 5000 andalso V =< 10000)
+                end,
+                Results
+            )
+        end},
+        {"boundary: base=1 cap=1 does not crash", fun() ->
+            V = aws_lib:backoff_delay(0, 1, 1),
+            ?assert(V >= 1)
+        end},
+        {"boundary: base=0 cap=0 does not crash (returns >= 1 due to guard)", fun() ->
+            V = aws_lib:backoff_delay(0, 0, 0),
+            ?assert(V >= 1)
+        end},
+        {"statistical spread: jitter produces varying results", fun() ->
+            Results = [aws_lib:backoff_delay(2, 500, 10000) || _ <- lists:seq(1, 100)],
+            Unique = lists:usort(Results),
+            %% With 100 samples from a range of 1000 values, we expect more than
+            %% a single distinct value. If all are identical, jitter is broken.
+            ?assert(length(Unique) > 1)
+        end},
+        {"monotonic growth: average delay increases with attempt (up to cap)", fun() ->
+            Avg = fun(Attempt) ->
+                Vals = [aws_lib:backoff_delay(Attempt, 500, 10000) || _ <- lists:seq(1, 200)],
+                lists:sum(Vals) / length(Vals)
+            end,
+            Avg0 = Avg(0),
+            Avg1 = Avg(1),
+            Avg2 = Avg(2),
+            Avg3 = Avg(3),
+            ?assert(Avg1 >= Avg0),
+            ?assert(Avg2 >= Avg1),
+            ?assert(Avg3 >= Avg2)
+        end},
+        {"cap less than base clips delay to cap range", fun() ->
+            Results = [aws_lib:backoff_delay(0, 5000, 100) || _ <- lists:seq(1, 50)],
+            lists:foreach(
+                fun(V) ->
+                    ?assert(V >= 51 andalso V =< 100)
+                end,
+                Results
+            )
+        end}
+    ].
+
+%% The "no sleep before the exhaustion clause" behaviour that maybe_backoff/3
+%% used to provide now lives in aws_lib_retry:with_retries/3 (the loop was
+%% extracted in issue #85). It is covered end-to-end by
+%% backoff_between_attempts_only_test_/0 below (one fewer sleep than attempts;
+%% first-attempt success never sleeps) and at the unit level by
+%% aws_lib_retry_tests.
+
+%% ----------------------------------------------------------------------------
+%% Backoff is applied between attempts only (issue #81 review)
+%% ----------------------------------------------------------------------------
+backoff_between_attempts_only_test_() ->
+    {
+        foreach,
+        fun() ->
+            setup(),
+            meck:new(gun, []),
+            meck:new(aws_lib_config, []),
+            meck:expect(aws_lib_config, endpoint_url, fun(_) -> undefined end),
+            meck:new(timer, [passthrough, unstick]),
+            meck:expect(timer, sleep, fun(_) -> ok end),
+            [gun, aws_lib_config, timer]
+        end,
+        fun(Mods) ->
+            teardown(ok),
+            meck:unload(Mods)
+        end,
+        [
+            {"exhausting retries sleeps once fewer than it attempts", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                %% Every attempt fails with a retriable 500, so the whole retry
+                %% budget is consumed.
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 500, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) ->
+                    {ok, <<"{\"Error\": {\"Code\": \"InternalError\"}}">>}
+                end),
+
+                {error, {service_error, _}, _} = aws_lib:api_get_request("AWS", "API", State),
+                %% The sleep after the final attempt would delay the returned
+                %% error by a full backoff interval (up to ?BACKOFF_CAP_MILLIS)
+                %% without buying another attempt, so there must be exactly one
+                %% fewer sleep than attempt.
+                Attempts = meck:num_calls(gun, await, '_'),
+                ?assertEqual(?MAX_RETRIES, Attempts),
+                ?assertEqual(Attempts - 1, meck:num_calls(timer, sleep, '_'))
+            end},
+            {"a request that succeeds on the first attempt never sleeps", fun() ->
+                State0 = set_test_credentials("ExpiredKey", "ExpiredAccessKey", undefined, {
+                    {3016, 4, 1}, {12, 0, 0}
+                }),
+                {ok, State} = aws_lib:set_region("us-east-1", State0),
+                meck:expect(gun, open, fun(_, _, _) -> {ok, pid} end),
+                meck:expect(gun, close, fun(_) -> ok end),
+                meck:expect(gun, await_up, fun(_, _) -> {ok, protocol} end),
+                meck:expect(gun, get, fun(_Pid, _Path, _Headers) -> nofin end),
+                meck:expect(gun, await, fun(_Pid, _, _) ->
+                    {response, nofin, 200, [{<<"content-type">>, <<"application/json">>}]}
+                end),
+                meck:expect(gun, await_body, fun(_Pid, _, _) -> {ok, <<"{\"pass\": true}">>} end),
+
+                {ok, _, _} = aws_lib:api_get_request("AWS", "API", State),
+                ?assertEqual(0, meck:num_calls(timer, sleep, '_'))
+            end}
+        ]
+    }.
