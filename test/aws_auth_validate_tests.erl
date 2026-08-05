@@ -97,15 +97,12 @@ registry_field_filter_override_test_() ->
         fun() ->
             application:set_env(
                 aws,
-                {auth_validation_allowed_fields_override, <<"ldap">>},
-                [<<"servers">>, <<"port">>, <<"unknown">>]
+                auth_validation_allowed_fields_override,
+                [{<<"ldap">>, [<<"servers">>, <<"port">>, <<"unknown">>]}]
             )
         end,
         fun(_) ->
-            application:unset_env(
-                aws,
-                {auth_validation_allowed_fields_override, <<"ldap">>}
-            )
+            application:unset_env(aws, auth_validation_allowed_fields_override)
         end,
         [
             fun() ->

@@ -41,12 +41,24 @@ lookup_backend(<<"tls">>) ->
 lookup_backend(_) ->
     {error, unknown_method}.
 
+%% The override narrows a method's allowed fields; it can never widen them,
+%% because every entry is intersected with the backend's own list.
+%%
+%% Keyed the same way as auth_validation_enabled_methods below: a single atom
+%% key holding a [{Method, Fields}] list. application:get_env/2 requires an
+%% atom parameter name, so a per-method key cannot be a {atom(), binary()}
+%% tuple.
 -spec effective_allowed_fields(module(), binary()) -> [binary()].
 effective_allowed_fields(Module, Method) ->
     BaseFields = Module:allowed_fields(),
-    case application:get_env(aws, {auth_validation_allowed_fields_override, Method}) of
-        {ok, Override} when is_list(Override) ->
-            [F || F <- Override, lists:member(F, BaseFields)];
+    case application:get_env(aws, auth_validation_allowed_fields_override) of
+        {ok, Overrides} when is_list(Overrides) ->
+            case lists:keyfind(Method, 1, Overrides) of
+                {_, Override} when is_list(Override) ->
+                    [F || F <- Override, lists:member(F, BaseFields)];
+                _ ->
+                    BaseFields
+            end;
         _ ->
             BaseFields
     end.

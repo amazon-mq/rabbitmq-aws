@@ -381,13 +381,11 @@ ini_parse_line(Section, _, Line) ->
 
 -spec ini_parse_line_parts(
     Section :: list(),
-    Parts :: list()
+    Parts :: [string(), ...]
 ) ->
     {ok, list()} | {new_parent, atom()}.
 %% @doc Parse the AWS configuration INI file, returning a proplist
 %% @end
-ini_parse_line_parts(Section, []) ->
-    {ok, Section};
 ini_parse_line_parts(Section, [RawKey, Value]) ->
     Key = ini_format_key(RawKey),
     {ok, lists:keystore(Key, 1, Section, {Key, maybe_convert_number(Value)})};
