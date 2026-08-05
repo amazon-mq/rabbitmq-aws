@@ -65,6 +65,13 @@ jobs:
           sudo aa-teardown || true
           sudo systemctl disable --now apparmor.service || true
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
+      # Dialyzer findings depend on the OTP version (library specs change
+      # between releases), so run it on a single configuration. Running it
+      # across the whole matrix would let a warning that only appears under one
+      # OTP release fail builds unrelated to the change under review.
+      - name: Run dialyzer
+        if: matrix.rmq-version == 'v4.3.x'
+        run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws dialyze
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws tests
       - name: maybe upload CT logs
         if: failure()
