@@ -60,14 +60,13 @@ semaphore_spec() ->
 semaphore_config() ->
     #{max => get_int_env(auth_validation_max_concurrent, 5, 100)}.
 
+%% An out-of-range or non-integer value falls back to Default rather than
+%% failing the boot; the schema is what reports a bad value to the operator.
+-spec get_int_env(atom(), pos_integer(), pos_integer()) -> pos_integer().
 get_int_env(Key, Default, MaxBound) ->
     case application:get_env(aws, Key) of
-        {ok, N} when is_integer(N), N > 0 ->
-            case MaxBound of
-                infinity -> N;
-                _ when N =< MaxBound -> N;
-                _ -> Default
-            end;
+        {ok, N} when is_integer(N), N > 0, N =< MaxBound ->
+            N;
         _ ->
             Default
     end.

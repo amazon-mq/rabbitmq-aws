@@ -203,6 +203,20 @@ respond({error, Category, Reason}, Req, Context) when is_atom(Category), is_bina
     Status = status_for_category(Category),
     reply_error(Status, Category, Reason, Req, Context).
 
+%% The domain is any atom, not just aws_auth_validate_backend:error_category().
+%% body_too_large is raised by this module (read_body/2) rather than by a
+%% backend, and the final clause exists precisely for atoms outside the
+%% documented set.
+%%
+%% Both of those clauses are reachable only through the -ifdef(TEST) export
+%% above, and `make dialyze' compiles without TEST, so dialyzer sees a local
+%% function and infers its domain from the sole production call site in
+%% respond/3 -- which passes only error_category(). That makes the two clauses
+%% look unreachable even though the eunit suite calls them directly. The spec
+%% below documents the real domain; it cannot silence the warning, because
+%% dialyzer prefers the inferred success typing of a local function.
+-dialyzer({no_match, status_for_category/1}).
+-spec status_for_category(atom()) -> 400 | 422 | 500.
 status_for_category(input_invalid) -> 400;
 status_for_category(body_too_large) -> 400;
 status_for_category(connection_failed) -> 400;
@@ -270,6 +284,12 @@ not_authorised(ReqData, Context) ->
 %% Request helpers
 %%--------------------------------------------------------------------
 
+%% The fallback clause is unreachable per cowboy_req:peer/1's own spec, which is
+%% why dialyzer flags it, but it is kept deliberately: peer_ip/1 runs BEFORE the
+%% try in with_semaphore/6, so a function_clause here would surface as an
+%% unhandled 500 on an otherwise valid request. Falling back to 0.0.0.0 keeps
+%% the request serviceable and still produces an audit line.
+-dialyzer({no_match, peer_ip/1}).
 peer_ip(Req) ->
     case cowboy_req:peer(Req) of
         {IP, _Port} -> IP;
@@ -333,6 +353,11 @@ username(#context{user = #user{username = Name}}) when is_binary(Name) ->
 username(_) ->
     <<"unknown">>.
 
+%% As with peer_ip/1, the non-tuple clause is unreachable given the inferred
+%% argument type but is kept so that a malformed address can never turn an audit
+%% log write into a crash. Audit logging must not be able to fail the request it
+%% is recording.
+-dialyzer({no_match, format_ip/1}).
 format_ip(IP) when is_tuple(IP) ->
     case inet:ntoa(IP) of
         {error, _} -> <<"unknown">>;

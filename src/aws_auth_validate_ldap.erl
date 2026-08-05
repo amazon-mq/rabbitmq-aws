@@ -767,6 +767,14 @@ do_ldap_connect(
 verify_connected_peer(Handle) ->
     check_peer_ip(Handle).
 
+%% eldap:info/1 is specced as returning connection_info() unconditionally, so
+%% dialyzer considers the fallback clause unreachable. The spec is optimistic:
+%% info/1 returns recv/1's result, and recv/1 answers
+%% {error, {internal_error, Reason}} if the eldap process exits first. The clause
+%% is therefore reachable in practice, and it must stay because this function
+%% fails closed -- dropping it would turn a dead connection into a
+%% function_clause instead of `blocked'.
+-dialyzer({no_match, check_peer_ip/1}).
 check_peer_ip(Handle) ->
     case eldap:info(Handle) of
         #{socket := Sock, socket_type := ssl} -> peer_allowed(ssl:peername(Sock));
