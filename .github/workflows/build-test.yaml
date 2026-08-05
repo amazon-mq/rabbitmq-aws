@@ -25,6 +25,7 @@ jobs:
           - rmq-version: 'v4.3.x'
             otp-version: 27
             elixir-version: 1.18
+            dialyze: true
           - rmq-version: 'v4.2.x'
             otp-version: 27
             elixir-version: 1.18
@@ -43,7 +44,8 @@ jobs:
         with:
           script: |
             core.setFailed('could not restore cached rabbitmq-server build');
-      - uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
+      - id: beam
+        uses: erlef/setup-beam@54075bcc5e249e4758d363f27d099f55d843f124 # v1.24.1
         with:
           otp-version: ${{ matrix.otp-version }}
           elixir-version: ${{ matrix.elixir-version }}
@@ -66,11 +68,36 @@ jobs:
           sudo systemctl disable --now apparmor.service || true
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws
       # Dialyzer findings depend on the OTP version (library specs change
-      # between releases), so run it on a single configuration. Running it
-      # across the whole matrix would let a warning that only appears under one
-      # OTP release fail builds unrelated to the change under review.
+      # between releases), so run it on a single configuration flagged with
+      # dialyze: true in the matrix. Running it across the whole matrix would
+      # let a warning that only appears under one OTP release fail builds
+      # unrelated to the change under review.
+      #
+      # Cache the PLT because building it is slow. The PLT holds OTP, rabbit,
+      # and this plugin's declared dependencies (never src/, which is analyzed
+      # live), so its contents are pinned by the runner OS, the resolved OTP
+      # version, the rabbitmq-server checkout, and the dependency set declared
+      # in the Makefile. The OTP version comes from the setup-beam step output,
+      # not matrix.otp-version, so it is the exact patch release (e.g. 27.3.4.14
+      # rather than 27): a patch bump changes OTP's specs and therefore the PLT,
+      # and must invalidate the cache. hashFiles of the Makefile covers the
+      # declared dependency set. This project uses erlang.mk and has no
+      # rebar.lock or mix.lock, so the Makefile is the dependency manifest.
+      #
+      # No restore-keys fallback on purpose: a key change must be a clean miss
+      # that rebuilds the PLT from scratch. make dialyze only rebuilds an
+      # existing PLT when the erts path changed, not when the dependency set
+      # changed, so restoring a near-miss PLT would analyze against a stale set
+      # and emit spurious unknown-function warnings. A miss rebuilds and
+      # re-caches; a hit restores the exact PLT and skips the rebuild.
+      - name: Cache dialyzer PLT
+        if: matrix.dialyze
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ github.workspace }}/rabbitmq-server/deps/aws/.aws.plt
+          key: plt-${{ runner.os }}-rmq-${{ matrix.rmq-version }}-otp-${{ steps.beam.outputs.otp-version }}-elixir-${{ matrix.elixir-version }}-${{ hashFiles('rabbitmq-server/deps/aws/Makefile') }}
       - name: Run dialyzer
-        if: matrix.rmq-version == 'v4.3.x'
+        if: matrix.dialyze
         run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws dialyze
       - run: make -C ${{ github.workspace }}/rabbitmq-server/deps/aws tests
       - name: maybe upload CT logs
