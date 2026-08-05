@@ -41,7 +41,7 @@
 %%
 %% This reuses the broker's own crypto library (jose) so the signature decision
 %% matches what rabbit_auth_backend_oauth2 would compute -- a decision-parity
-%% claim analogous to the LDAP backend's, scoped to signature + exp/nbf/aud.
+%% claim analogous to the LDAP backend's, scoped to signature + exp/aud.
 %% Scope authorization CAN now be checked via the optional `authz_check' block
 %% (delegated to aws_auth_validate_oauth_authz when the arity-4 scope API is
 %% available); see allowed_fields/0 for the full authz field set. Note: not all
@@ -71,9 +71,11 @@
 %%                               verification, or no fetched JWKS key matched its
 %%                               kid. A REAL config mismatch: the JWKS the broker
 %%                               fetches would also reject live tokens.
-%%   * token_expired    (422) -- a supplied access_token is expired (exp) or not
-%%                               yet valid (nbf). TRANSIENT, not a config bug --
-%%                               re-mint the token and retry.
+%%   * token_expired    (422) -- a supplied access_token is expired (exp).
+%%                               TRANSIENT, not a config bug -- re-mint the token
+%%                               and retry. A post-dated token is NOT reported
+%%                               here: nbf is deliberately not checked (see
+%%                               check_token_expiry/1).
 %%   token_invalid / token_expired are safe to distinguish (unlike the coarse
 %%   reachability categories) because they describe the caller's own token, not
 %%   the broker's infra or an SSRF target, so they disclose nothing the
@@ -309,7 +311,7 @@ allowed_fields() ->
         <<"resource_server_id">>,
         <<"ssl_options">>,
         %% Optional customer-supplied access token. Present access_token
-        %% activates signature + exp/nbf/aud verification against the fetched
+        %% activates signature + exp/aud verification against the fetched
         %% JWKS. Carries no secret (the customer minted it out of band).
         <<"access_token">>,
         %% Optional authorization-evaluation layer: the customer's

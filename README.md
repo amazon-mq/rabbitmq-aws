@@ -104,80 +104,21 @@ Validating an authentication backend configuration on a running broker has
 traditionally meant editing `rabbitmq.conf`, restarting the broker, observing
 the result, and repeating -- an expensive guess-restart-guess loop. This plugin
 adds a synchronous HTTP endpoint that answers whether a new auth config is viable
-_before_ it is applied, returning an immediate categorized result instead.
+_before_ it is applied:
 
 ```
 PUT /api/aws/auth/validate/:method
 ```
 
-The `:method` path segment selects the backend to validate. Supported methods:
+Supported `:method` values are `ldap`, `http`, `oauth`, and `tls`. A viable
+config returns **204 No Content**; problems come back as a fixed set of
+categorized error responses. The endpoint is admin-gated, opt-in, and disabled
+by default. Secret material (bind passwords, certificates) is supplied by ARN
+reference and resolved server-side rather than passed in the request body.
 
-- `ldap` - LDAP simple bind, optional StartTLS, optional post-bind DN lookup and
-  authorization-query checks (mirrors `rabbitmq_auth_backend_ldap`).
-- `http` - HTTP auth backend reachability, including mTLS (client
-  certificate/key) to the auth service.
-- `oauth` - OAuth2/OIDC: JWKS reachability and, when an access token is
-  supplied, signature and `exp`/`nbf`/`aud` verification plus optional
-  scope/authorization evaluation.
-- `tls` - TLS handshake and certificate-chain validation against a target,
-  including certificate-login (`EXTERNAL`) checks.
-
-The request body is a JSON object carrying the backend configuration to test.
-Each backend accepts only the fields relevant to it (see the per-method
-`allowed_fields` in the corresponding `aws_auth_validate_*` module); any other
-fields are ignored. Secret material (such as an LDAP bind password) is supplied
-by _reference_ as a `password_arn` and resolved through AWS Secrets Manager
-(see "Configuration via AWS ARN" above), never passed inline.
-
-### Responses
-
-A successful validation returns **204 No Content**. Failures return a fixed set
-of categories -- deliberately coarse so the endpoint never leaks server
-hostnames, DNs, or raw backend errors -- as a JSON body `{"error": ..., "message": ...}`:
-
-| Status | Categories |
-|---|---|
-| 400 | `input_invalid`, `body_too_large`, `connection_failed`, `tls_failed`, `query_invalid` |
-| 401 | `insufficient_user_tag` |
-| 404 | `unknown_method`, `method_disabled` |
-| 422 | `auth_failed`, `config_conflict`, `authz_unverified`, `token_expired`, `token_invalid` |
-| 503 | `capacity_exhausted` |
-
-### Access control
-
-The endpoint is gated on the RabbitMQ management API and, by default, requires
-the `administrator` user tag. It performs outbound connections to
-operator-supplied targets, so treat access to it accordingly.
-
-### Enabling the endpoint
-
-The feature is **opt-in and disabled by default**. Two levels of toggle are
-required: a master switch that starts the subsystem, and a per-method switch for
-each backend you want to validate. When disabled, the endpoint returns 404.
-
-```
-# Start the validation subsystem (required)
-aws.auth_validation.enabled = true
-
-# Enable individual methods (each is opt-in; enable only what you need)
-aws.auth_validation.enabled_methods.ldap = true
-aws.auth_validation.enabled_methods.http = true
-aws.auth_validation.enabled_methods.oauth = true
-aws.auth_validation.enabled_methods.tls = true
-```
-
-Additional tuning keys (each has an effective default applied in code, so the
-key only needs to be set to override it):
-
-| Key | Effective default | Purpose |
-|---|---|---|
-| `aws.auth_validation.max_body_size` | `65536` | Maximum request body size, in bytes (1..1048576). |
-| `aws.auth_validation.max_concurrent` | `5` | Maximum concurrent outbound validation connections (1..100). |
-| `aws.auth_validation.connection_timeout_ms` | `5000` | Per-connection timeout for outbound calls, in ms (1..60000). |
-| `aws.auth_validation.required_user_tag` | `administrator` | Management user tag required to call the endpoint. |
-
-When enabled, the plugin also registers an admin-gated **Auth Validation** tab
-in the RabbitMQ management console UI that drives the same endpoint.
+See **[AUTH_VALIDATION.md](AUTH_VALIDATION.md)** for the full reference: the
+per-method behaviour, request fields, response categories, security model, and
+the configuration keys needed to enable it.
 
 ## Installation
 

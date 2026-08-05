@@ -649,8 +649,13 @@ instance_volumes(State0 = #aws_state{config = Config0}) ->
     State :: aws_state()
 ) ->
     {ok, list(), aws_state()} | {error, term(), aws_state()}.
-%% @doc Invoke an API call to an AWS service with retries and exponential
-%% backoff with jitter between attempts.
+%% @doc Invoke an API call to an AWS service with retries, delegating the retry
+%% loop to aws_lib_retry:with_retries/3 (issue #85). The attempt closure threads
+%% {State, Conn, LastError} as context; a credential failure short-circuits via
+%% {stop, ...}; perform_request_reuse/8 drives the HTTP attempt; and
+%% classify_response's verdict decides retriability. The inter-attempt delay is
+%% supplied as a wait_time_ms fun computing exponential backoff with jitter
+%% (issue #81); with_retries skips the sleep before the final attempt.
 %% @end
 api_request_with_retries(Service, Method, Path, Body, Headers, Retries, BackoffBase, State) ->
     %% Open a single connection and reuse it across the whole retry sequence
@@ -659,124 +664,115 @@ api_request_with_retries(Service, Method, Path, Body, Headers, Retries, BackoffB
     %% seed from it so the first attempt avoids a fresh handshake; otherwise
     %% start with `undefined' (nothing open yet, opened lazily on first attempt).
     Conn0 = seed_conn_from_state(State),
-    api_request_with_retries(
-        Service, Method, Path, Body, Headers, Retries, BackoffBase, State, Conn0, undefined, 0
-    ).
+    Ctx0 = {State, Conn0, undefined},
 
--spec api_request_with_retries(
-    Service :: string(),
-    Method :: method(),
-    Path :: path(),
-    Body :: body(),
-    Headers :: headers(),
-    Retries :: integer(),
-    BackoffBase :: integer(),
-    State :: aws_state(),
-    Conn :: aws_lib_httpc:conn() | undefined,
-    LastError :: result_error() | undefined,
-    Attempt :: non_neg_integer()
-) ->
-    {ok, list(), aws_state()} | {error, term(), aws_state()}.
-api_request_with_retries(
-    _Service,
-    _Method,
-    _Path,
-    _Body,
-    _Headers,
-    Retries,
-    _BackoffBase,
-    State,
-    Conn,
-    LastError,
-    _Attempt
-) when
-    Retries =< 0
-->
-    ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
-    %% Reconcile the carried connection into the returned state: in reuse mode a
-    %% still-live connection is handed back, a transport-dropped one (undefined)
-    %% clears the slot; in one-shot mode it is closed.
-    State1 = finish_conn(Conn, State),
-    %% Surface the last attempt's decoded AWS error so the caller can act on the
-    %% service error code (throttling vs invalid parameter vs access denied)
-    %% rather than a generic string (issue #82).
-    {error, exhausted_error(LastError), State1};
-api_request_with_retries(
-    Service, Method, Path, Body, Headers, Retries, BackoffBase, State0, Conn0, LastError, Attempt
-) ->
-    case ensure_credentials_valid(State0) of
-        {ok, State1} ->
-            {Result, Conn1, Verdict} =
-                perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, Conn0),
-            case Result of
-                {ok, {_Headers, Payload}, State2} ->
-                    ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
-                    State3 = finish_conn(Conn1, State2),
-                    {ok, Payload, State3};
-                {error, Message, Response} = Error ->
-                    %% Message may be a status string (from format_response/1
-                    %% on an HTTP error) or a tuple such as
-                    %% {gun_open_failed, Reason} on a connection failure, so
-                    %% use ~tp rather than ~ts.
-                    ?LOG_WARNING("Error occurred: ~tp", [Message]),
-                    case Response of
-                        {_, Payload} ->
-                            ?LOG_WARNING("Failed AWS request: ~ts~nResponse: ~tp", [
-                                Path, Payload
-                            ]);
-                        _ ->
-                            ok
-                    end,
-                    case Verdict of
-                        not_retriable ->
-                            %% A 4xx client error that will not succeed on retry
-                            %% (issue #80): return the decoded error to the caller
-                            %% immediately rather than burning the remaining
-                            %% retries. The exchange completed cleanly, so in
-                            %% reuse mode the connection is handed back for the
-                            %% next request; in one-shot mode finish_conn/2 closes
-                            %% it.
-                            %% Log at ERROR level so log-level alerting still sees
-                            %% a permanent failure: before issue #80 short-circuited
-                            %% the retry loop, this failure would have exhausted the
-                            %% retries and reached the ?LOG_ERROR clause above.
-                            ?LOG_ERROR(
-                                "Request to AWS service has failed with a permanent error: ~tp",
-                                [Message]
-                            ),
-                            State3 = finish_conn(Conn1, State1),
-                            {error, exhausted_error(Error), State3};
-                        retriable ->
-                            ?LOG_WARNING(
-                                "Will retry AWS request, remaining retries: ~b", [Retries]
-                            ),
-                            maybe_backoff(Retries, Attempt, BackoffBase),
-                            %% perform_request_reuse/8 hands back a live connection
-                            %% after an HTTP-level error (reused on the next
-                            %% attempt) or `undefined' after a transport failure
-                            %% (reopened next attempt). Carry the most informative
-                            %% error forward so retry exhaustion can return it: a
-                            %% decoded service-error body from an earlier attempt
-                            %% is kept even if a later attempt fails at the
-                            %% transport level with no body.
-                            api_request_with_retries(
-                                Service,
-                                Method,
-                                Path,
-                                Body,
-                                Headers,
-                                Retries - 1,
-                                BackoffBase,
-                                State1,
-                                Conn1,
-                                keep_informative_error(LastError, Error),
-                                Attempt + 1
-                            )
-                    end
-            end;
-        {error, Reason} ->
-            State1 = finish_conn(Conn0, State0),
-            {error, {credentials, Reason}, State1}
+    AttemptFun = fun({State0, ConnIn, PrevError}) ->
+        case ensure_credentials_valid(State0) of
+            {ok, State1} ->
+                {Result, Conn1, Verdict} =
+                    perform_request_reuse(Service, Method, Headers, Path, Body, [], State1, ConnIn),
+                case Result of
+                    {ok, {_RespHeaders, Payload}, State2} ->
+                        ?LOG_DEBUG("AWS request: ~ts~nResponse: ~tp", [Path, Payload]),
+                        State3 = finish_conn(Conn1, State2),
+                        %% finish_conn/2 has reconciled the connection into
+                        %% State3; drop it from the carried context so the outer
+                        %% success clause does not reconcile (and close) it a
+                        %% second time.
+                        {ok, Payload, {State3, undefined, PrevError}};
+                    {error, Message, Response} = Error ->
+                        %% Message may be a status string (from format_response/1
+                        %% on an HTTP error) or a tuple such as
+                        %% {gun_open_failed, Reason} on a connection failure, so
+                        %% use ~tp rather than ~ts.
+                        ?LOG_WARNING("Error occurred: ~tp", [Message]),
+                        case Response of
+                            {_, Payload} ->
+                                ?LOG_WARNING("Failed AWS request: ~ts~nResponse: ~tp", [
+                                    Path, Payload
+                                ]);
+                            _ ->
+                                ok
+                        end,
+                        case Verdict of
+                            not_retriable ->
+                                %% A 4xx client error that will not succeed on
+                                %% retry (issue #80): short-circuit rather than
+                                %% burning the remaining retries. Leave conn
+                                %% reconciliation to the outer {error, ...} clause
+                                %% so reuse mode hands the connection back and
+                                %% one-shot mode closes it (one finish_conn call
+                                %% on every exit path).
+                                %% Log at ERROR level so log-level alerting still
+                                %% sees a permanent failure.
+                                ?LOG_ERROR(
+                                    "Request to AWS service has failed with a permanent error: ~tp",
+                                    [Message]
+                                ),
+                                {stop, exhausted_error(Error), {State1, Conn1, PrevError}};
+                            retriable ->
+                                %% perform_request_reuse/8 hands back a live
+                                %% connection after an HTTP-level error (reused on
+                                %% the next attempt) or `undefined' after a
+                                %% transport failure (reopened next attempt).
+                                %% Carry the most informative error forward so
+                                %% retry exhaustion can return it: a decoded
+                                %% service-error body from an earlier attempt is
+                                %% kept even if a later attempt fails at the
+                                %% transport level with no body.
+                                NewLastError = keep_informative_error(PrevError, Error),
+                                {retry, Error, {State1, Conn1, NewLastError}}
+                        end
+                end;
+            {error, Reason} ->
+                State1 = finish_conn(ConnIn, State0),
+                {stop, {credentials, Reason}, {State1, ConnIn, PrevError}}
+        end
+    end,
+
+    OnRetry = fun(AttemptNumber, _Error, _Ctx) ->
+        %% AttemptNumber is 1-based; after N attempts, Retries - N remain.
+        Remaining = Retries - AttemptNumber,
+        ?LOG_WARNING("Will retry AWS request, remaining retries: ~b", [Remaining]),
+        ok
+    end,
+
+    OnExhausted = fun(_TotalAttempts, _LastAttemptError, {_St, _Co, LastErr}) ->
+        ?LOG_ERROR("Request to AWS service has failed after ~b retries", [?MAX_RETRIES]),
+        %% Surface the last attempt's decoded AWS error so the caller can act on
+        %% the service error code (throttling vs invalid parameter vs access
+        %% denied) rather than a generic string (issue #82).
+        exhausted_error(LastErr)
+    end,
+
+    %% Exponential backoff with jitter (issue #81), supplied as a fun so the
+    %% retry loop stays policy-agnostic. AttemptNumber is 1-based; the first
+    %% retry's delay uses exponent 0, matching the pre-extraction attempt
+    %% counter that started at 0.
+    WaitTimeMs = fun(AttemptNumber, _Ctx) ->
+        backoff_delay(AttemptNumber - 1, BackoffBase, ?BACKOFF_CAP_MILLIS)
+    end,
+
+    Opts = #{
+        max_retries => Retries,
+        wait_time_ms => WaitTimeMs,
+        on_retry => OnRetry,
+        on_exhausted => OnExhausted
+    },
+
+    case aws_lib_retry:with_retries(AttemptFun, Opts, Ctx0) of
+        {ok, Payload, {FinalState, _FinalConn, _}} ->
+            {ok, Payload, FinalState};
+        {error, {credentials, Reason}, {FinalState, _FinalConn, _}} ->
+            %% The attempt closure already reconciled the connection on the
+            %% credential-failure path.
+            {error, {credentials, Reason}, FinalState};
+        {error, ErrorTerm, {FinalState, FinalConn, _}} ->
+            %% On a not_retriable stop or retry exhaustion the connection is
+            %% still carried in the context; reconcile it into the returned
+            %% state here (reuse mode hands it back, one-shot mode closes it).
+            State1 = finish_conn(FinalConn, FinalState),
+            {error, ErrorTerm, State1}
     end.
 
 %% Keep the more informative of two retry errors: an error carrying a decoded
@@ -806,19 +802,10 @@ exhausted_error({error, _Message, {_Headers, DecodedBody}}) ->
 exhausted_error(_) ->
     {service_error, retries_exhausted}.
 
--spec maybe_backoff(
-    Retries :: integer(), Attempt :: non_neg_integer(), Base :: non_neg_integer()
-) -> ok.
-%% Sleep between attempts, but only when another attempt will actually follow.
-%% The caller decrements Retries after this call, so Retries =< 1 means the next
-%% recursion hits the exhaustion clause: sleeping there would delay the returned
-%% error by a full backoff interval (up to ?BACKOFF_CAP_MILLIS) without buying
-%% another attempt. This matters on the broker-boot ARN resolution path, where it
-%% halves the worst-case delay for an unreachable service.
-maybe_backoff(Retries, _Attempt, _Base) when Retries =< 1 ->
-    ok;
-maybe_backoff(_Retries, Attempt, Base) ->
-    timer:sleep(backoff_delay(Attempt, Base, ?BACKOFF_CAP_MILLIS)).
+%% Note: the "skip the sleep before the final attempt" logic (issue #81 review)
+%% now lives in aws_lib_retry:with_retries/3, which owns the inter-attempt sleep
+%% after the loop was extracted (issue #85). backoff_delay/3 below stays here as
+%% the policy the wait_time_ms fun computes.
 
 -spec backoff_delay(
     Attempt :: non_neg_integer(), Base :: non_neg_integer(), Cap :: non_neg_integer()
@@ -903,8 +890,9 @@ perform_request_reuse(Service, Method, Headers, Path, Body, Options, State0, Con
         {error, _} = Error ->
             %% Shape the 2-tuple error through format_response/1 into the
             %% 3-tuple result the retry loop matches on; returning the raw
-            %% {error, Reason} here would raise a case_clause in
-            %% api_request_with_retries/11.
+            %% {error, Reason} here would raise a case_clause in the attempt
+            %% closure api_request_with_retries/8 passes to
+            %% aws_lib_retry:with_retries/3.
             {aws_lib_response:format_response(Error), ConnSlot0, retriable}
     end.
 
