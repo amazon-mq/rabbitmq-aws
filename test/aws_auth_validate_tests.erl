@@ -97,21 +97,32 @@ registry_field_filter_override_test_() ->
         fun() ->
             application:set_env(
                 aws,
-                auth_validation_allowed_fields_override,
+                auth_validation_allowed_fields,
                 [{<<"ldap">>, [<<"servers">>, <<"port">>, <<"unknown">>]}]
             )
         end,
         fun(_) ->
-            application:unset_env(aws, auth_validation_allowed_fields_override)
+            application:unset_env(aws, auth_validation_allowed_fields)
         end,
         [
             fun() ->
+                %% ldap has an override: narrowed to the listed fields, and the
+                %% unknown entry is dropped by the intersection.
                 Effective = aws_auth_validate_registry:effective_allowed_fields(
                     aws_auth_validate_ldap, <<"ldap">>
                 ),
                 ?assert(lists:member(<<"servers">>, Effective)),
                 ?assert(lists:member(<<"port">>, Effective)),
-                ?assertNot(lists:member(<<"unknown">>, Effective))
+                ?assertNot(lists:member(<<"unknown">>, Effective)),
+                ?assertNot(lists:member(<<"user_dn">>, Effective))
+            end,
+            fun() ->
+                %% http has no entry in the override list, so it keeps the
+                %% backend's full default set.
+                Effective = aws_auth_validate_registry:effective_allowed_fields(
+                    aws_auth_validate_http, <<"http">>
+                ),
+                ?assertEqual(aws_auth_validate_http:allowed_fields(), Effective)
             end
         ]}.
 

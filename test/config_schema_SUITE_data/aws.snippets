@@ -430,5 +430,10 @@
     {aws_auth_validation_enabled_methods,
         "aws.auth_validation.enabled_methods.ldap = true",
         [{aws, [{auth_validation_enabled_methods, [{<<"ldap">>, true}]}]}],
-        [aws_auth_validation_enabled_methods]}
+        [aws_auth_validation_enabled_methods]},
+
+    {aws_auth_validation_allowed_fields,
+        "aws.auth_validation.allowed_fields.ldap = servers,port,password_arn",
+        [{aws, [{auth_validation_allowed_fields, [{<<"ldap">>, [<<"servers">>, <<"port">>, <<"password_arn">>]}]}]}],
+        [aws_auth_validation_allowed_fields]}
 ].

@@ -148,6 +148,30 @@ and no log entry. Setting `max_body_size = 2000000`, for example, leaves the
 limit at `65536`, and a 200 KB body is then rejected as `body_too_large` with
 nothing pointing at the ignored setting.
 
+### Narrowing accepted request fields (optional)
+
+Each backend already accepts only the fields relevant to it (its
+`allowed_fields`); any other top-level field is silently dropped. If you want to
+narrow that set further -- for example to reject `queries` and `dn_lookup_base`
+on the `ldap` method and accept only the basic bind fields -- set a per-method
+allowlist:
+
+```
+aws.auth_validation.allowed_fields.ldap = servers,port,user_dn,password_arn,use_ssl
+```
+
+The value is a comma-separated list of field names. The effective set is the
+**intersection** of this list and the backend's own defaults, so the key can
+only ever remove fields, never add one; an entry that is not a real field for
+that method simply never matches. A method left unset keeps the backend's full
+default set. Unknown method names (anything other than `ldap`, `http`, `oauth`,
+`tls`) are rejected at configuration-generation time rather than silently
+ignored, so a typo fails the boot rather than producing an allowlist that never
+applies.
+
+This is a defense-in-depth control on an endpoint that is already admin-gated,
+opt-in, and side-effect-free; most deployments will not need it.
+
 The plugin also registers an **Auth Validation** tab in the RabbitMQ management
 console UI that drives the same endpoint. Note that the tab is registered
 whenever the plugin itself is enabled, independently of the toggles above: with
