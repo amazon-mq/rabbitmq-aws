@@ -98,6 +98,28 @@ setting.
 
 **NOTE:** encrypted X509 certificates are _not_ supported at this time.
 
+## Auth Configuration Validation
+
+Validating an authentication backend configuration on a running broker has
+traditionally meant editing `rabbitmq.conf`, restarting the broker, observing
+the result, and repeating -- an expensive guess-restart-guess loop. This plugin
+adds a synchronous HTTP endpoint that answers whether a new auth config is viable
+_before_ it is applied:
+
+```
+PUT /api/aws/auth/validate/:method
+```
+
+Supported `:method` values are `ldap`, `http`, `oauth`, and `tls`. A viable
+config returns **204 No Content**; problems come back as a fixed set of
+categorized error responses. The endpoint is admin-gated, opt-in, and disabled
+by default. Secret material (bind passwords, certificates) is supplied by ARN
+reference and resolved server-side rather than passed in the request body.
+
+See **[AUTH_VALIDATION.md](AUTH_VALIDATION.md)** for the full reference: the
+per-method behaviour, request fields, response categories, security model, and
+the configuration keys needed to enable it.
+
 ## Installation
 
 Visit the [GitHub Releases](https://github.com/amazon-mq/rabbitmq-aws/releases)
