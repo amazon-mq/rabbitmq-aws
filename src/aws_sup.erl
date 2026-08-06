@@ -41,8 +41,9 @@ auth_validation_children() ->
             %% Register the Prometheus metrics collector before starting the
             %% semaphore worker. The collector has no process (it is a callback
             %% module registered with prometheus_registry), so no child spec is
-            %% needed. prometheus is a declared dependency, so a failure here is
-            %% a real fault and must surface rather than be swallowed.
+            %% needed. rabbitmq_prometheus is a declared dependency (which
+            %% transitively pulls in prometheus), so a failure here is a real
+            %% fault and must surface rather than be swallowed.
             aws_auth_validate_metrics:register(),
             [semaphore_spec()];
         _ ->
