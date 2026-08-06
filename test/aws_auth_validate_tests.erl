@@ -1114,6 +1114,14 @@ tls_body(CacertArn) ->
 %% referenced_arns/2 -- ARN extraction for audit log
 %%--------------------------------------------------------------------
 
+%% An unrecognized method (lookup_backend returns {error, unknown_method})
+%% yields <<"none">> without calling effective_allowed_fields.
+referenced_arns_unknown_method_test() ->
+    Result = aws_auth_validate_mgmt:referenced_arns(
+        <<"garbage">>, #{<<"password_arn">> => <<"arn:aws:sm:us-east-1:123:secret:x">>}
+    ),
+    ?assertEqual(<<"none">>, Result).
+
 %% A request with a top-level password_arn in the body (and in the effective
 %% allowed fields) surfaces that ARN in the audit output.
 referenced_arns_top_level_password_arn_test_() ->
