@@ -127,9 +127,14 @@ credentialed_query_parity_test() ->
 credentialed_query_encoding_test() ->
     Params = #{username => <<"user@host">>, password => <<"p&ss=w0rd">>},
     Query = aws_auth_validate_http:credentialed_query_for(Params),
-    %% The raw characters should NOT appear (they should be percent-encoded)
+    %% The special characters inside the values are percent-encoded: @ -> %40,
+    %% and the password's literal & and = become %26 and %3D. The single
+    %% unencoded `&' separating username= from password= is the legitimate
+    %% parameter delimiter, so we assert on the encoded forms rather than the
+    %% raw characters' total absence.
     ?assertEqual(nomatch, string:find(Query, "@")),
-    ?assertEqual(nomatch, string:find(Query, "&")),
+    ?assertNotEqual(nomatch, string:find(Query, "%40")),
+    ?assertNotEqual(nomatch, string:find(Query, "p%26ss%3Dw0rd")),
     ?assertEqual(nomatch, string:find(Query, "=w0rd")).
 
 %%--------------------------------------------------------------------
