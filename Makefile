@@ -15,7 +15,10 @@ LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
 PLT_APPS = rabbit
 
 DEP_EARLY_PLUGINS = rabbit_common/mk/rabbitmq-early-plugin.mk
-DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk
+# Precompile the auth-validation UI's EJS templates into priv/www/js/aws-ejs.js
+# at build time (the management UI no longer compiles .ejs at runtime).
+DEP_PLUGINS = rabbit_common/mk/rabbitmq-plugin.mk \
+              rabbitmq_management/mk/rabbitmq-management-plugin.mk
 
 include ../../rabbitmq-components.mk
 include ../../erlang.mk

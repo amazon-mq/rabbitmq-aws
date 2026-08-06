@@ -44,10 +44,12 @@
 dispatcher() -> [{"/aws/auth/validate/:method", ?MODULE, []}].
 
 %% Register the management-console UI extension. The management plugin serves
-%% this plugin's priv/www/ automatically (see rabbit_mgmt_dispatcher), so the
-%% referenced file is loaded from priv/www/js/aws_auth_validate.js. The JS adds
-%% an admin-gated "Auth Validation" tab that drives PUT /aws/auth/validate/:method.
-web_ui() -> [{javascript, <<"aws_auth_validate.js">>}].
+%% this plugin's priv/www/ automatically (see rabbit_mgmt_dispatcher). Two files
+%% load, in order: aws-ejs.js first (the build-time-precompiled EJS templates,
+%% populating COMPILED_TEMPLATES -- the UI no longer compiles .ejs at runtime),
+%% then aws_auth_validate.js, which adds an admin-gated "Auth Validation" tab
+%% that drives PUT /aws/auth/validate/:method and renders those templates.
+web_ui() -> [{javascript, [<<"aws-ejs.js">>, <<"aws_auth_validate.js">>]}].
 
 %%--------------------------------------------------------------------
 %% cowboy_rest callbacks
