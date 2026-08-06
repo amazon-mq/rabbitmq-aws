@@ -180,3 +180,52 @@ from it return 404 `method_disabled`. Its visibility is hard-coded to the
 `administrator` tag, so lowering `required_user_tag` does not make the tab
 appear for users holding the lowered tag, even though the endpoint accepts
 their requests.
+
+## Metrics
+
+When `aws.auth_validation.enabled = true`, the plugin registers a Prometheus
+collector that exposes the following metrics on the standard RabbitMQ
+`/api/metrics` endpoint. Amazon MQ bridges these to CloudWatch automatically.
+When the feature is disabled, no metrics are registered and the collector is
+absent from the Prometheus registry.
+
+| Metric | Type | Labels | Description |
+|---|---|---|---|
+| `rabbitmq_aws_auth_validation_requests_total` | counter | `method`, `result` | Total number of auth-validation requests. |
+| `rabbitmq_aws_auth_validation_duration_milliseconds` | histogram | `method` | Duration of auth-validation requests in milliseconds. |
+| `rabbitmq_aws_auth_validation_capacity_exhausted_total` | counter | `method` | Total number of requests rejected due to semaphore capacity exhaustion (503). |
+| `rabbitmq_aws_auth_validation_semaphore_in_use` | gauge | (none) | Number of semaphore slots currently held by in-flight validations. |
+| `rabbitmq_aws_auth_validation_semaphore_capacity` | gauge | (none) | Configured maximum concurrent validation slots (`max_concurrent`). |
+
+### Labels
+
+- **`method`** -- the `:method` path segment (`ldap`, `http`, `oauth`, `tls`).
+- **`result`** -- the fixed response category atom (`success`, `input_invalid`,
+  `body_too_large`, `connection_failed`, `tls_failed`, `query_invalid`,
+  `auth_failed`, `config_conflict`, `authz_unverified`, `token_expired`,
+  `token_invalid`, `capacity_exhausted`, `unknown_method`, `method_disabled`,
+  `internal_error`).
+
+Metrics are **never** dimensioned by source IP, username, target host, URL, DN,
+or any secret/ARN -- this is a security invariant matching the audit trail
+policy.
+
+### Histogram bucket boundaries (milliseconds)
+
+```
+10, 25, 50, 100, 250, 500, 1000, 2500, 5000, 10000
+```
+
+These cover the range from fast local validation (~10 ms for a parse-only check)
+through typical LDAP/HTTP round trips (~100-500 ms) to the connection timeout
+ceiling (5-10 s).
+
+### Implementation notes
+
+- The collector uses OTP `counters` with `write_concurrency` stored in
+  `persistent_term`, so the hot-path `observe/3` call adds negligible latency
+  (no message passing, no lock contention).
+- Semaphore gauges are read live from the semaphore gen_server at scrape time
+  (pull model), not stored in counters.
+- If the feature is disabled or the collector is deregistered, `observe/3` is a
+  silent no-op -- it never crashes the caller.

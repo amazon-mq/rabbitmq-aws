@@ -37,8 +37,21 @@ init([]) ->
 
 auth_validation_children() ->
     case application:get_env(aws, auth_validation_enabled, false) of
-        true -> [semaphore_spec()];
-        _ -> []
+        true ->
+            %% Register the Prometheus metrics collector before starting the
+            %% semaphore worker. The collector has no process (it is a callback
+            %% module registered with prometheus_registry), so no child spec is
+            %% needed. Registration is wrapped in try/catch so that a missing
+            %% prometheus dependency (unlikely -- transitive via
+            %% rabbitmq_management) does not prevent the feature from starting.
+            try
+                aws_auth_validate_metrics:register()
+            catch
+                _:_ -> ok
+            end,
+            [semaphore_spec()];
+        _ ->
+            []
     end.
 
 %% The concurrency semaphore bounds simultaneous outbound LDAP connections;

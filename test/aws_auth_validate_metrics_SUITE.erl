@@ -1,0 +1,187 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
+%% Common Test suite for aws_auth_validate_metrics.
+%%
+%% Tests cover:
+%%   - Counter increments for requests_total
+%%   - Histogram bucket population for duration
+%%   - Dedicated capacity_exhausted counter
+%%   - Semaphore gauge reads at scrape time
+%%   - No-op behaviour when metrics are not registered
+%%   - Crash safety (observe/3 never raises)
+-module(aws_auth_validate_metrics_SUITE).
+
+-include_lib("common_test/include/ct.hrl").
+-include_lib("eunit/include/eunit.hrl").
+
+-export([
+    all/0,
+    init_per_suite/1,
+    end_per_suite/1,
+    init_per_testcase/2,
+    end_per_testcase/2
+]).
+
+-export([
+    requests_total_increments/1,
+    duration_histogram_records/1,
+    capacity_exhausted_increments/1,
+    semaphore_gauges/1,
+    no_state_when_disabled/1,
+    crash_safety/1,
+    unknown_method_no_crash/1,
+    unknown_category_no_crash/1
+]).
+
+all() ->
+    [
+        requests_total_increments,
+        duration_histogram_records,
+        capacity_exhausted_increments,
+        semaphore_gauges,
+        no_state_when_disabled,
+        crash_safety,
+        unknown_method_no_crash,
+        unknown_category_no_crash
+    ].
+
+init_per_suite(Config) ->
+    %% Start applications that prometheus_registry needs.
+    {ok, _} = application:ensure_all_started(prometheus),
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_testcase(no_state_when_disabled, Config) ->
+    %% Ensure metrics are NOT registered for this test case.
+    _ = persistent_term:erase({aws_auth_validate_metrics, counters}),
+    Config;
+init_per_testcase(crash_safety, Config) ->
+    %% Ensure metrics are NOT registered for this test case.
+    _ = persistent_term:erase({aws_auth_validate_metrics, counters}),
+    Config;
+init_per_testcase(_TestCase, Config) ->
+    %% Ensure clean state: deregister any prior collector and erase counters.
+    catch aws_auth_validate_metrics:deregister(),
+    %% Register metrics fresh for each test case.
+    aws_auth_validate_metrics:register(),
+    Config.
+
+end_per_testcase(no_state_when_disabled, _Config) ->
+    ok;
+end_per_testcase(crash_safety, _Config) ->
+    ok;
+end_per_testcase(_TestCase, _Config) ->
+    %% Clean up: deregister collector and erase persistent_term.
+    catch aws_auth_validate_metrics:deregister(),
+    ok.
+
+%%--------------------------------------------------------------------
+%% Test cases
+%%--------------------------------------------------------------------
+
+%% Verify that observe/3 increments the requests_total counter for multiple
+%% (method, category) combinations.
+requests_total_increments(_Config) ->
+    aws_auth_validate_metrics:observe(<<"ldap">>, success, 50),
+    aws_auth_validate_metrics:observe(<<"ldap">>, success, 30),
+    aws_auth_validate_metrics:observe(<<"ldap">>, auth_failed, 100),
+    aws_auth_validate_metrics:observe(<<"http">>, connection_failed, 200),
+    aws_auth_validate_metrics:observe(<<"oauth">>, token_expired, 500),
+
+    %% Read counters directly to verify.
+    Counters = aws_auth_validate_metrics:counter_ref(),
+    ?assertNotEqual(undefined, Counters),
+
+    %% ldap + success: method_index=0, category_index=0, slot = 0*15 + 0 + 1 = 1
+    ?assertEqual(2, counters:get(Counters, 1)),
+    %% ldap + auth_failed: method_index=0, category_index=6, slot = 0*15 + 6 + 1 = 7
+    ?assertEqual(1, counters:get(Counters, 7)),
+    %% http + connection_failed: method_index=1, category_index=3, slot = 1*15 + 3 + 1 = 19
+    ?assertEqual(1, counters:get(Counters, 19)),
+    %% oauth + token_expired: method_index=2, category_index=9, slot = 2*15 + 9 + 1 = 40
+    ?assertEqual(1, counters:get(Counters, 40)),
+    ok.
+
+%% Verify that observe/3 populates histogram buckets correctly.
+duration_histogram_records(_Config) ->
+    %% Observe durations in different buckets:
+    %% 5ms -> bucket 1 (<=10), 75ms -> bucket 4 (<=100), 3000ms -> bucket 8 (<=5000)
+    aws_auth_validate_metrics:observe(<<"ldap">>, success, 5),
+    aws_auth_validate_metrics:observe(<<"ldap">>, success, 75),
+    aws_auth_validate_metrics:observe(<<"ldap">>, success, 3000),
+
+    Counters = aws_auth_validate_metrics:counter_ref(),
+    Base = aws_auth_validate_metrics:histogram_base(),
+
+    %% ldap is method_index 0, so its histogram starts at Base + 0*12.
+    %% Bucket 1 (<=10ms): slot = Base + 0*12 + 1 = Base + 1
+    ?assertEqual(1, counters:get(Counters, Base + 1)),
+    %% Bucket 4 (<=100ms): slot = Base + 0*12 + 4 = Base + 4
+    ?assertEqual(1, counters:get(Counters, Base + 4)),
+    %% Bucket 9 (<=5000ms): slot = Base + 0*12 + 9 = Base + 9
+    ?assertEqual(1, counters:get(Counters, Base + 9)),
+    %% Sum slot: Base + 0*12 + 11 = Base + 11
+    ?assertEqual(5 + 75 + 3000, counters:get(Counters, Base + 11)),
+    %% Count slot: Base + 0*12 + 12 = Base + 12
+    ?assertEqual(3, counters:get(Counters, Base + 12)),
+    ok.
+
+%% Verify that capacity_exhausted observations increment the correct counter.
+capacity_exhausted_increments(_Config) ->
+    aws_auth_validate_metrics:observe(<<"ldap">>, capacity_exhausted, 10),
+    aws_auth_validate_metrics:observe(<<"ldap">>, capacity_exhausted, 20),
+    aws_auth_validate_metrics:observe(<<"http">>, capacity_exhausted, 15),
+
+    Counters = aws_auth_validate_metrics:counter_ref(),
+    %% ldap + capacity_exhausted: method_index=0, category_index=11, slot = 0*15 + 11 + 1 = 12
+    ?assertEqual(2, counters:get(Counters, 12)),
+    %% http + capacity_exhausted: method_index=1, category_index=11, slot = 1*15 + 11 + 1 = 27
+    ?assertEqual(1, counters:get(Counters, 27)),
+    ok.
+
+%% Verify that semaphore gauges reflect live state from the semaphore worker.
+semaphore_gauges(_Config) ->
+    %% Start a semaphore with max=3.
+    {ok, Pid} = aws_auth_validate_semaphore:start_link(#{max => 3}),
+
+    %% Acquire two slots.
+    {ok, Ref1} = aws_auth_validate_semaphore:acquire(),
+    {ok, _Ref2} = aws_auth_validate_semaphore:acquire(),
+
+    %% Verify usage/0 returns current state.
+    {2, 3} = aws_auth_validate_semaphore:usage(),
+
+    %% Release one.
+    ok = aws_auth_validate_semaphore:release(Ref1),
+    {1, 3} = aws_auth_validate_semaphore:usage(),
+
+    %% Clean up.
+    gen_server:stop(Pid),
+    ok.
+
+%% Verify that when metrics are not registered, no persistent_term entries exist.
+no_state_when_disabled(_Config) ->
+    ?assertEqual(undefined, persistent_term:get({aws_auth_validate_metrics, counters}, undefined)),
+    ok.
+
+%% Verify that calling observe/3 when not registered does not crash.
+crash_safety(_Config) ->
+    %% Should be a no-op, not a crash.
+    ?assertEqual(ok, aws_auth_validate_metrics:observe(<<"ldap">>, success, 100)),
+    ?assertEqual(ok, aws_auth_validate_metrics:observe(<<"http">>, auth_failed, 50)),
+    ok.
+
+%% Verify that observing an unknown method does not crash.
+unknown_method_no_crash(_Config) ->
+    ?assertEqual(ok, aws_auth_validate_metrics:observe(<<"unknown_method">>, success, 100)),
+    ok.
+
+%% Verify that observing an unknown category does not crash.
+unknown_category_no_crash(_Config) ->
+    ?assertEqual(ok, aws_auth_validate_metrics:observe(<<"ldap">>, some_unknown_category, 100)),
+    ok.

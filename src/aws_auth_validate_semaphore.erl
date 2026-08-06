@@ -10,7 +10,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/1, acquire/0, release/1, current/0]).
+-export([start_link/1, acquire/0, release/1, current/0, usage/0]).
 
 -export([
     init/1,
@@ -46,6 +46,12 @@ release(Ref) ->
 -spec current() -> non_neg_integer().
 current() ->
     gen_server:call(?MODULE, get_current).
+
+%% @doc Return the current in-use count and the configured maximum capacity.
+%% Used by the metrics collector at scrape time to emit semaphore gauges.
+-spec usage() -> {non_neg_integer(), pos_integer()}.
+usage() ->
+    gen_server:call(?MODULE, usage).
 
 %%--------------------------------------------------------------------
 %% gen_server callbacks
@@ -93,6 +99,8 @@ handle_call(
     end;
 handle_call(get_current, _From, #sem_state{current = Current} = State) ->
     {reply, Current, State};
+handle_call(usage, _From, #sem_state{current = Current, max = Max} = State) ->
+    {reply, {Current, Max}, State};
 handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 

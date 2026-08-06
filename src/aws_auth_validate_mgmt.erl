@@ -317,7 +317,10 @@ audit(Method, SourceIP, User, ResultCategory, T0) ->
     ?AWS_LOG_INFO(
         "auth_validate: method=~ts user=~ts source_ip=~ts result=~ts duration_ms=~B",
         [sanitize_log(Method), sanitize_log(User), format_ip(SourceIP), ResultCategory, Duration]
-    ).
+    ),
+    %% Emit Prometheus metrics for this request. observe/3 is a no-op when
+    %% the metrics collector is not registered, so this is always safe.
+    aws_auth_validate_metrics:observe(Method, ResultCategory, Duration).
 
 %% Strip control characters (CR, LF, TAB, any other byte < 0x20, and DEL) from a
 %% value before it is interpolated into the single-line audit record. Method
