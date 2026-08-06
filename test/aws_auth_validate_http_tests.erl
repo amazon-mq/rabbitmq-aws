@@ -42,7 +42,9 @@ http_allowed_fields_test() ->
             <<"resource_path">>,
             <<"topic_path">>,
             <<"http_method">>,
-            <<"ssl_options">>
+            <<"ssl_options">>,
+            <<"username">>,
+            <<"password_arn">>
         ]
     ].
 
