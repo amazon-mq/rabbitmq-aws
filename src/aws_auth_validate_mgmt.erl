@@ -30,8 +30,10 @@
 %% to an HTTP status, including the catch-all for an unexpected category;
 %% max_body_size/0 resolves the configured body-size limit against its bounds;
 %% sanitize_log/1 strips control chars from a caller-influenceable audit field;
-%% username/1 extracts the authenticated principal (or the `unknown' fallback).
--export([status_for_category/1, max_body_size/0, sanitize_log/1, username/1]).
+%% username/1 extracts the authenticated principal (or the `unknown' fallback);
+%% referenced_arns/2 extracts known ARN reference strings from the request body
+%% for audit logging (never resolved content, only identifiers).
+-export([status_for_category/1, max_body_size/0, sanitize_log/1, username/1, referenced_arns/2]).
 -endif.
 
 -include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
@@ -105,17 +107,17 @@ with_body(T0, SourceIP, User, Method, Req0, Context) ->
     MaxBytes = max_body_size(),
     case read_body(Req0, MaxBytes) of
         {error, body_too_large, Req1} ->
-            audit(Method, SourceIP, User, body_too_large, T0),
+            audit(Method, SourceIP, User, body_too_large, <<"none">>, T0),
             reply_error(400, body_too_large, <<"Request body too large">>, Req1, Context);
         {ok, RawBody, Req1} ->
             case decode_json(RawBody) of
                 {error, _} ->
-                    audit(Method, SourceIP, User, input_invalid, T0),
+                    audit(Method, SourceIP, User, input_invalid, <<"none">>, T0),
                     reply_error(400, input_invalid, <<"Invalid JSON body">>, Req1, Context);
                 {ok, BodyMap} when is_map(BodyMap) ->
                     with_semaphore(T0, SourceIP, User, Method, BodyMap, Req1, Context);
                 {ok, _NotMap} ->
-                    audit(Method, SourceIP, User, input_invalid, T0),
+                    audit(Method, SourceIP, User, input_invalid, <<"none">>, T0),
                     reply_error(
                         400, input_invalid, <<"JSON body must be an object">>, Req1, Context
                     )
@@ -130,9 +132,10 @@ with_semaphore(T0, SourceIP, User, Method, BodyMap, Req, Context) ->
     %% atomic acquire IS the liveness check, so there is no time-of-check vs
     %% time-of-use window -- and map it to the same graceful 503 as a full
     %% semaphore. Any other exit propagates (it is a genuine fault).
+    Arns = referenced_arns(Method, BodyMap),
     case try_acquire() of
         not_ready ->
-            audit(Method, SourceIP, User, capacity_exhausted, T0),
+            audit(Method, SourceIP, User, capacity_exhausted, Arns, T0),
             reply_error(
                 503,
                 capacity_exhausted,
@@ -141,7 +144,7 @@ with_semaphore(T0, SourceIP, User, Method, BodyMap, Req, Context) ->
                 Context
             );
         {error, full} ->
-            audit(Method, SourceIP, User, capacity_exhausted, T0),
+            audit(Method, SourceIP, User, capacity_exhausted, Arns, T0),
             reply_error(503, capacity_exhausted, <<"Service at capacity">>, Req, Context);
         {ok, Ref} ->
             try
@@ -159,11 +162,11 @@ with_semaphore(T0, SourceIP, User, Method, BodyMap, Req, Context) ->
                 %% Report it as a 500 rather than a 400 connection_failed, which
                 %% would wrongly tell the caller their LDAP server is unreachable.
                 Result = aws_auth_validate_registry:dispatch(Method, BodyMap),
-                audit(Method, SourceIP, User, result_category(Result), T0),
+                audit(Method, SourceIP, User, result_category(Result), Arns, T0),
                 respond(Result, Req, Context)
             catch
                 _Class:_Reason:_Stack ->
-                    audit(Method, SourceIP, User, internal_error, T0),
+                    audit(Method, SourceIP, User, internal_error, Arns, T0),
                     reply_error(
                         500,
                         internal_error,
@@ -312,11 +315,23 @@ decode_json(<<>>) ->
 decode_json(Raw) ->
     rabbit_json:try_decode(Raw).
 
-audit(Method, SourceIP, User, ResultCategory, T0) ->
+%% Emit a single-line audit record for every validation request. The arns= field
+%% lists the ARN reference strings the request carried (identifiers, not resolved
+%% content -- safe to log per the R6 no-credential-leakage invariant). For
+%% pre-decode failures (body_too_large, malformed JSON) arns=none is emitted since
+%% no body was parsed.
+audit(Method, SourceIP, User, ResultCategory, Arns, T0) ->
     Duration = erlang:monotonic_time(millisecond) - T0,
     ?AWS_LOG_INFO(
-        "auth_validate: method=~ts user=~ts source_ip=~ts result=~ts duration_ms=~B",
-        [sanitize_log(Method), sanitize_log(User), format_ip(SourceIP), ResultCategory, Duration]
+        "auth_validate: method=~ts user=~ts source_ip=~ts result=~ts duration_ms=~B arns=~ts",
+        [
+            sanitize_log(Method),
+            sanitize_log(User),
+            format_ip(SourceIP),
+            ResultCategory,
+            Duration,
+            Arns
+        ]
     ),
     %% Emit Prometheus metrics for this request. observe/3 is a no-op when
     %% the metrics collector is not registered, so this is always safe.
@@ -368,6 +383,64 @@ format_ip(IP) when is_tuple(IP) ->
     end;
 format_ip(_) ->
     <<"unknown">>.
+
+%% Extracts the ARN reference strings that the request body carries, for inclusion
+%% in the audit log. Only a bounded set of known ARN keys is inspected --
+%% password_arn, cacertfile_arn, certfile_arn, keyfile_arn -- so arbitrary body
+%% fields are never leaked. Each value is sanitized before interpolation (log-
+%% injection guard). Returns a comma-joined binary of the ARN identifiers, or
+%% <<"none">> if no relevant ARN keys are present. ARN references are identifiers
+%% (safe to log per R6); resolved secret/cert content is never logged.
+%%
+%% Top-level ARN keys are included only if they appear in the backend's
+%% effective_allowed_fields. TLS-material ARN keys nested one level inside
+%% ssl_options are included when ssl_options itself is an allowed field (the
+%% parent's presence is sufficient; sub-keys are not individually listed in
+%% effective_allowed_fields).
+referenced_arns(Method, BodyMap) ->
+    KnownArnKeys = [
+        <<"password_arn">>, <<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>
+    ],
+    TlsArnKeys = [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
+    case aws_auth_validate_registry:lookup_backend(Method) of
+        {error, unknown_method} ->
+            <<"none">>;
+        {ok, Module} ->
+            AllowedFields = aws_auth_validate_registry:effective_allowed_fields(Module, Method),
+            %% Collect top-level ARN values that are in both the known set and
+            %% the effective allowed fields for this backend.
+            TopLevelArns = [
+                sanitize_log(V)
+             || K <- KnownArnKeys,
+                lists:member(K, AllowedFields),
+                V <- [maps:get(K, BodyMap, undefined)],
+                is_binary(V)
+            ],
+            %% Walk one level into ssl_options for TLS-material ARN keys. The
+            %% parent ssl_options being an allowed field is sufficient -- the
+            %% sub-keys are not individually gated by effective_allowed_fields.
+            SslArns =
+                case lists:member(<<"ssl_options">>, AllowedFields) of
+                    true ->
+                        case maps:get(<<"ssl_options">>, BodyMap, undefined) of
+                            SslMap when is_map(SslMap) ->
+                                [
+                                    sanitize_log(V)
+                                 || K <- TlsArnKeys,
+                                    V <- [maps:get(K, SslMap, undefined)],
+                                    is_binary(V)
+                                ];
+                            _ ->
+                                []
+                        end;
+                    false ->
+                        []
+                end,
+            case TopLevelArns ++ SslArns of
+                [] -> <<"none">>;
+                Collected -> iolist_to_binary(lists:join(<<",">>, Collected))
+            end
+    end.
 
 %%--------------------------------------------------------------------
 %% Configuration accessors

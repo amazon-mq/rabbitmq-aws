@@ -93,6 +93,32 @@ to caller-supplied targets, and every method can cause the broker to assume the
 configured role and fetch ARN-backed material, so treat access to it
 accordingly.
 
+## Audit logging
+
+Every validation request emits a single-line structured log entry containing the
+method, authenticated user, source IP, result category, duration, and the ARN
+references the request carried:
+
+```
+auth_validate: method=ldap user=admin source_ip=10.0.0.5 result=success duration_ms=247 arns=arn:aws:secretsmanager:us-east-1:123456789012:secret:pw
+```
+
+The `arns=` field lists the ARN reference strings (identifiers) found in the
+request body from a bounded key set: `password_arn`, `cacertfile_arn`,
+`certfile_arn`, `keyfile_arn`. ARN references are safe to log per the R6 security
+invariant -- they are identifiers, not the resolved secret/certificate content,
+which is never logged. Multiple ARN references are comma-separated; when no ARN
+keys are present in the request, `arns=none` is emitted.
+
+For pre-decode failures (`body_too_large`, malformed JSON), `arns=none` is
+emitted since no body was parsed at that point.
+
+Nested TLS-material ARN keys inside `ssl_options` (e.g.
+`ssl_options.cacertfile_arn`) are also included when the parent `ssl_options`
+field is allowed for the backend. Each ARN value is sanitized before
+interpolation to prevent log-injection attacks (control characters are replaced
+with U+FFFD).
+
 ## Enabling the endpoint
 
 The feature is **opt-in and disabled by default**. Two levels of toggle are

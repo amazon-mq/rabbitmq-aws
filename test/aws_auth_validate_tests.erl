@@ -1111,6 +1111,182 @@ tls_body(CacertArn) ->
     }.
 
 %%--------------------------------------------------------------------
+%% referenced_arns/2 -- ARN extraction for audit log
+%%--------------------------------------------------------------------
+
+%% A request with a top-level password_arn in the body (and in the effective
+%% allowed fields) surfaces that ARN in the audit output.
+referenced_arns_top_level_password_arn_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"password_arn">>, <<"servers">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Arn = <<"arn:aws:secretsmanager:us-east-1:123456789012:secret:my-secret">>,
+            Body = #{<<"password_arn">> => Arn},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [?_assertEqual(Arn, Result)]
+        end}.
+
+%% A nested ssl_options.cacertfile_arn appears when ssl_options is an allowed field.
+referenced_arns_nested_ssl_options_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"ssl_options">>, <<"servers">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Arn = <<"arn:aws:acm-pca:us-east-1:123456789012:certificate-authority/abc">>,
+            Body = #{<<"ssl_options">> => #{<<"cacertfile_arn">> => Arn}},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [?_assertEqual(Arn, Result)]
+        end}.
+
+%% A request body with no ARN fields returns <<"none">>.
+referenced_arns_none_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"servers">>, <<"port">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Body = #{<<"servers">> => [<<"ldap.example.com">>]},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [?_assertEqual(<<"none">>, Result)]
+        end}.
+
+%% An ARN value containing CR/LF is sanitized (replaced with U+FFFD).
+referenced_arns_sanitizes_crlf_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"password_arn">>, <<"servers">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Body = #{<<"password_arn">> => <<"arn:aws:sm:us-east-1:123:secret\r\ninjected">>},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [
+                ?_assertEqual(nomatch, binary:match(Result, <<"\r">>)),
+                ?_assertEqual(nomatch, binary:match(Result, <<"\n">>))
+            ]
+        end}.
+
+%% The access_token field (oauth secret) is NEVER included -- it is not in the
+%% known ARN key set (password_arn, cacertfile_arn, certfile_arn, keyfile_arn).
+referenced_arns_excludes_access_token_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"oauth">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"oauth">>
+            ) ->
+                [<<"access_token">>, <<"resource_server_id">>, <<"ssl_options">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Body = #{
+                <<"access_token">> => <<"secret_token_value">>,
+                <<"resource_server_id">> => <<"my-resource">>
+            },
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"oauth">>, Body),
+            [
+                ?_assertEqual(<<"none">>, Result),
+                %% Double-check the token value does not appear in the result.
+                ?_assertEqual(nomatch, binary:match(Result, <<"secret_token_value">>))
+            ]
+        end}.
+
+%% Only ARN reference identifiers from the known key set appear -- never arbitrary
+%% body field values that might be resolved secrets or other sensitive content.
+referenced_arns_no_secret_leakage_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"password_arn">>, <<"servers">>, <<"user_dn">>, <<"ssl_options">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Arn = <<"arn:aws:secretsmanager:us-east-1:123456789012:secret:pw">>,
+            Body = #{
+                <<"password_arn">> => Arn,
+                <<"servers">> => [<<"ldap.example.com">>],
+                <<"user_dn">> => <<"cn=admin,dc=example,dc=com">>,
+                <<"some_unknown_field">> => <<"should-never-appear">>
+            },
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [
+                %% Only the password_arn value appears (it is the only known ARN key present).
+                ?_assertEqual(Arn, Result),
+                %% Arbitrary body values never appear.
+                ?_assertEqual(nomatch, binary:match(Result, <<"ldap.example.com">>)),
+                ?_assertEqual(nomatch, binary:match(Result, <<"cn=admin">>)),
+                ?_assertEqual(nomatch, binary:match(Result, <<"should-never-appear">>))
+            ]
+        end}.
+
+%%--------------------------------------------------------------------
 %% LDAP query DSL parser (aws_auth_validate_ldap_query)
 %%--------------------------------------------------------------------
 
