@@ -61,10 +61,26 @@
 dispatcher() -> [{"/aws/auth/validate/:method", ?MODULE, []}].
 
 %% Register the management-console UI extension. The management plugin serves
-%% this plugin's priv/www/ automatically (see rabbit_mgmt_dispatcher), so the
-%% referenced file is loaded from priv/www/js/aws_auth_validate.js. The JS adds
-%% an admin-gated "Auth Validation" tab that drives PUT /aws/auth/validate/:method.
+%% this plugin's priv/www/ automatically (see rabbit_mgmt_dispatcher).
+%%
+%% aws_auth_validate.js adds an admin-gated "Auth Validation" tab that drives
+%% PUT /aws/auth/validate/:method and renders the tab's EJS template.
+%%
+%% How that template is loaded depends on the RabbitMQ series (see the Makefile
+%% gate on rabbitmq-management-plugin.mk):
+%%   - main/v4.3.x: the management UI looks templates up in a build-time
+%%     COMPILED_TEMPLATES map (no runtime eval). We must load aws-ejs.js -- the
+%%     precompiled bundle produced by `make app` -- FIRST, so the compiled
+%%     template is registered before the view renders it. HAVE_MGMT_EJS_PRECOMPILE
+%%     is defined in that case.
+%%   - v4.2.x/v3.13.x: the UI still compiles priv/www/js/tmpl/*.ejs at runtime;
+%%     aws-ejs.js is never generated, so registering it would 404. Load only
+%%     aws_auth_validate.js and let the runtime loader fetch the raw .ejs.
+-ifdef(HAVE_MGMT_EJS_PRECOMPILE).
+web_ui() -> [{javascript, [<<"aws-ejs.js">>, <<"aws_auth_validate.js">>]}].
+-else.
 web_ui() -> [{javascript, <<"aws_auth_validate.js">>}].
+-endif.
 
 %%--------------------------------------------------------------------
 %% cowboy_rest callbacks
