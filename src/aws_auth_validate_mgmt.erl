@@ -32,8 +32,18 @@
 %% sanitize_log/1 strips control chars from a caller-influenceable audit field;
 %% username/1 extracts the authenticated principal (or the `unknown' fallback);
 %% referenced_arns/2 extracts known ARN reference strings from the request body
-%% for audit logging (never resolved content, only identifiers).
--export([status_for_category/1, max_body_size/0, sanitize_log/1, username/1, referenced_arns/2]).
+%% for audit logging (never resolved content, only identifiers);
+%% encode_arn_value/1 percent-encodes ambiguous bytes for the audit format;
+%% prepare_arn_value/1 validates, caps, and encodes a single ARN value for logging.
+-export([
+    status_for_category/1,
+    max_body_size/0,
+    sanitize_log/1,
+    username/1,
+    referenced_arns/2,
+    encode_arn_value/1,
+    prepare_arn_value/1
+]).
 -endif.
 
 -include_lib("rabbitmq_web_dispatch/include/rabbitmq_web_dispatch_records.hrl").
@@ -42,6 +52,11 @@
 
 -define(DEFAULT_MAX_BODY_SIZE, 65_536).
 -define(DEFAULT_REQUIRED_USER_TAG, administrator).
+%% Maximum byte length of a single ARN value in the audit log. Real ARNs are
+%% well under this limit; the cap prevents a maliciously large value from
+%% producing an unbounded log line. Values exceeding this are truncated with
+%% a "...[truncated]" marker.
+-define(MAX_ARN_LOG_LEN, 2048).
 
 dispatcher() -> [{"/aws/auth/validate/:method", ?MODULE, []}].
 
@@ -356,6 +371,43 @@ sanitize_byte(B) when B < 16#20; B =:= 16#7F ->
 sanitize_byte(B) ->
     <<B>>.
 
+%% Percent-encode bytes that would be ambiguous in the space/comma-delimited
+%% audit format: space (0x20), equals (0x3D), comma (0x2C), percent (0x25),
+%% and control bytes (< 0x20, 0x7F). The encoding is reversible and greppable.
+encode_arn_value(Bin) when is_binary(Bin) ->
+    <<<<(encode_arn_byte(B))/binary>> || <<B>> <= Bin>>.
+
+encode_arn_byte(B) when B < 16#20 -> percent_hex(B);
+encode_arn_byte(16#20) -> <<"%20">>;
+encode_arn_byte(16#25) -> <<"%25">>;
+encode_arn_byte(16#2C) -> <<"%2C">>;
+encode_arn_byte(16#3D) -> <<"%3D">>;
+encode_arn_byte(16#7F) -> <<"%7F">>;
+encode_arn_byte(B) -> <<B>>.
+
+percent_hex(B) ->
+    <<$%, (hex_digit(B bsr 4)), (hex_digit(B band 16#0F))>>.
+
+hex_digit(N) when N < 10 -> $0 + N;
+hex_digit(N) -> $A + N - 10.
+
+%% Prepare an ARN value for audit logging: validate shape, cap length,
+%% percent-encode ambiguous bytes. A value exceeding MAX_ARN_LOG_LEN is
+%% truncated with a marker. A value not starting with "arn:" is wrapped
+%% in [non-arn:...] so it cannot masquerade as a real ARN identifier.
+prepare_arn_value(Bin) when byte_size(Bin) > ?MAX_ARN_LOG_LEN ->
+    Truncated = binary:part(Bin, 0, ?MAX_ARN_LOG_LEN),
+    <<(encode_arn_value(Truncated))/binary, "...[truncated]">>;
+prepare_arn_value(<<"arn:", _/binary>> = Bin) ->
+    encode_arn_value(Bin);
+prepare_arn_value(Bin) ->
+    Prefix =
+        case byte_size(Bin) > 128 of
+            true -> binary:part(Bin, 0, 128);
+            false -> Bin
+        end,
+    <<"[non-arn:", (encode_arn_value(Prefix))/binary, "]">>.
+
 %% The authenticated management user's name, for the audit trail. This endpoint
 %% is admin-gated and makes outbound connections to caller-chosen targets (an
 %% SSRF surface), so the acting principal -- not just the TCP peer IP, which
@@ -387,48 +439,63 @@ format_ip(_) ->
 %% Extracts the ARN reference strings that the request body carries, for inclusion
 %% in the audit log. Only a bounded set of known ARN keys is inspected --
 %% password_arn, cacertfile_arn, certfile_arn, keyfile_arn -- so arbitrary body
-%% fields are never leaked. Each value is sanitized before interpolation (log-
-%% injection guard). Returns a comma-joined binary of the ARN identifiers, or
-%% <<"none">> if no relevant ARN keys are present. ARN references are identifiers
-%% (safe to log per R6); resolved secret/cert content is never logged.
+%% fields are never leaked. Each value is percent-encoded (space, equals, comma,
+%% percent, control bytes) to prevent log injection and field forgery (F1/F4),
+%% capped at MAX_ARN_LOG_LEN bytes with a truncation marker (F2), and validated
+%% for the "arn:" prefix -- non-ARN values are wrapped in [non-arn:...] so they
+%% cannot masquerade as real identifiers (F2). Empty-string values are treated as
+%% absent (F3). Returns a comma-joined binary of the prepared ARN values, or
+%% <<"none">> if no relevant ARN keys are present.
+%%
+%% ARN references are identifiers (safe to log per R6); resolved secret/cert
+%% content is never logged.
 %%
 %% Top-level ARN keys are included only if they appear in the backend's
 %% effective_allowed_fields. TLS-material ARN keys nested one level inside
 %% ssl_options are included when ssl_options itself is an allowed field (the
 %% parent's presence is sufficient; sub-keys are not individually listed in
-%% effective_allowed_fields).
+%% effective_allowed_fields). The set of ssl_options ARN keys is per-method:
+%% the tls backend accepts only cacertfile_arn (it validates local CA material,
+%% not client certs for outbound mTLS), while ldap/http accept all three (F6).
 referenced_arns(Method, BodyMap) ->
     KnownArnKeys = [
         <<"password_arn">>, <<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>
     ],
-    TlsArnKeys = [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>],
     case aws_auth_validate_registry:lookup_backend(Method) of
         {error, unknown_method} ->
             <<"none">>;
         {ok, Module} ->
+            %% NOTE: this duplicates the lookup_backend + effective_allowed_fields
+            %% work that dispatch/2 performs moments later. Threading the resolved
+            %% module through the pipeline would tangle the mgmt->registry boundary
+            %% for marginal savings; left as-is deliberately.
             AllowedFields = aws_auth_validate_registry:effective_allowed_fields(Module, Method),
             %% Collect top-level ARN values that are in both the known set and
             %% the effective allowed fields for this backend.
             TopLevelArns = [
-                sanitize_log(V)
+                prepare_arn_value(V)
              || K <- KnownArnKeys,
                 lists:member(K, AllowedFields),
                 V <- [maps:get(K, BodyMap, undefined)],
-                is_binary(V)
+                is_binary(V),
+                V =/= <<>>
             ],
             %% Walk one level into ssl_options for TLS-material ARN keys. The
             %% parent ssl_options being an allowed field is sufficient -- the
             %% sub-keys are not individually gated by effective_allowed_fields.
+            %% The key set is method-specific (see ssl_arn_keys_for_method/1).
             SslArns =
                 case lists:member(<<"ssl_options">>, AllowedFields) of
                     true ->
                         case maps:get(<<"ssl_options">>, BodyMap, undefined) of
                             SslMap when is_map(SslMap) ->
+                                SslArnKeys = ssl_arn_keys_for_method(Method),
                                 [
-                                    sanitize_log(V)
-                                 || K <- TlsArnKeys,
+                                    prepare_arn_value(V)
+                                 || K <- SslArnKeys,
                                     V <- [maps:get(K, SslMap, undefined)],
-                                    is_binary(V)
+                                    is_binary(V),
+                                    V =/= <<>>
                                 ];
                             _ ->
                                 []
@@ -441,6 +508,16 @@ referenced_arns(Method, BodyMap) ->
                 Collected -> iolist_to_binary(lists:join(<<",">>, Collected))
             end
     end.
+
+%% Per-method ssl_options ARN keys that the backend actually processes.
+%% The tls backend validates only the CA bundle (cacertfile_arn); certfile_arn
+%% and keyfile_arn under ssl_options are for client-cert mTLS to a remote auth
+%% service, which ldap and http support but tls (a local-material check) does
+%% not.
+ssl_arn_keys_for_method(<<"tls">>) ->
+    [<<"cacertfile_arn">>];
+ssl_arn_keys_for_method(_) ->
+    [<<"cacertfile_arn">>, <<"certfile_arn">>, <<"keyfile_arn">>].
 
 %%--------------------------------------------------------------------
 %% Configuration accessors

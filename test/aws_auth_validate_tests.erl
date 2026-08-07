@@ -1197,7 +1197,7 @@ referenced_arns_none_test_() ->
             [?_assertEqual(<<"none">>, Result)]
         end}.
 
-%% An ARN value containing CR/LF is sanitized (replaced with U+FFFD).
+%% An ARN value containing CR/LF is percent-encoded (no raw control chars in output).
 referenced_arns_sanitizes_crlf_test_() ->
     {setup,
         fun() ->
@@ -1220,7 +1220,10 @@ referenced_arns_sanitizes_crlf_test_() ->
             Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
             [
                 ?_assertEqual(nomatch, binary:match(Result, <<"\r">>)),
-                ?_assertEqual(nomatch, binary:match(Result, <<"\n">>))
+                ?_assertEqual(nomatch, binary:match(Result, <<"\n">>)),
+                %% Control chars are percent-encoded.
+                ?_assertNotEqual(nomatch, binary:match(Result, <<"%0D">>)),
+                ?_assertNotEqual(nomatch, binary:match(Result, <<"%0A">>))
             ]
         end}.
 
@@ -1291,6 +1294,167 @@ referenced_arns_no_secret_leakage_test_() ->
                 ?_assertEqual(nomatch, binary:match(Result, <<"ldap.example.com">>)),
                 ?_assertEqual(nomatch, binary:match(Result, <<"cn=admin">>)),
                 ?_assertEqual(nomatch, binary:match(Result, <<"should-never-appear">>))
+            ]
+        end}.
+
+%%--------------------------------------------------------------------
+%% encode_arn_value/1 -- percent-encoding for audit safety (F1/F4)
+%%--------------------------------------------------------------------
+
+encode_arn_value_plain_passthrough_test() ->
+    In = <<"arn:aws:secretsmanager:us-east-1:123456789012:secret:pw">>,
+    ?assertEqual(In, aws_auth_validate_mgmt:encode_arn_value(In)).
+
+encode_arn_value_encodes_space_test() ->
+    ?assertEqual(<<"arn:aws:x%20y">>, aws_auth_validate_mgmt:encode_arn_value(<<"arn:aws:x y">>)).
+
+encode_arn_value_encodes_equals_test() ->
+    ?assertEqual(<<"a%3Db">>, aws_auth_validate_mgmt:encode_arn_value(<<"a=b">>)).
+
+encode_arn_value_encodes_comma_test() ->
+    ?assertEqual(<<"a%2Cb">>, aws_auth_validate_mgmt:encode_arn_value(<<"a,b">>)).
+
+encode_arn_value_encodes_percent_test() ->
+    ?assertEqual(<<"100%2525">>, aws_auth_validate_mgmt:encode_arn_value(<<"100%25">>)).
+
+encode_arn_value_encodes_control_chars_test() ->
+    ?assertEqual(<<"%0D%0A">>, aws_auth_validate_mgmt:encode_arn_value(<<"\r\n">>)).
+
+encode_arn_value_encodes_del_test() ->
+    ?assertEqual(<<"%7F">>, aws_auth_validate_mgmt:encode_arn_value(<<127>>)).
+
+%%--------------------------------------------------------------------
+%% prepare_arn_value/1 -- length cap, non-ARN detection (F2)
+%%--------------------------------------------------------------------
+
+prepare_arn_value_normal_arn_test() ->
+    In = <<"arn:aws:secretsmanager:us-east-1:123456789012:secret:pw">>,
+    ?assertEqual(In, aws_auth_validate_mgmt:prepare_arn_value(In)).
+
+prepare_arn_value_truncates_overlength_test() ->
+    %% A value exceeding 2048 bytes is truncated with a marker.
+    Long = iolist_to_binary([<<"arn:aws:sm:">>, binary:copy(<<"x">>, 2100)]),
+    Result = aws_auth_validate_mgmt:prepare_arn_value(Long),
+    ?assert(byte_size(Result) < byte_size(Long)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"...[truncated]">>)).
+
+prepare_arn_value_non_arn_prefix_test() ->
+    %% A value not starting with "arn:" is wrapped.
+    Result = aws_auth_validate_mgmt:prepare_arn_value(<<"not-an-arn-value">>),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"[non-arn:">>)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"]">>)).
+
+prepare_arn_value_non_arn_caps_at_128_test() ->
+    %% A long non-ARN value only includes the first 128 bytes.
+    Long = binary:copy(<<"x">>, 500),
+    Result = aws_auth_validate_mgmt:prepare_arn_value(Long),
+    %% [non-arn: + 128 x's + ] = 138 bytes + prefix/suffix
+    ?assert(byte_size(Result) < 200).
+
+prepare_arn_value_injection_attempt_test() ->
+    %% An injection attempt is encoded so spaces/equals don't forge fields.
+    Injected = <<"arn:aws:x result=success user=root">>,
+    Result = aws_auth_validate_mgmt:prepare_arn_value(Injected),
+    %% No raw space or equals in the output.
+    ?assertEqual(nomatch, binary:match(Result, <<" ">>)),
+    %% The encoded version has %20 and %3D.
+    ?assertNotEqual(nomatch, binary:match(Result, <<"%20">>)),
+    ?assertNotEqual(nomatch, binary:match(Result, <<"%3D">>)).
+
+%%--------------------------------------------------------------------
+%% referenced_arns/2 -- additional edge cases (F3, F4, F6)
+%%--------------------------------------------------------------------
+
+%% An empty-string ARN value is treated as absent (F3).
+referenced_arns_empty_string_yields_none_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"password_arn">>, <<"servers">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            Body = #{<<"password_arn">> => <<>>},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [?_assertEqual(<<"none">>, Result)]
+        end}.
+
+%% A comma within a value is percent-encoded, not confused with the separator (F4).
+referenced_arns_comma_in_value_encoded_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"ldap">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"ldap">>
+            ) ->
+                [<<"password_arn">>, <<"servers">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            %% A single ARN value containing a comma must not split into two entries.
+            Body = #{<<"password_arn">> => <<"arn:aws:sm:us-east-1:123:secret:a,b">>},
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"ldap">>, Body),
+            [
+                %% The raw comma is encoded as %2C.
+                ?_assertNotEqual(nomatch, binary:match(Result, <<"%2C">>)),
+                %% Splitting on comma yields exactly one element (the whole value).
+                ?_assertEqual(1, length(binary:split(Result, <<",">>, [global])))
+            ]
+        end}.
+
+%% The tls method only reports cacertfile_arn, not certfile_arn/keyfile_arn (F6).
+referenced_arns_tls_only_cacertfile_test_() ->
+    {setup,
+        fun() ->
+            ok = meck:new(aws_auth_validate_registry, [passthrough]),
+            meck:expect(aws_auth_validate_registry, lookup_backend, fun(<<"tls">>) ->
+                {ok, some_module}
+            end),
+            meck:expect(aws_auth_validate_registry, effective_allowed_fields, fun(
+                some_module, <<"tls">>
+            ) ->
+                [<<"ssl_options">>, <<"target">>]
+            end),
+            ok
+        end,
+        fun(_) ->
+            meck:unload(aws_auth_validate_registry)
+        end,
+        fun(_) ->
+            CaArn = <<"arn:aws:acm-pca:us-east-1:123:ca/abc">>,
+            CertArn = <<"arn:aws:sm:us-east-1:123:secret:cert">>,
+            KeyArn = <<"arn:aws:sm:us-east-1:123:secret:key">>,
+            Body = #{
+                <<"ssl_options">> => #{
+                    <<"cacertfile_arn">> => CaArn,
+                    <<"certfile_arn">> => CertArn,
+                    <<"keyfile_arn">> => KeyArn
+                }
+            },
+            Result = aws_auth_validate_mgmt:referenced_arns(<<"tls">>, Body),
+            [
+                %% Only cacertfile_arn is reported.
+                ?_assertNotEqual(nomatch, binary:match(Result, <<"acm-pca">>)),
+                %% certfile and keyfile are NOT reported.
+                ?_assertEqual(nomatch, binary:match(Result, <<"secret:cert">>)),
+                ?_assertEqual(nomatch, binary:match(Result, <<"secret:key">>))
             ]
         end}.
 
