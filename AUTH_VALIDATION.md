@@ -15,7 +15,9 @@ The `:method` path segment selects the backend to validate. Supported methods:
 - `ldap` - LDAP simple bind, optional StartTLS, optional post-bind DN lookup and
   authorization-query checks (mirrors `rabbitmq_auth_backend_ldap`).
 - `http` - HTTP auth backend reachability, including mTLS (client
-  certificate/key) to the auth service.
+  certificate/key) to the auth service. Optionally accepts `username` and
+  `password_arn` for a credentialed probe that asserts `user_path` returns
+  `allow` for the supplied credentials (see below).
 - `oauth` - OAuth2/OIDC: JWKS reachability and, when an access token is
   supplied, signature and `exp`/`aud` verification plus optional
   scope/authorization evaluation. `nbf` is deliberately not checked, matching
@@ -185,7 +187,9 @@ aws.arns.assume_role_arn = arn:aws:iam::111122223333:role/rabbitmq-auth-validati
 
 Without it, requests to those two methods fail with 422 `config_conflict` even
 when otherwise correct. The `http` and `oauth` methods need it only when the
-request references ARN-backed TLS material.
+request references ARN-backed TLS material -- with the exception of `http`
+credentialed-probe mode (see below), which always requires it because the
+`password_arn` must be resolved.
 
 Additional tuning keys (each has an effective default applied in code, so the
 key only needs to be set to override it):
@@ -236,6 +240,54 @@ from it return 404 `method_disabled`. Its visibility is hard-coded to the
 `administrator` tag, so lowering `required_user_tag` does not make the tab
 appear for users holding the lowered tag, even though the endpoint accepts
 their requests.
+
+## HTTP method: credentialed-probe mode
+
+By default the `http` method operates in reachability-only mode: it confirms
+each configured `*_path` is reachable and speaks the auth protocol (an allow or
+deny response), using a synthetic probe principal. A `deny` for the probe is a
+success -- it proves the endpoint is an auth backend.
+
+When both `username` and `password_arn` are supplied in the request body, the
+method switches to **credentialed-probe mode**:
+
+```json
+{
+  "user_path": "https://auth.example.com/auth/user",
+  "username": "alice",
+  "password_arn": "arn:aws:secretsmanager:us-east-1:111122223333:secret:rabbit-pw",
+  "http_method": "post"
+}
+```
+
+In credentialed mode the `user_path` probe sends the real username and resolved
+password (matching `rabbit_auth_backend_http`'s user-check request shape) and
+**asserts the response is `allow`**. A `deny` from the auth server means the
+credential was rejected -- reported as 422 `auth_failed` with the reason "HTTP
+auth server denied the supplied credentials". Other configured paths
+(`vhost_path`, `resource_path`, `topic_path`) remain reachability-only even
+when credentials are supplied.
+
+### Fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `username` | string | No* | The username to authenticate. |
+| `password_arn` | string | No* | A Secrets Manager ARN referencing the password. |
+
+*Both must be supplied together or both omitted. Supplying only one returns 400
+`input_invalid` with "username and password_arn must be supplied together".
+
+### Requirements
+
+- A configured `aws.arns.assume_role_arn` is **mandatory** when `password_arn`
+  is supplied, regardless of whether `ssl_options` references any TLS-material
+  ARNs. Without it, the request returns 422 `config_conflict`.
+- The password is supplied by ARN reference only (never inline) -- the resolved
+  secret is fetched server-side under the operator's configured role.
+- The resolved password is never logged, returned in any response, or exposed
+  in crash reports.
+- Reachability-only mode is completely unchanged when credentials are omitted.
 
 ## Metrics
 

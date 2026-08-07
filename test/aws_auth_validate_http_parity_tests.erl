@@ -114,6 +114,39 @@ query_encoding_special_chars_test_() ->
     end.
 
 %%--------------------------------------------------------------------
+%% Credentialed-query encoding parity (non-ASCII byte sequences)
+%%--------------------------------------------------------------------
+
+%% The credentialed query must encode non-ASCII bytes identically to
+%% rabbit_http_util:quote_plus/1 (the encoder the real backend uses). A prior
+%% version used uri_string:compose_query which treats each byte from
+%% binary_to_list as a Unicode codepoint, re-encoding to UTF-8 and producing
+%% double-encoded sequences for multi-byte chars (e.g. 0xC3 0xA9 -> %C3%83%C2%A9
+%% instead of %C3%A9). This test pins the byte-parity for a non-ASCII value.
+credentialed_query_nonascii_parity_test_() ->
+    case upstream_q_usable() of
+        false ->
+            [];
+        true ->
+            %% "cafe" with accent on e: UTF-8 bytes 0x63 0x61 0x66 0xC3 0xA9
+            NonAscii = <<"caf", 16#C3, 16#A9>>,
+            Expected = rabbit_http_util:quote_plus(NonAscii),
+            Params = #{username => NonAscii, password => <<"pw">>},
+            Query = aws_auth_validate_http:credentialed_query_for(Params),
+            [
+                {"non-ASCII username encoding matches rabbit_http_util:quote_plus",
+                    ?_assertNotEqual(nomatch, string:find(Query, "username=" ++ Expected))},
+                {"non-ASCII password encoding matches rabbit_http_util:quote_plus", fun() ->
+                    PwNonAscii = <<"p", 16#C3, 16#A4, "ss">>,
+                    PwExpected = rabbit_http_util:quote_plus(PwNonAscii),
+                    PwParams = #{username => <<"u">>, password => PwNonAscii},
+                    PwQuery = aws_auth_validate_http:credentialed_query_for(PwParams),
+                    ?assertNotEqual(nomatch, string:find(PwQuery, "password=" ++ PwExpected))
+                end}
+            ]
+    end.
+
+%%--------------------------------------------------------------------
 %% Tag-join parity (join_tags/1 is exported upstream)
 %%--------------------------------------------------------------------
 

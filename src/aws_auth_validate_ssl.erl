@@ -102,12 +102,17 @@
 %%   reasons    :: map()      -- backend-specific fixed reason binaries, keyed by
 %%                 the atoms below (so each backend keeps its own fixed-response
 %%                 wording). See reason/2.
+%%   force_assume_role :: boolean() -- optional; when true, require/assume the
+%%                 configured role even if the request references no ARN (the
+%%                 http credentialed probe sets this because password_arn always
+%%                 resolves). Defaults to false when absent.
 -type opts() :: #{
     arn_keys := [binary()],
     ssl_option_keys := [binary()],
     sni_key := binary(),
     client_cert := boolean(),
-    reasons := map()
+    reasons := map(),
+    force_assume_role => boolean()
 }.
 
 -export_type([opts/0]).
@@ -148,7 +153,10 @@ configured_assume_role_arn() ->
 -spec resolve_request_state(map(), opts()) ->
     {ok, map()} | {error, aws_auth_validate_backend:error_category(), binary()}.
 resolve_request_state(Params, Opts) ->
-    case request_references_arn(Params, Opts) of
+    MustAssume =
+        maps:get(force_assume_role, Opts, false) orelse
+            request_references_arn(Params, Opts),
+    case MustAssume of
         false ->
             %% No ARN is referenced, so this request resolves nothing and needs
             %% no credentials. Do NOT hand out a usable aws_lib:new() state here:
