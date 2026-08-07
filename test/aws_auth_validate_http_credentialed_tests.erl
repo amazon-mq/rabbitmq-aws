@@ -103,11 +103,20 @@ classify_credentialed_response_deny_with_reason_test() ->
         aws_auth_validate_http:classify_credentialed_response(<<"deny bad password">>)
     ).
 
-%% Non-auth-shaped body -> auth_failed (same as deny -- server did not grant).
+%% Non-auth-shaped body -> auth_failed with REASON_ENDPOINT (not an auth server),
+%% distinct from a well-formed deny (which uses REASON_AUTH_DENIED). This lets the
+%% operator distinguish "wrong endpoint" from "credentials rejected".
 classify_credentialed_response_garbage_test() ->
     ?assertMatch(
-        {error, auth_failed, <<"HTTP auth server denied the supplied credentials">>},
+        {error, auth_failed, <<"HTTP auth server did not return a usable response">>},
         aws_auth_validate_http:classify_credentialed_response(<<"hello">>)
+    ).
+
+%% Empty body -> auth_failed with REASON_ENDPOINT (not an auth server).
+classify_credentialed_response_empty_test() ->
+    ?assertMatch(
+        {error, auth_failed, <<"HTTP auth server did not return a usable response">>},
+        aws_auth_validate_http:classify_credentialed_response(<<>>)
     ).
 
 %%--------------------------------------------------------------------

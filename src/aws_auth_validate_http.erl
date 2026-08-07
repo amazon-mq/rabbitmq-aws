@@ -296,46 +296,25 @@ validate(Body) when is_map(Body) ->
 %% into Params. Runs after all pure input validation has passed, so a malformed
 %% request never triggers an STS AssumeRole call (ARN-first ordering).
 %%
-%% Mirrors the LDAP backend's guardrail (resolve_request_state/1 there): when the
-%% request resolves ANY ARN, a configured `aws.arns.assume_role_arn' is
-%% MANDATORY. We assume that role -- the SAME role the plugin already assumes at
-%% boot to resolve every configured ARN (aws_arn_config:maybe_assume_role/1) --
-%% into a request-local aws_lib state and resolve the TLS-material ARNs under it.
-%% This is operator config, not caller input, so it raises no confused-deputy
-%% concern.
-%%
-%% When NO role is configured we do NOT fall back to a default aws_lib state:
-%% that would resolve ARNs with the broker's ambient (EC2 instance) credentials,
-%% which on Amazon MQ can be far more privileged than the role a customer would
-%% attach to their own secret/bucket, so a validate request could resolve ARNs
-%% the caller's intended role never could -- a least-privilege pitfall. We never
-%% use the instance role: with an ARN referenced and no assume_role configured,
-%% refuse with config_conflict before any secret fetch or outbound connection.
-%%
-%% For the credentialed mode (username + password_arn): the password_arn will be
+%% Delegates to the shared aws_auth_validate_ssl:resolve_request_state/2 for both
+%% modes. In credentialed mode (username + password_arn) the password_arn will be
 %% resolved under the assumed role, so an assume_role_arn is MANDATORY regardless
-%% of whether TLS material ARNs are also referenced. This matches the LDAP
-%% backend where password_arn always forces the role. For reachability-only mode,
-%% the behaviour is unchanged: ARNs are only required when TLS material is
-%% referenced.
+%% of whether TLS material ARNs are also referenced -- the `force_assume_role'
+%% flag in the opts map achieves this by skipping the request_references_arn check
+%% and always requiring the configured role.
 %%
-%% Delegates to the shared aws_auth_validate_ssl helper for reachability mode.
-%% The no-ARN branch there stores the `none' credential sentinel (which
-%% resolve_arn/2 refuses), matching the fail-closed contract PR #116 introduced
-%% -- a customer request can never resolve an ARN under the broker's ambient EC2
-%% instance role.
+%% For reachability-only mode the behaviour is unchanged: the shared helper checks
+%% whether any ARN key is present in ssl_options before requiring a role. The
+%% no-ARN branch stores the `none' credential sentinel (which resolve_arn/2
+%% refuses), matching the fail-closed contract PR #116 introduced -- a customer
+%% request can never resolve an ARN under the broker's ambient EC2 instance role.
 resolve_request_state(#{credential_mode := credentialed} = Params) ->
     %% Credentialed mode resolves password_arn, so assume_role is mandatory
-    %% regardless of whether TLS material ARNs are also referenced.
-    case aws_auth_validate_ssl:configured_assume_role_arn() of
-        none ->
-            {error, config_conflict, ?REASON_NO_ASSUME_ROLE};
-        RoleArn ->
-            case aws_iam:assume_role(RoleArn, aws_lib:new()) of
-                {ok, State} -> {ok, Params#{aws_state => State}};
-                {error, _} -> {error, input_invalid, ?REASON_ASSUME_ROLE}
-            end
-    end;
+    %% regardless of whether TLS material ARNs are also referenced. The shared
+    %% helper's force_assume_role flag skips the request_references_arn check and
+    %% always requires/assumes the configured role.
+    Opts = (ssl_opts())#{force_assume_role => true},
+    aws_auth_validate_ssl:resolve_request_state(Params, Opts);
 resolve_request_state(Params) ->
     aws_auth_validate_ssl:resolve_request_state(Params, ssl_opts()).
 
@@ -600,7 +579,18 @@ probe_one(Key, Url, Params, SslOpts, Profile) ->
         {ok, PinnedUrl, Host} ->
             UrlStr = maps:get(url_string, PinnedUrl),
             {Query, Classifier} = probe_query_and_classifier(Key, Params),
-            Request = build_request(Method, UrlStr, Query, Host),
+            %% Force POST for credentialed probes: a GET would append the
+            %% resolved password to the URL query string, leaking it into auth
+            %% server access logs and any intermediate proxy/LB logs. POST puts
+            %% credentials in the request body where they are not logged by
+            %% standard infrastructure. Reachability probes use whatever method
+            %% the operator configured (default GET) -- they carry no secret.
+            EffectiveMethod =
+                case maps:get(credential_mode, Params, reachability) of
+                    credentialed -> post;
+                    _ -> Method
+                end,
+            Request = build_request(EffectiveMethod, UrlStr, Query, Host),
             HttpOpts =
                 [
                     {timeout, Timeout},
@@ -610,7 +600,9 @@ probe_one(Key, Url, Params, SslOpts, Profile) ->
                     %% do not re-vet the Location target).
                     {autoredirect, false}
                 ] ++ ssl_http_opt(Url, Host, SslOpts),
-            case httpc:request(Method, Request, HttpOpts, [{body_format, binary}], Profile) of
+            case
+                httpc:request(EffectiveMethod, Request, HttpOpts, [{body_format, binary}], Profile)
+            of
                 {ok, {{_Vsn, Code, _Phrase}, _Headers, Body}} ->
                     case lists:member(Code, ?AUTH_RESPONSE_CODES) of
                         %% A usable status is necessary but not sufficient: the
@@ -641,11 +633,13 @@ probe_query_and_classifier(Key, _Params) ->
 
 %% Build the query string for a credentialed user_path probe, matching the
 %% fields rabbit_auth_backend_http sends for a user check (username + password).
+%% Uses rabbit_http_util:quote_plus/1 -- the same encoder the real backend uses
+%% in rabbit_auth_backend_http:q/1 -- to ensure byte-for-byte encoding parity.
+%% uri_string:compose_query would re-encode non-ASCII bytes as UTF-8 codepoints
+%% (double-encoding), producing different percent-sequences for multi-byte chars.
 credentialed_query_for(#{username := Username, password := Password}) ->
-    uri_string:compose_query([
-        {"username", binary_to_list(Username)},
-        {"password", binary_to_list(Password)}
-    ]).
+    "username=" ++ rabbit_http_util:quote_plus(Username) ++
+        "&password=" ++ rabbit_http_util:quote_plus(Password).
 
 %% Map an httpc transport error to a fixed category (shared classifier). A
 %% TLS/cert failure -> tls_failed; everything else -> connection_failed. The raw
@@ -689,13 +683,21 @@ classify_response(Key, Body) ->
 
 %% In credentialed mode, only `allow' is success. A well-formed `deny' means
 %% the credential was rejected -- the operator expected it to work, so this is
-%% auth_failed. A non-auth-shaped body is also auth_failed (same as a deny: the
-%% server did not grant access for the supplied credentials).
+%% auth_failed with REASON_AUTH_DENIED. A body matching NEITHER allow NOR deny
+%% means the endpoint is not an auth server at all -- report REASON_ENDPOINT (the
+%% same distinction the reachability classifier makes), so the operator is not
+%% misled into thinking their credentials are wrong when the path simply points at
+%% the wrong endpoint.
 classify_credentialed_response(Body) ->
     Normalized = normalize_resp(Body),
     case is_keyword_prefix(<<"allow">>, Normalized) of
-        true -> ok;
-        false -> {error, auth_failed, ?REASON_AUTH_DENIED}
+        true ->
+            ok;
+        false ->
+            case is_keyword_prefix(<<"deny">>, Normalized) of
+                true -> {error, auth_failed, ?REASON_AUTH_DENIED};
+                false -> {error, auth_failed, ?REASON_ENDPOINT}
+            end
     end.
 
 %% Normalize exactly as rabbit_auth_backend_http does: strip leading/trailing

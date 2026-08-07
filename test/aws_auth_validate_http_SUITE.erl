@@ -58,7 +58,14 @@ groups() ->
             mtls_client_cert_presented_returns_ok,
             mtls_client_cert_missing_returns_tls_failed,
             hostname_pin_preserves_host_ok,
-            hostname_resolving_to_infra_denied
+            hostname_resolving_to_infra_denied,
+            %% Credentialed-probe path integration tests (F4/F5).
+            credentialed_allow_returns_ok,
+            credentialed_deny_returns_auth_denied,
+            credentialed_non_auth_returns_endpoint,
+            credentialed_no_assume_role_returns_config_conflict,
+            credentialed_assume_role_failure_returns_input_invalid,
+            credentialed_password_never_in_error
         ]}
     ].
 
@@ -372,6 +379,155 @@ hostname_resolving_to_infra_denied(_Config) ->
         )
     after
         meck:unload(inet)
+    end.
+
+%%--------------------------------------------------------------------
+%% Credentialed-probe integration tests (F4: end-to-end wiring, F5: guardrails)
+%%--------------------------------------------------------------------
+%%
+%% These exercise the full validate/1 -> probe_query_and_classifier ->
+%% credentialed_query_for -> classify_credentialed_response wiring through the
+%% in-process httpd stub. They mock ARN resolution (aws_arn_util:resolve_arn)
+%% to return a fixed password, since no real Secrets Manager is available, but
+%% the rest of the path -- including the POST override, the response classifier,
+%% and the assume-role guardrails -- runs for real.
+
+credentialed_allow_returns_ok(Config) ->
+    %% Stub returns "allow" on user_path -> credentialed probe should succeed.
+    ok = meck:new(aws_arn_util, [passthrough]),
+    try
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+            {ok, <<"test-password">>, State}
+        end),
+        Port = ?config(http_port, Config),
+        Url = iolist_to_binary(["http://127.0.0.1:", integer_to_list(Port), "/ok200"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"get">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        ?assertEqual(ok, validate(Body))
+    after
+        meck:unload(aws_arn_util)
+    end.
+
+credentialed_deny_returns_auth_denied(Config) ->
+    %% Stub returns "deny" on user_path -> credentialed probe reports auth_denied.
+    ok = meck:new(aws_arn_util, [passthrough]),
+    try
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+            {ok, <<"test-password">>, State}
+        end),
+        Port = ?config(http_port, Config),
+        Url = iolist_to_binary(["http://127.0.0.1:", integer_to_list(Port), "/denyok"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"get">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        ?assertEqual(
+            {error, auth_failed, <<"HTTP auth server denied the supplied credentials">>},
+            validate(Body)
+        )
+    after
+        meck:unload(aws_arn_util)
+    end.
+
+credentialed_non_auth_returns_endpoint(Config) ->
+    %% Stub returns non-auth body ("hello") on user_path -> report REASON_ENDPOINT
+    %% (not an auth server), distinct from a credential denial. Tests F3's fix.
+    ok = meck:new(aws_arn_util, [passthrough]),
+    try
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+            {ok, <<"test-password">>, State}
+        end),
+        Port = ?config(http_port, Config),
+        Url = iolist_to_binary(["http://127.0.0.1:", integer_to_list(Port), "/notauth"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"get">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        ?assertEqual(
+            {error, auth_failed, <<"HTTP auth server did not return a usable response">>},
+            validate(Body)
+        )
+    after
+        meck:unload(aws_arn_util)
+    end.
+
+credentialed_no_assume_role_returns_config_conflict(_Config) ->
+    %% F5: credentialed mode with NO assume_role_arn configured -> config_conflict.
+    %% Temporarily remove the arn_config env (set in init_per_group) and unmeck
+    %% aws_iam so the real code path runs.
+    OldArn = application:get_env(aws, arn_config),
+    application:unset_env(aws, arn_config),
+    try
+        Body = #{
+            <<"user_path">> => <<"http://8.8.8.8/auth">>,
+            <<"http_method">> => <<"get">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        ?assertMatch(
+            {error, config_conflict, _},
+            validate(Body)
+        )
+    after
+        case OldArn of
+            {ok, V} -> application:set_env(aws, arn_config, V);
+            undefined -> ok
+        end
+    end.
+
+credentialed_assume_role_failure_returns_input_invalid(_Config) ->
+    %% F5: assume-role failure -> input_invalid. Temporarily override the aws_iam
+    %% mock to return an error.
+    meck:expect(aws_iam, assume_role, fun(_RoleArn, _State) -> {error, sts_error} end),
+    try
+        Body = #{
+            <<"user_path">> => <<"http://8.8.8.8/auth">>,
+            <<"http_method">> => <<"get">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        ?assertMatch(
+            {error, input_invalid, _},
+            validate(Body)
+        )
+    after
+        %% Restore the success mock for remaining tests.
+        meck:expect(aws_iam, assume_role, fun(_RoleArn, State) -> {ok, State} end)
+    end.
+
+credentialed_password_never_in_error(Config) ->
+    %% F5: the resolved password must NEVER appear in any error tuple returned by
+    %% the validator (security invariant R6). Drive a credentialed request whose
+    %% endpoint returns "deny" (an auth_failed error) and assert the password
+    %% binary does not appear as a substring of the reason.
+    ResolvedPassword = <<"SuperS3cret!P@ssword#123">>,
+    ok = meck:new(aws_arn_util, [passthrough]),
+    try
+        meck:expect(aws_arn_util, resolve_arn, fun(_Arn, State) ->
+            {ok, ResolvedPassword, State}
+        end),
+        Port = ?config(http_port, Config),
+        Url = iolist_to_binary(["http://127.0.0.1:", integer_to_list(Port), "/denyok"]),
+        Body = #{
+            <<"user_path">> => Url,
+            <<"http_method">> => <<"post">>,
+            <<"username">> => <<"alice">>,
+            <<"password_arn">> => <<"arn:aws:secretsmanager:us-east-1:111:secret:pw">>
+        },
+        Result = validate(Body),
+        %% Result is {error, auth_failed, Reason}; assert password not in Reason.
+        {error, _, Reason} = Result,
+        ?assertEqual(nomatch, binary:match(Reason, ResolvedPassword))
+    after
+        meck:unload(aws_arn_util)
     end.
 
 %% Route a resolve_arn call to the right PEM by ARN. The validator passes the
