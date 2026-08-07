@@ -93,6 +93,62 @@ to caller-supplied targets, and every method can cause the broker to assume the
 configured role and fetch ARN-backed material, so treat access to it
 accordingly.
 
+## Audit logging
+
+Every validation request emits a single-line structured log entry containing the
+method, authenticated user, source IP, result category, duration, and the ARN
+references the request carried:
+
+```
+auth_validate: method=ldap user=admin source_ip=10.0.0.5 result=success duration_ms=247 arns=arn:aws:secretsmanager:us-east-1:123456789012:secret:pw
+```
+
+The `arns=` field lists the ARN reference strings (identifiers) found in the
+request body from a bounded key set: `password_arn`, `cacertfile_arn`,
+`certfile_arn`, `keyfile_arn`. ARN references are safe to log per the R6 security
+invariant -- they are identifiers, not the resolved secret/certificate content,
+which is never logged. Multiple ARN references are comma-separated; when no ARN
+keys are present in the request (or all are empty strings), `arns=none` is
+emitted.
+
+For pre-decode failures (`body_too_large`, malformed JSON), `arns=none` is
+emitted since no body was parsed at that point.
+
+Nested TLS-material ARN keys inside `ssl_options` (e.g.
+`ssl_options.cacertfile_arn`) are also included when the parent `ssl_options`
+field is allowed for the backend. The set of ssl_options ARN keys is per-method:
+for `tls` only `cacertfile_arn` is reported (the tls backend validates local CA
+material, not client certs for outbound mTLS); for `ldap` and `http` all three
+keys (`cacertfile_arn`, `certfile_arn`, `keyfile_arn`) are reported.
+
+### Value encoding
+
+Each ARN value is percent-encoded before interpolation to prevent log-injection
+attacks. The following bytes are encoded as `%XX` (uppercase hex):
+
+| Byte    | Encoding | Reason                                    |
+|---------|----------|-------------------------------------------|
+| < 0x20  | `%XX`    | Control characters (prevent line splitting)|
+| 0x20    | `%20`    | Space (field delimiter in the log format)  |
+| 0x25    | `%25`    | Percent (encoding self-escape)             |
+| 0x2C    | `%2C`    | Comma (ARN value separator)               |
+| 0x3D    | `%3D`    | Equals (key=value delimiter)              |
+| 0x7F    | `%7F`    | DEL control character                      |
+
+This encoding is reversible (standard percent-decoding) and makes values
+unambiguous and greppable. All other bytes (including UTF-8 multi-byte
+sequences) pass through unchanged.
+
+### Length cap and non-ARN detection
+
+Each logged ARN value is capped at 2048 bytes. Values exceeding this limit are
+truncated and appended with `...[truncated]`. Real ARNs are well under this cap;
+it exists to prevent unbounded log lines from maliciously large input.
+
+A value that does not start with the `arn:` prefix is logged as
+`[non-arn:<first-128-bytes-percent-encoded>]` so it cannot masquerade as a real
+ARN identifier but is still attributable for forensic purposes.
+
 ## Enabling the endpoint
 
 The feature is **opt-in and disabled by default**. Two levels of toggle are
