@@ -56,6 +56,23 @@
 
 -define(BACKOFF_BASE_MILLIS, 500).
 -define(BACKOFF_CAP_MILLIS, 10000).
+
+%% ECS/EKS container credentials endpoint constants.
+%% The default host for AWS_CONTAINER_CREDENTIALS_RELATIVE_URI.
+-define(ECS_CREDENTIALS_HOST, "169.254.170.2").
+%% Alternate ECS/EKS link-local address (also used by EKS Pod Identity Agent).
+-define(ECS_CREDENTIALS_HOST_ALT, "169.254.170.23").
+%% IPv6 EKS Pod Identity Agent address.
+-define(ECS_CREDENTIALS_HOST_V6, "fd00:ec2::23").
+%% Connect timeout for container credential endpoint (local/link-local, should be fast).
+-define(CONTAINER_CREDS_CONNECT_TIMEOUT, 2000).
+%% Response timeout for container credential endpoint.
+-define(CONTAINER_CREDS_RESPONSE_TIMEOUT, 5000).
+%% Maximum response body size from container credential endpoint (credentials JSON is ~1KB).
+-define(CONTAINER_CREDS_MAX_BODY, 16384).
+%% Maximum size of an authorization token file (8KB is generous for a bearer token).
+-define(CONTAINER_AUTH_TOKEN_MAX_SIZE, 8192).
+
 -define(MAX_RETRIES, 5).
 
 -define(AWS_CREDENTIALS_TABLE, aws_credentials).

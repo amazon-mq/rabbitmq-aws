@@ -42,7 +42,10 @@
     %% _}}) rather than blocking on a background reconnect.
     retry => non_neg_integer(),
     %% Request (await/await_body) timeout, consulted only by request/7.
-    timeout => timeout()
+    timeout => timeout(),
+    %% TLS client options forwarded to gun when transport is tls. Used by the
+    %% container credentials path to configure verify_peer with system CAs.
+    tls_opts => [ssl:tls_client_option()]
 }.
 
 %% The response tuple this module produces, consumed by
@@ -71,10 +74,17 @@ open(Host, Port, Opts) ->
     },
     %% Only override gun's default retry count when the caller asks; existing
     %% one-shot callers leave it unset and keep gun's default behaviour.
-    GunOpts =
+    GunOpts1 =
         case maps:find(retry, Opts) of
             {ok, Retry} -> GunOpts0#{retry => Retry};
             error -> GunOpts0
+        end,
+    %% Forward TLS client options to gun when the caller provides them (used by
+    %% the container credentials HTTPS path for verify_peer with system CAs).
+    GunOpts =
+        case maps:find(tls_opts, Opts) of
+            {ok, TlsOpts} -> GunOpts1#{tls_opts => TlsOpts};
+            error -> GunOpts1
         end,
     case gun:open(Host, Port, GunOpts) of
         {ok, ConnPid} ->
