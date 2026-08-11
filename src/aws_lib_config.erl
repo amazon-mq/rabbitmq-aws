@@ -22,7 +22,8 @@
     load_imdsv2_token/0,
     instance_metadata_request_headers/1,
     region/1,
-    endpoint_url/1
+    endpoint_url/1,
+    parse_iso8601_timestamp/1
 ]).
 
 %% Export all for unit tests
@@ -571,29 +572,56 @@ lookup_credentials(_, AccessKey, SecretKey, SessionToken, Config) ->
 %% @doc Return the access key and secret access key if they are set in
 %%      for the specified profile in the config file, if it exists. If it does
 %%      not exist or the profile is not set or the values are not set in the
-%%      profile, look up the values in the shared credentials file
+%%      profile, look up the values in the shared credentials file.
+%%
+%%      When the config file profile has role_arn but no access_key, we must
+%%      check for role_arn before falling through to the credentials file --
+%%      a profile with role_arn + source_profile is a valid credential source
+%%      even without inline static keys.
 %% @end
 lookup_credentials_from_config(Profile, {error, _}, _, _, Config) ->
-    lookup_credentials_from_file(Profile, credentials_file_data(), Config);
-lookup_credentials_from_config(_, AccessKey, SecretKey, SessionToken, Config) ->
-    Creds =
-        case SessionToken of
-            {error, _} ->
-                #aws_credentials{
-                    access_key = AccessKey,
-                    secret_key = SecretKey,
-                    security_token = undefined,
-                    expiration = undefined
-                };
-            SessionToken ->
-                #aws_credentials{
-                    access_key = AccessKey,
-                    secret_key = SecretKey,
-                    security_token = SessionToken,
-                    expiration = undefined
-                }
-        end,
-    {ok, Creds, Config}.
+    %% No access_key in config file profile -- check if there is a role_arn
+    %% before falling through to the credentials file.
+    case value(Profile, role_arn) of
+        {error, _} ->
+            lookup_credentials_from_file(Profile, credentials_file_data(), Config);
+        _RoleArn ->
+            %% Profile has role_arn in config file: resolve via chain.
+            %% Re-fetch the full section data for chain resolution.
+            SectionData = config_section_data(Profile),
+            lookup_credentials_from_section(SectionData, Config)
+    end;
+lookup_credentials_from_config(Profile, AccessKey, SecretKey, SessionToken, Config) ->
+    %% Access key is present in config file. However, if role_arn is ALSO present,
+    %% the static keys are source credentials for AssumeRole -- route through
+    %% chain resolution rather than returning static creds directly.
+    case value(Profile, role_arn) of
+        {error, _} ->
+            %% No role_arn: return static credentials as-is.
+            Creds =
+                case SessionToken of
+                    {error, _} ->
+                        #aws_credentials{
+                            access_key = AccessKey,
+                            secret_key = SecretKey,
+                            security_token = undefined,
+                            expiration = undefined
+                        };
+                    SessionToken ->
+                        #aws_credentials{
+                            access_key = AccessKey,
+                            secret_key = SecretKey,
+                            security_token = SessionToken,
+                            expiration = undefined
+                        }
+                end,
+            {ok, Creds, Config};
+        _RoleArn ->
+            %% Profile has both access_key and role_arn. The static keys are the
+            %% source credentials for AssumeRole. Route to chain resolution.
+            SectionData = config_section_data(Profile),
+            lookup_credentials_from_section(SectionData, Config)
+    end.
 
 -spec lookup_credentials_from_file(
     Profile :: string(),
@@ -621,14 +649,31 @@ lookup_credentials_from_file(Profile, Credentials, Config) ->
 %%      for the specified profile from the shared credentials file. If the
 %%      profile is not set or the values are not set in the profile, attempt to
 %%      lookup the values from the EC2 instance metadata service.
+%%
+%%      When the section contains a `role_arn' key, credential chain resolution
+%%      is triggered: source credentials are resolved (from source_profile or
+%%      the section's own static keys), then STS AssumeRole is called. This
+%%      path is ONLY reachable from the boot-time config load -- never from a
+%%      validation request body.
 %% @end
 lookup_credentials_from_section(undefined, Config) ->
     lookup_credentials_from_instance_metadata(Config);
 lookup_credentials_from_section(Credentials, Config) ->
-    AccessKey = proplists:get_value(aws_access_key_id, Credentials, undefined),
-    SecretKey = proplists:get_value(aws_secret_access_key, Credentials, undefined),
-    SessionToken = proplists:get_value(aws_session_token, Credentials, undefined),
-    lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config).
+    case proplists:get_value(role_arn, Credentials, undefined) of
+        undefined ->
+            %% No role_arn -- resolve static credentials as before.
+            AccessKey = proplists:get_value(aws_access_key_id, Credentials, undefined),
+            SecretKey = proplists:get_value(aws_secret_access_key, Credentials, undefined),
+            SessionToken = proplists:get_value(aws_session_token, Credentials, undefined),
+            lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config);
+        RoleArn ->
+            %% role_arn present -- enter credential chain resolution.
+            %% The profile name is not directly available here since this
+            %% function receives the section proplist, but we use "unknown" as
+            %% a placeholder for the top-level entry. The chain tracks
+            %% visited profiles from the source_profile resolution path.
+            resolve_role_arn_credentials(RoleArn, Credentials, Config, [])
+    end.
 
 -spec lookup_credentials_from_proplist(
     AccessKey :: access_key(),
@@ -652,6 +697,344 @@ lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
         expiration = undefined
     },
     {ok, Creds, Config}.
+
+%% ============================================================================
+%% Credential chain resolution (role_arn / source_profile)
+%%
+%% This code path is ONLY reachable from boot-time config file credential
+%% loading (aws_lib_config:credentials/1,2). It is impossible for a validation
+%% request body to inject role_arn/source_profile because:
+%%   - aws_auth_validate_mgmt gets request JSON and passes filtered fields
+%%   - aws_auth_validate_registry has per-backend allowed_fields/0 that do
+%%     NOT include role_arn or source_profile
+%%   - This module (aws_lib_config) is NOT called from any validation path
+%% ============================================================================
+
+-spec resolve_role_arn_credentials(
+    RoleArn :: string(),
+    SectionData :: list(),
+    Config :: aws_config(),
+    Visited :: [string()]
+) ->
+    {ok, aws_credentials(), aws_config()} | {error, term()}.
+%% @doc Entry point for role_arn credential chain resolution. Checks for
+%% credential_source (rejected -- not supported, belongs to issue-94),
+%% resolves source credentials, validates the session name, and calls STS
+%% AssumeRole.
+%% @end
+resolve_role_arn_credentials(RoleArn, SectionData, Config, Visited) ->
+    %% Check for credential_source -- reject with a loud error
+    case proplists:get_value(credential_source, SectionData, undefined) of
+        undefined ->
+            resolve_role_arn_credentials_inner(RoleArn, SectionData, Config, Visited);
+        CredSourceValue ->
+            Profile = proplists:get_value(source_profile, SectionData, "unknown"),
+            ?LOG_WARNING(
+                "credential_source is not yet supported (profile=~ts, value=~ts). "
+                "See issue-94 for implementation.",
+                [Profile, format_value(CredSourceValue)]
+            ),
+            {error, {credential_source_not_supported, Profile, CredSourceValue}}
+    end.
+
+resolve_role_arn_credentials_inner(RoleArn, SectionData, Config, Visited) ->
+    %% Depth check
+    case length(Visited) >= ?MAX_CREDENTIAL_CHAIN_DEPTH of
+        true ->
+            Profile = proplists:get_value(source_profile, SectionData, "unknown"),
+            ?LOG_ERROR(
+                "Credential chain too deep: profile=~ts, depth=~B, max=~B. "
+                "Check for excessive role_arn/source_profile nesting in AWS config.",
+                [Profile, length(Visited), ?MAX_CREDENTIAL_CHAIN_DEPTH]
+            ),
+            {error, {credential_chain_too_deep, Profile, length(Visited)}};
+        false ->
+            resolve_source_credentials(RoleArn, SectionData, Config, Visited)
+    end.
+
+resolve_source_credentials(RoleArn, SectionData, Config, Visited) ->
+    SourceProfile = proplists:get_value(source_profile, SectionData, undefined),
+    case SourceProfile of
+        undefined ->
+            %% role_arn without source_profile: use this section's own static creds
+            resolve_inline_source_credentials(RoleArn, SectionData, Config, Visited);
+        SourceProfile ->
+            %% role_arn with source_profile: resolve from the named profile
+            resolve_named_source_profile(RoleArn, SourceProfile, SectionData, Config, Visited)
+    end.
+
+%% When role_arn is present without source_profile, the section's own
+%% aws_access_key_id/aws_secret_access_key serve as the source credentials
+%% for the AssumeRole call.
+resolve_inline_source_credentials(RoleArn, SectionData, Config, Visited) ->
+    AccessKey = proplists:get_value(aws_access_key_id, SectionData, undefined),
+    SecretKey = proplists:get_value(aws_secret_access_key, SectionData, undefined),
+    case {AccessKey, SecretKey} of
+        {undefined, _} ->
+            ?LOG_ERROR(
+                "Profile has role_arn without source_profile and no "
+                "aws_access_key_id. Cannot resolve source credentials for "
+                "AssumeRole on ~ts.",
+                [RoleArn]
+            ),
+            {error, {missing_source_credentials, RoleArn}};
+        {_, undefined} ->
+            ?LOG_ERROR(
+                "Profile has role_arn without source_profile and no "
+                "aws_secret_access_key. Cannot resolve source credentials for "
+                "AssumeRole on ~ts.",
+                [RoleArn]
+            ),
+            {error, {missing_source_credentials, RoleArn}};
+        {AK, SK} ->
+            SessionToken = proplists:get_value(aws_session_token, SectionData, undefined),
+            SourceCreds = #aws_credentials{
+                access_key = AK,
+                secret_key = SK,
+                security_token = SessionToken,
+                expiration = undefined
+            },
+            perform_assume_role(RoleArn, SectionData, SourceCreds, Config, Visited)
+    end.
+
+%% Resolve credentials from a named source_profile. The profile is looked up
+%% in both the credentials file and the config file.
+resolve_named_source_profile(RoleArn, SourceProfile, SectionData, Config, Visited) ->
+    %% Cycle detection
+    case lists:member(SourceProfile, Visited) of
+        true ->
+            ?LOG_ERROR(
+                "Credential chain cycle detected: profile=~ts already visited. "
+                "Visited chain: ~tp",
+                [SourceProfile, Visited]
+            ),
+            {error, {credential_chain_cycle, SourceProfile, Visited}};
+        false ->
+            resolve_named_source_profile_lookup(
+                RoleArn, SourceProfile, SectionData, Config, [SourceProfile | Visited]
+            )
+    end.
+
+resolve_named_source_profile_lookup(RoleArn, SourceProfile, SectionData, Config, Visited) ->
+    %% Look up source_profile in credentials file first, then config file.
+    %% Credentials file uses bare [NAME]; config file uses [profile NAME].
+    SourceSection = lookup_source_profile_section(SourceProfile),
+    case SourceSection of
+        undefined ->
+            ?LOG_ERROR(
+                "source_profile '~ts' not found in credentials file or config file. "
+                "Cannot resolve credentials for AssumeRole on ~ts.",
+                [SourceProfile, RoleArn]
+            ),
+            {error, {source_profile_not_found, SourceProfile}};
+        SourceData ->
+            %% The source profile itself may have role_arn -- recurse
+            case proplists:get_value(role_arn, SourceData, undefined) of
+                undefined ->
+                    %% Source has static credentials
+                    AK = proplists:get_value(aws_access_key_id, SourceData, undefined),
+                    SK = proplists:get_value(aws_secret_access_key, SourceData, undefined),
+                    case {AK, SK} of
+                        {undefined, _} ->
+                            ?LOG_ERROR(
+                                "source_profile '~ts' exists but has no "
+                                "aws_access_key_id.",
+                                [SourceProfile]
+                            ),
+                            {error, {source_profile_missing_credentials, SourceProfile}};
+                        {_, undefined} ->
+                            ?LOG_ERROR(
+                                "source_profile '~ts' exists but has no "
+                                "aws_secret_access_key.",
+                                [SourceProfile]
+                            ),
+                            {error, {source_profile_missing_credentials, SourceProfile}};
+                        {_, _} ->
+                            ST = proplists:get_value(
+                                aws_session_token, SourceData, undefined
+                            ),
+                            SourceCreds = #aws_credentials{
+                                access_key = AK,
+                                secret_key = SK,
+                                security_token = ST,
+                                expiration = undefined
+                            },
+                            perform_assume_role(
+                                RoleArn, SectionData, SourceCreds, Config, Visited
+                            )
+                    end;
+                NestedRoleArn ->
+                    %% Source profile also has role_arn -- chain deeper.
+                    %% First check credential_source on the nested profile.
+                    case proplists:get_value(credential_source, SourceData, undefined) of
+                        undefined ->
+                            ok;
+                        NestedCredSource ->
+                            ?LOG_WARNING(
+                                "credential_source is not yet supported "
+                                "(profile=~ts, value=~ts). See issue-94.",
+                                [SourceProfile, format_value(NestedCredSource)]
+                            ),
+                            throw(
+                                {error,
+                                    {credential_source_not_supported, SourceProfile,
+                                        NestedCredSource}}
+                            )
+                    end,
+                    %% Recursively resolve the nested chain
+                    case
+                        resolve_role_arn_credentials_inner(
+                            NestedRoleArn, SourceData, Config, Visited
+                        )
+                    of
+                        {ok, NestedCreds, _Config2} ->
+                            perform_assume_role(
+                                RoleArn, SectionData, NestedCreds, Config, Visited
+                            );
+                        {error, _} = Error ->
+                            Error
+                    end
+            end
+    end.
+
+%% Perform the actual STS AssumeRole call with resolved source credentials.
+perform_assume_role(RoleArn, SectionData, SourceCreds, Config, _Visited) ->
+    %% Validate and determine session name
+    case resolve_session_name(SectionData) of
+        {error, _} = Error ->
+            Error;
+        {ok, SessionName} ->
+            %% Build opts map for aws_iam:assume_role/3
+            ExternalId = proplists:get_value(external_id, SectionData, undefined),
+            Opts0 = #{role_session_name => SessionName},
+            Opts =
+                case ExternalId of
+                    undefined -> Opts0;
+                    _ -> Opts0#{external_id => ExternalId}
+                end,
+            %% Build a State with the source credentials for signing
+            State = #aws_state{
+                credentials = SourceCreds,
+                config = Config
+            },
+            StartTime = erlang:monotonic_time(millisecond),
+            ?LOG_INFO(
+                "Credential chain: assuming role ~ts (session=~ts)",
+                [RoleArn, SessionName]
+            ),
+            case aws_iam:assume_role(RoleArn, Opts, State) of
+                {ok, AssumedCreds} ->
+                    Elapsed = erlang:monotonic_time(millisecond) - StartTime,
+                    ?LOG_INFO(
+                        "Credential chain: AssumeRole for ~ts succeeded in ~Bms",
+                        [RoleArn, Elapsed]
+                    ),
+                    {ok, AssumedCreds, Config};
+                {error, Reason} ->
+                    Elapsed = erlang:monotonic_time(millisecond) - StartTime,
+                    ?LOG_ERROR(
+                        "Credential chain: AssumeRole for ~ts failed after ~Bms: ~tp",
+                        [RoleArn, Elapsed, Reason]
+                    ),
+                    {error, {assume_role_failed, RoleArn, Reason}}
+            end
+    end.
+
+%% Resolve the session name from profile data: if role_session_name is set,
+%% validate it; otherwise derive from "rabbitmq-aws-<profile>".
+resolve_session_name(SectionData) ->
+    case proplists:get_value(role_session_name, SectionData, undefined) of
+        undefined ->
+            %% Derive from profile name. The derived name "rabbitmq-aws-<profile>"
+            %% is always valid because profile names come from the INI regex
+            %% which only allows [\w\s+\-_]. We use "session" as a fallback
+            %% that is guaranteed to be valid.
+            SourceProfile = proplists:get_value(source_profile, SectionData, "session"),
+            DerivedName = "rabbitmq-aws-" ++ ensure_string(SourceProfile),
+            {ok, DerivedName};
+        Name ->
+            NameStr = ensure_string(Name),
+            case validate_session_name(NameStr) of
+                true ->
+                    {ok, NameStr};
+                false ->
+                    ?LOG_ERROR(
+                        "Invalid role_session_name: '~ts'. Must match pattern "
+                        "[\\w+=,.@-]{2,64}.",
+                        [NameStr]
+                    ),
+                    {error, {invalid_role_session_name, NameStr}}
+            end
+    end.
+
+%% Validate that a session name matches the STS pattern: 2-64 chars from [\w+=,.@-]
+validate_session_name(Name) ->
+    case re:run(Name, ?ROLE_SESSION_NAME_PATTERN, [{capture, none}]) of
+        match -> true;
+        nomatch -> false
+    end.
+
+%% Look up a profile section from both the credentials file and the config file.
+%% Credentials file uses bare [Name]; config file uses [profile Name].
+lookup_source_profile_section(Profile) ->
+    %% Try credentials file first (bare profile name)
+    case credentials_file_data() of
+        {error, _} ->
+            lookup_source_profile_from_config(Profile);
+        CredsData ->
+            case proplists:get_value(Profile, CredsData, undefined) of
+                undefined ->
+                    lookup_source_profile_from_config(Profile);
+                Section ->
+                    Section
+            end
+    end.
+
+lookup_source_profile_from_config(Profile) ->
+    case config_file_data() of
+        {error, _} ->
+            undefined;
+        ConfigData ->
+            %% Config file: try bare [Profile] and [profile Profile]
+            Prefixed = "profile " ++ Profile,
+            case proplists:get_value(Profile, ConfigData, undefined) of
+                undefined ->
+                    proplists:get_value(Prefixed, ConfigData, undefined);
+                Section ->
+                    Section
+            end
+    end.
+
+%% Return the full section data for a profile from the config file.
+%% Used when lookup_credentials_from_config detects role_arn.
+config_section_data(Profile) ->
+    case config_file_data() of
+        {error, _} ->
+            undefined;
+        ConfigData ->
+            Prefixed = "profile " ++ Profile,
+            case proplists:get_value(Profile, ConfigData, undefined) of
+                undefined ->
+                    proplists:get_value(Prefixed, ConfigData, undefined);
+                Section ->
+                    Section
+            end
+    end.
+
+%% Ensure a value is a string. INI values that look numeric get converted by
+%% maybe_convert_number; we need them back as strings for session names and
+%% profile names.
+ensure_string(V) when is_list(V) -> V;
+ensure_string(V) when is_atom(V) -> atom_to_list(V);
+ensure_string(V) when is_integer(V) -> integer_to_list(V);
+ensure_string(V) when is_binary(V) -> binary_to_list(V).
+
+%% Format a value for logging. Avoids crashing on unexpected types.
+format_value(V) when is_list(V) -> V;
+format_value(V) when is_atom(V) -> atom_to_list(V);
+format_value(V) when is_integer(V) -> integer_to_list(V);
+format_value(V) when is_binary(V) -> binary_to_list(V);
+format_value(V) -> io_lib:format("~tp", [V]).
 
 -spec with_metadata_connection(fun((aws_lib_httpc:conn()) -> Result)) -> Result.
 %% @doc Execute a function with a shared metadata service connection
