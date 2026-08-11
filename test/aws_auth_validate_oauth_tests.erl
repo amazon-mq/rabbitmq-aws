@@ -1068,11 +1068,17 @@ authz_iam_scope_alias_grants_access_test_() ->
 %% and the regression slips through here. The pin fires only on a series with the
 %% full arity-4 API; treat the parity-bump revisit as the real backstop.
 %%
-%% FLIP SHAPE: the scope value below is deliberately `rabbitmq.'-prefixed. In the
-%% fixed backend, extract_scope_list_from_token_value/2 takes a LIST value
-%% VERBATIM (only a map value keyed by resource_server_id is prefix-injected), so
-%% after the scope_prefix "rabbitmq." strip this yields write:*/* and flips to ok.
-%% An unprefixed value here would be filtered to [] by the strip and never flip.
+%% UNESCAPED STAYS UNRESOLVED: the #16947 fix does NOT make an unescaped dotted
+%% key resolve a flat claim -- it adds an ESCAPED form (\.) that does (see
+%% authz_escaped_dotted_additional_scopes_key_test_). So the DOTTED assertion
+%% below stays authz_unverified before AND after the fix; only the ESCAPED
+%% counterpart flips to ok. The CONTROL (non-dotted key) resolves in both worlds.
+%%
+%% FLIP SHAPE: the control scope value below is deliberately `rabbitmq.'-prefixed.
+%% extract_scope_list_from_token_value/2 takes a LIST value VERBATIM (only a map
+%% value keyed by resource_server_id is prefix-injected), so after the scope_prefix
+%% "rabbitmq." strip this yields write:*/* and the control reaches ok. An unprefixed
+%% value would be filtered to [] by the strip and never grant.
 %%
 %% This matches the project's parity stance: document upstream behavior and pin
 %% against drift, surfacing regressions as test failures once the dep ships the
@@ -1107,9 +1113,13 @@ authz_dotted_additional_scopes_key_parity_pin_test_() ->
             Dotted = Validate(<<"https://sts.amazonaws.com/tags">>),
             Control = Validate(<<"tags">>),
             [
-                %% Current behavior: split_path splits the dotted key, lookup fails,
-                %% no scopes extracted -> authz_unverified. This will flip to ok once
-                %% upstream fixes the lookup.
+                %% An UNESCAPED dotted key is split on dots into a nested path
+                %% (["https://sts","amazonaws","com/tags"]) and never resolves the
+                %% flat claim -> authz_unverified. This stays true BOTH before and
+                %% after the #16947 fix: the fix does not make unescaped dots resolve
+                %% a flat key; it adds an ESCAPED form (\.) that does. See
+                %% authz_escaped_dotted_additional_scopes_key_test_ for the escaped
+                %% counterpart that flips to ok.
                 ?_assertMatch({error, authz_unverified, _}, Dotted),
                 ?_assert(reason_contains(Dotted, "no scopes for this resource_server")),
                 %% CONTROL: the identical scopes under a NON-dotted key DO resolve and
@@ -1121,6 +1131,60 @@ authz_dotted_additional_scopes_key_parity_pin_test_() ->
             ]
         end)
     end}.
+
+%% Counterpart to the parity pin above: an ESCAPED dotted key (\.) IS resolvable
+%% via the #16947 fix. rabbit_oauth2_schema:tokenize_additional_scopes_key/1 keeps
+%% "\." literal, so "https://sts\.amazonaws\.com/tags" tokenizes to the single flat
+%% segment [<<"https://sts.amazonaws.com/tags">>] and the flat claim IS found.
+%%
+%% Gated twice: maybe_skip_authz (arity-4 scope API) AND the tokenizer's presence.
+%% On a pre-#16947 broker the endpoint falls back to passing the raw binary (old
+%% split_path behavior), so the escaped key would NOT resolve there -- skipping is
+%% correct, not a failure, exactly as the endpoint's fallback intends.
+authz_escaped_dotted_additional_scopes_key_test_() ->
+    {setup, fun setup_httpc_mock/0, fun teardown_httpc_mock/1, fun(_) ->
+        case tokenizer_available() of
+            false ->
+                [];
+            true ->
+                maybe_skip_authz(fun() ->
+                    #{jwk_pub := PubJwk, sign := Sign} = rsa_signer(<<"k1">>),
+                    %% Same flat dotted claim key as the parity pin, resolved this
+                    %% time by ESCAPING the dots in additional_scopes_key.
+                    Token = Sign(#{
+                        <<"exp">> => future(),
+                        <<"aud">> => <<"rabbitmq">>,
+                        <<"https://sts.amazonaws.com/tags">> => [
+                            <<"rabbitmq.write:*/*">>, <<"rabbitmq.read:*/*">>
+                        ]
+                    }),
+                    JwksBody = rabbit_json:encode(#{<<"keys">> => [PubJwk]}),
+                    mock_httpc_response(200, JwksBody),
+                    Body = (jwks_body())#{
+                        <<"access_token">> => Token,
+                        <<"resource_server_id">> => <<"rabbitmq">>,
+                        <<"scope_prefix">> => <<"rabbitmq.">>,
+                        %% Escaped dots (\.) keep the URI a single flat claim key.
+                        <<"additional_scopes_key">> =>
+                            <<"https://sts\\.amazonaws\\.com/tags">>,
+                        <<"authz_check">> => #{
+                            <<"resource">> => <<"my-queue">>,
+                            <<"permission">> => <<"write">>
+                        }
+                    },
+                    %% Flat claim found -> rabbitmq.write:*/* -> prefix strips to
+                    %% write:*/* -> grants write on /my-queue.
+                    [?_assertEqual(ok, aws_auth_validate_oauth:validate(Body))]
+                end)
+        end
+    end}.
+
+%% True when the broker exposes the post-#16947 tokenizer the endpoint relies on
+%% for escaped-dot support. Mirrors the runtime probe in
+%% aws_auth_validate_oauth_authz:tokenize_additional_scopes_key/1.
+tokenizer_available() ->
+    (code:ensure_loaded(rabbit_oauth2_schema) =/= {error, nofile}) andalso
+        erlang:function_exported(rabbit_oauth2_schema, tokenize_additional_scopes_key, 1).
 
 %% authz_check without an access_token is rejected in the pure phase.
 authz_check_without_token_rejected_test() ->
