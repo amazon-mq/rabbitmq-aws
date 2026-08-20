@@ -59,7 +59,7 @@
 
 -spec start_link() -> {ok, pid()} | ignore | {error, term()}.
 start_link() ->
-    start_link(default_config()).
+    start_link(#{}).
 
 -spec start_link(map()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Config) ->
@@ -96,8 +96,10 @@ default_config() ->
     Runtime = #{
         %% local node whose view is sampled and gossiped
         self_node => node(),
-        %% cluster peers to gossip rows to
-        peers_fun => fun() -> nodes() end,
+        %% cluster peers to gossip rows to: the running cluster members other
+        %% than this node. Anchored to broker cluster membership, not the VM's
+        %% raw nodes/0 connection set, so CLI or hidden nodes are not included.
+        peers_fun => fun() -> rabbit_nodes:list_running() -- [node()] end,
         %% samples this node's per-peer down-probability view
         sample_fun => fun sample_failure_probabilities/0
     },
