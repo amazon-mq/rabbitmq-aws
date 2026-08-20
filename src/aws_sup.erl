@@ -26,7 +26,7 @@ init([]) ->
         intensity => 5,
         period => 10
     },
-    ChildSpecs = auth_validation_children(),
+    ChildSpecs = auth_validation_children() ++ node_health_children(),
     {ok, {SupFlags, ChildSpecs}}.
 
 %%--------------------------------------------------------------------
@@ -90,6 +90,37 @@ semaphore_spec() ->
 
 semaphore_config() ->
     #{max => get_int_env(auth_validation_max_concurrent, 5, 100)}.
+
+%%--------------------------------------------------------------------
+%% Node-health feature: like auth validation, workers start only when the
+%% toggle is on. When on, the Prometheus collector is registered and the
+%% gossip worker is started; when off, the supervisor stays empty and no
+%% peer-health metrics are emitted.
+%%--------------------------------------------------------------------
+
+node_health_children() ->
+    case aws_node_health_config:enabled() of
+        true ->
+            %% Register the collector before the worker so a scrape between
+            %% registration and the first sample simply reports the worker as
+            %% unavailable rather than missing the collector entirely.
+            aws_node_health_metrics:register(),
+            [node_health_spec()];
+        false ->
+            []
+    end.
+
+%% The worker reads its own settings from aws_node_health_config, so no config
+%% is threaded through here.
+node_health_spec() ->
+    #{
+        id => aws_node_health_worker,
+        start => {aws_node_health_worker, start_link, []},
+        restart => permanent,
+        shutdown => 5_000,
+        type => worker,
+        modules => [aws_node_health_worker]
+    }.
 
 %% An out-of-range or non-integer value falls back to Default rather than
 %% failing the boot; the schema is what reports a bad value to the operator.

@@ -87,24 +87,21 @@ refresh() ->
 %% Defaults / config
 %%--------------------------------------------------------------------
 
+%% Runtime dependencies (local node, peers, sampler) come from here; the
+%% operator-tunable numeric knobs and scoring thresholds come from
+%% aws_node_health_config, layered on top so an explicit start_link/1 config
+%% still overrides everything.
 -spec default_config() -> map().
 default_config() ->
-    #{
+    Runtime = #{
         %% local node whose view is sampled and gossiped
         self_node => node(),
         %% cluster peers to gossip rows to
         peers_fun => fun() -> nodes() end,
         %% samples this node's per-peer down-probability view
-        sample_fun => fun sample_failure_probabilities/0,
-        %% snapshots retained for the rolling decision window
-        window_max => 30,
-        %% drop a peer's row if it has not refreshed within this many ticks
-        stale_ticks => 5,
-        %% sampling / recompute period
-        interval_ms => 1000,
-        %% scoring thresholds (see aws_node_health)
-        analysis => aws_node_health:default_config()
-    }.
+        sample_fun => fun sample_failure_probabilities/0
+    },
+    maps:merge(Runtime, aws_node_health_config:worker_config()).
 
 %% The node failure detector exposes each node's view of its peers as a map of
 %% peer -> probability. Sampling must never crash the worker, so any failure
