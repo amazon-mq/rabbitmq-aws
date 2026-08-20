@@ -1,0 +1,188 @@
+%% This module attributes a degraded peer node from a window of per-node
+%% peer-down probability snapshots.
+%%
+%% Each node observes the reachability of its peers (via the node failure
+%% detector) as a probability in [0.0, 1.0]. A single node's view is only one
+%% row of the picture; the nodes share their rows so that any node holds the
+%% full observer x peer matrix. This module consumes a window of those matrices
+%% and decides whether one node is the culprit, or whether the degradation is
+%% cluster-wide (and so must not be attributed to a single node).
+%%
+%% The decision is deliberately two-path, because a single threshold on the
+%% suspect's own level cannot work: empirically a real single-node fault and
+%% mild cluster-wide congestion on the busiest node produce similar suspect
+%% levels, while a heavier real fault produces a much higher one. The two paths
+%% are:
+%%
+%%   P1 (isolated): the suspect is sustained-elevated AND every other node is
+%%      pristine. This catches a flapping partial fault that never pins high,
+%%      because the tell is that the rest of the cluster stays quiet.
+%%   P2 (extreme): the suspect is extreme for most of the window AND leads the
+%%      next node by a wide margin. This catches a severe fault even when the
+%%      other nodes are themselves mildly elevated by background loss.
+%%
+%% A cluster-wide guard fires first: if two or more nodes are sustained-elevated
+%% without one extreme leader, the condition is symmetric and is reported as
+%% cluster_wide rather than blamed on any node.
+
+-module(aws_node_health).
+
+-export([default_config/0, analyze/2]).
+
+-type prob() :: float().
+-type view() :: #{node() => prob()}.
+-type snapshot() :: #{node() => view()}.
+-type verdict() :: clean | cluster_wide | {suspect, node()}.
+-type score() :: #{inbound => float(), confidence => float(), suspected => 0 | 1}.
+-type result() :: #{verdict => verdict(), scores => #{node() => score()}}.
+
+-export_type([snapshot/0, verdict/0, result/0]).
+
+-spec default_config() -> map().
+default_config() ->
+    %% inbound prob considered elevated
+    #{
+        elevated => 0.5,
+        %% inbound prob considered extreme
+        extreme => 0.9,
+        %% a non-suspect node this low is quiet
+        pristine => 0.05,
+        %% P1: fraction of window suspect is elevated
+        sustained_frac => 0.35,
+        %% P2: fraction of window suspect is extreme
+        extreme_frac => 0.8,
+        %% P2: min lead of suspect over next node
+        margin => 0.5,
+        %% this many elevated nodes => cluster_wide
+        cluster_min_nodes => 2
+    }.
+
+-spec analyze(map(), [snapshot()]) -> result().
+analyze(_Config, []) ->
+    #{verdict => clean, scores => #{}};
+analyze(Config0, Window) ->
+    Config = maps:merge(default_config(), Config0),
+    Nodes = all_nodes(Window),
+    Med = #{N => node_median(Window, N) || N <- Nodes},
+    FracElev = #{N => frac_ge(inbound_series(Window, N), maps:get(elevated, Config)) || N <- Nodes},
+    FracExtreme =
+        #{N => frac_ge(inbound_series(Window, N), maps:get(extreme, Config)) || N <- Nodes},
+    Candidate = argmax_median(Nodes, Med),
+    Others = [N || N <- Nodes, N =/= Candidate],
+    OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- Others]]),
+    OthersPristine = lists:all(
+        fun(N) -> maps:get(N, Med) < maps:get(pristine, Config) end,
+        Others
+    ),
+    NumElevated = length([N || N <- Nodes, maps:get(N, Med) >= maps:get(elevated, Config)]),
+    Margin = maps:get(Candidate, Med) - OthersMaxMed,
+
+    P1Gate = OthersPristine,
+    P2Gate = Margin >= maps:get(margin, Config),
+    P1Fire = P1Gate andalso maps:get(Candidate, FracElev) >= maps:get(sustained_frac, Config),
+    P2Fire = P2Gate andalso maps:get(Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
+    ClusterWide = NumElevated >= maps:get(cluster_min_nodes, Config),
+
+    Verdict =
+        if
+            P2Fire -> {suspect, Candidate};
+            ClusterWide -> cluster_wide;
+            P1Fire -> {suspect, Candidate};
+            true -> clean
+        end,
+
+    P1Conf =
+        case P1Gate of
+            true -> maps:get(Candidate, FracElev);
+            false -> 0.0
+        end,
+    P2Conf =
+        case P2Gate of
+            true -> maps:get(Candidate, FracExtreme);
+            false -> 0.0
+        end,
+    CandConf =
+        case Verdict of
+            cluster_wide -> 0.0;
+            _ -> lists:max([P1Conf, P2Conf])
+        end,
+    Scores =
+        #{
+            N => #{
+                inbound => maps:get(N, Med),
+                confidence => confidence_for(N, Candidate, CandConf),
+                suspected => suspected_for(N, Verdict)
+            }
+         || N <- Nodes
+        },
+    #{verdict => Verdict, scores => Scores}.
+
+confidence_for(N, N, CandConf) -> CandConf;
+confidence_for(_, _, _) -> 0.0.
+
+suspected_for(N, {suspect, N}) -> 1;
+suspected_for(_, _) -> 0.
+
+%% A node's inbound score at one snapshot is the median of the other nodes'
+%% views of it. Absent views are skipped; a snapshot with no observers of N
+%% contributes nothing to N's series.
+-spec snapshot_inbound(snapshot(), node()) -> none | {ok, float()}.
+snapshot_inbound(Snapshot, N) ->
+    Vals = [
+        maps:get(N, View)
+     || {Observer, View} <- maps:to_list(Snapshot),
+        Observer =/= N,
+        is_map(View),
+        maps:is_key(N, View)
+    ],
+    case Vals of
+        [] -> none;
+        _ -> {ok, median(Vals)}
+    end.
+
+inbound_series(Window, N) ->
+    [M || Snapshot <- Window, {ok, M} <- [snapshot_inbound(Snapshot, N)]].
+
+node_median(Window, N) ->
+    case inbound_series(Window, N) of
+        [] -> 0.0;
+        Series -> median(Series)
+    end.
+
+argmax_median(Nodes, Med) ->
+    [First | Rest] = lists:sort(Nodes),
+    lists:foldl(
+        fun(N, Best) ->
+            case maps:get(N, Med) > maps:get(Best, Med) of
+                true -> N;
+                false -> Best
+            end
+        end,
+        First,
+        Rest
+    ).
+
+all_nodes(Window) ->
+    lists:usort(
+        lists:flatten(
+            [
+                [Observer | maps:keys(View)]
+             || Snapshot <- Window, {Observer, View} <- maps:to_list(Snapshot)
+            ]
+        )
+    ).
+
+-spec median([number()]) -> float().
+median(List) ->
+    Sorted = lists:sort(List),
+    N = length(Sorted),
+    case N rem 2 of
+        1 -> float(lists:nth((N div 2) + 1, Sorted));
+        0 -> (lists:nth(N div 2, Sorted) + lists:nth((N div 2) + 1, Sorted)) / 2
+    end.
+
+-spec frac_ge([number()], number()) -> float().
+frac_ge([], _Threshold) ->
+    0.0;
+frac_ge(List, Threshold) ->
+    length([X || X <- List, X >= Threshold]) / length(List).
