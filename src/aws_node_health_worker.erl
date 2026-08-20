@@ -24,7 +24,7 @@
 
 -include("aws.hrl").
 
--export([start_link/0, start_link/1, latest/0, refresh/0]).
+-export([start_link/0, start_link/1, latest/0, own_view/0, refresh/0]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% Exported for unit tests of the otherwise-internal pure helpers.
@@ -36,11 +36,14 @@
 -type snapshot() :: #{node() => view()}.
 -type rows() :: #{node() => {integer(), view()}}.
 
+-export_type([view/0]).
+
 -record(state, {
     self_node :: node(),
     peers_fun :: fun(() -> [node()]),
     sample_fun :: fun(() -> view()),
     rows = #{} :: rows(),
+    own_row = #{} :: view(),
     window = [] :: [snapshot()],
     window_max :: pos_integer(),
     stale_ticks :: non_neg_integer(),
@@ -67,6 +70,12 @@ start_link(Config) ->
 -spec latest() -> aws_node_health:result().
 latest() ->
     gen_server:call(?MODULE, latest).
+
+%% This node's own most recent view of its peers (its raw failure-detector
+%% row), the value behind the per-node rabbitmq_peer_down_probability metric.
+-spec own_view() -> view().
+own_view() ->
+    gen_server:call(?MODULE, own_view).
 
 %% Run one sample/gossip/compute cycle synchronously and return the new latest.
 %% The periodic timer runs the same cycle; this is for tests and diagnostics.
@@ -134,6 +143,8 @@ init(Config0) ->
 
 handle_call(latest, _From, State) ->
     {reply, State#state.latest, State};
+handle_call(own_view, _From, State) ->
+    {reply, State#state.own_row, State};
 handle_call(refresh, _From, State0) ->
     State = cycle(State0),
     {reply, State#state.latest, State};
@@ -169,7 +180,13 @@ cycle(State0) ->
     Snapshot = assemble_snapshot(Rows0, Tick, State0#state.stale_ticks),
     Window = push_window(State0#state.window, Snapshot, State0#state.window_max),
     Latest = aws_node_health:analyze(State0#state.analysis, Window),
-    State0#state{rows = Rows0, window = Window, tick = Tick, latest = Latest}.
+    State0#state{
+        rows = Rows0,
+        own_row = OwnRow,
+        window = Window,
+        tick = Tick,
+        latest = Latest
+    }.
 
 gossip(PeersFun, Self, Row) ->
     lists:foreach(
