@@ -1,3 +1,8 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
 %% Calibration tests for aws_node_health, driven by captured peer-down
 %% probability samples (see aws_node_health_fixtures). Each phase of each
 %% capture has a known ground truth, and the detector must classify it

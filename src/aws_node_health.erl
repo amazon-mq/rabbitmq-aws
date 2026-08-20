@@ -1,3 +1,8 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
 %% This module attributes a degraded peer node from a window of per-node
 %% peer-down probability snapshots.
 %%

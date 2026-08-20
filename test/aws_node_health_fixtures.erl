@@ -1,3 +1,8 @@
+%% Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+%% SPDX-License-Identifier: Apache-2.0
+%% vim:ft=erlang:
+%% -*- mode: erlang; -*-
+
 %% Generated fixtures for aws_node_health calibration tests.
 %% Source: captured per-node peer-down probability samples from a 3-node
 %% RabbitMQ cluster (ha-mode:all) under tc/netem packet-loss injection.
