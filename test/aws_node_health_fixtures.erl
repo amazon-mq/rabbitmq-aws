@@ -13,7 +13,7 @@
 %% run3: uniform 4% loss on all nodes, then one node at 25% (clean run).
 -module(aws_node_health_fixtures).
 
--export([run1/0, run2/0, run3/0]).
+-export([run1/0, run2/0, run3/0, oscillating_fault/0]).
 
 %% [{Phase, [Snapshot]}]
 run1() ->
@@ -1061,5 +1061,114 @@ run3() ->
                 rmq1 => #{rmq0 => 0.532, rmq2 => 0.039},
                 rmq2 => #{rmq0 => 0.081, rmq1 => 0.05}
             }
+        ]}
+    ].
+
+%% A live-captured oscillating single-node fault (periodic packet loss on
+%% rmq0). aten spikes rmq0 to ~1.0 on each burst then re-normalises toward a
+%% lower baseline, so the signal flaps rather than staying above a threshold;
+%% the clean pair stays at 0.0 throughout.
+oscillating_fault() ->
+    [
+        {oscillating_single_fault, [
+            #{rmq1 => #{rmq0 => 0.0, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.0, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 1.0, rmq2 => 0.0}, rmq2 => #{rmq0 => 1.0, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 1.0, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.074, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.074, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.074, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.074, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.074, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.075, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.075, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.045, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.998, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.047, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.998, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.99, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.082, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.082, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.082, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.124, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.082, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.123, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.082, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.085, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.084, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.084, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.121, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.083, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.996, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.99, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.172, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.139, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.171, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.138, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.171, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.138, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.169, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.137, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.169, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.137, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.169, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.137, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.169, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.136, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.169, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.136, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.172, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.136, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.243, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.184, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.243, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.183, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.243, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.183, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.246, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.183, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.245, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.188, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.244, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.188, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.243, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.188, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.985, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.976, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.314, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.256, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.314, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.256, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.314, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.264, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.314, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.263, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.318, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.263, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.317, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.261, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.314, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.26, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.335, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.986, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.991, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.304, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.355, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.313, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.355, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.312, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.354, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.312, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.354, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.31, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.354, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.308, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.354, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.307, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.354, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.307, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.361, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.307, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.36, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.304, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.358, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.304, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.978, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.98, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.989, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.353, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.406, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.353, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.413, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.351, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.412, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.346, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.406, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.338, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.392, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.339, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.382, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.328, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.361, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.318, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.351, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.312, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.399, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.983, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.398, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.39, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.387, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.381, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.378, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.369, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.366, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.36, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.355, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.354, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.353, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.35, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.36, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.395, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.421, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.395, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.418, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.393, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.408, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.384, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.4, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.372, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.393, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.36, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.389, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.35, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.379, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.352, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.377, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.345, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.379, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.975, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.432, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.983, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.426, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.418, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.415, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.409, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.405, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.395, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.394, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.385, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.384, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.375, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.374, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.37, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.391, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.388, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.987, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.974, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.396, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.985, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.402, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.422, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.402, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.421, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.4, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.418, rmq1 => 0.0}},
+            #{rmq1 => #{rmq0 => 0.388, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.409, rmq1 => 0.0}}
         ]}
     ].

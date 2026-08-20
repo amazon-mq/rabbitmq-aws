@@ -19,12 +19,17 @@
 %% levels, while a heavier real fault produces a much higher one. The two paths
 %% are:
 %%
-%%   P1 (isolated): the suspect is sustained-elevated AND every other node is
-%%      pristine. This catches a flapping partial fault that never pins high,
-%%      because the tell is that the rest of the cluster stays quiet.
+%%   P1 (isolated): every other node is pristine AND the suspect flaps -- its
+%%      probability crosses the extreme threshold repeatedly within the window.
+%%      This catches a partial/periodic fault whose signal oscillates rather
+%%      than pinning high (the node failure detector re-normalises a steady loss
+%%      downward over time, so a time-above-threshold measure starves, but each
+%%      loss burst still produces a fresh upward crossing). The tell is that the
+%%      rest of the cluster stays quiet while one node keeps spiking.
 %%   P2 (extreme): the suspect is extreme for most of the window AND leads the
-%%      next node by a wide margin. This catches a severe fault even when the
-%%      other nodes are themselves mildly elevated by background loss.
+%%      next node by a wide margin. This catches a severe fault that pins high
+%%      even when the other nodes are themselves mildly elevated by background
+%%      loss.
 %%
 %% A cluster-wide guard fires first: if two or more nodes are sustained-elevated
 %% without one extreme leader, the condition is symmetric and is reported as
@@ -45,15 +50,15 @@
 
 -spec default_config() -> map().
 default_config() ->
-    %% inbound prob considered elevated
+    %% inbound prob considered elevated (used by the cluster-wide test)
     #{
         elevated => 0.5,
-        %% inbound prob considered extreme
+        %% inbound prob considered extreme (P2 threshold and the flap crossing level)
         extreme => 0.9,
-        %% a non-suspect node this low is quiet
+        %% a non-suspect node with median inbound below this is quiet
         pristine => 0.05,
-        %% P1: fraction of window suspect is elevated
-        sustained_frac => 0.35,
+        %% P1: min upward crossings of `extreme` by the suspect within the window
+        flap_min => 2,
         %% P2: fraction of window suspect is extreme
         extreme_frac => 0.8,
         %% P2: min lead of suspect over next node
@@ -78,7 +83,6 @@ analyze(Config0, Window) ->
 -spec analyze(map(), [snapshot()], [node()]) -> result().
 analyze(Config, Window, Nodes) ->
     Med = #{N => node_median(Window, N) || N <- Nodes},
-    FracElev = #{N => frac_elevated(Window, N, maps:get(elevated, Config)) || N <- Nodes},
     FracExtreme = #{N => frac_elevated(Window, N, maps:get(extreme, Config)) || N <- Nodes},
     Candidate = argmax_median(Nodes, Med),
     Others = [N || N <- Nodes, N =/= Candidate],
@@ -89,10 +93,12 @@ analyze(Config, Window, Nodes) ->
     ),
     NumElevated = length([N || N <- Nodes, maps:get(N, Med) >= maps:get(elevated, Config)]),
     Margin = maps:get(Candidate, Med) - OthersMaxMed,
+    FlapMin = maps:get(flap_min, Config),
+    Flaps = flap_count(Window, Candidate, maps:get(extreme, Config)),
 
     P1Gate = OthersPristine,
     P2Gate = Margin >= maps:get(margin, Config),
-    P1Fire = P1Gate andalso maps:get(Candidate, FracElev) >= maps:get(sustained_frac, Config),
+    P1Fire = P1Gate andalso Flaps >= FlapMin,
     P2Fire = P2Gate andalso maps:get(Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
     ClusterWide = NumElevated >= maps:get(cluster_min_nodes, Config),
 
@@ -110,7 +116,11 @@ analyze(Config, Window, Nodes) ->
     CandConf =
         case Verdict of
             {suspect, _} ->
-                P1Conf = maybe_conf(P1Gate, Candidate, FracElev),
+                P1Conf =
+                    case P1Gate of
+                        true -> min(1.0, Flaps / (2 * FlapMin));
+                        false -> 0.0
+                    end,
                 P2Conf = maybe_conf(P2Gate, Candidate, FracExtreme),
                 lists:max([P1Conf, P2Conf]);
             _ ->
@@ -205,3 +215,25 @@ frac_elevated([], _N, _Threshold) ->
 frac_elevated(Window, N, Threshold) ->
     Elevated = [V || V <- inbound_series(Window, N), V >= Threshold],
     length(Elevated) / length(Window).
+
+%% Number of upward crossings of Threshold in N's inbound series across the
+%% window: transitions from below the threshold to at-or-above it. A periodic
+%% fault produces one crossing per loss burst even as the detector re-normalises
+%% the baseline downward, so this holds up where a time-above-threshold measure
+%% starves. A steady, pinned-high signal produces no crossings after the first,
+%% which is why P2 (fraction extreme) covers that case separately.
+-spec flap_count([snapshot()], node(), number()) -> non_neg_integer().
+flap_count(Window, N, Threshold) ->
+    count_upcrossings(inbound_series(Window, N), Threshold, undefined, 0).
+
+-spec count_upcrossings([float()], number(), float() | undefined, non_neg_integer()) ->
+    non_neg_integer().
+count_upcrossings([], _Threshold, _Prev, Acc) ->
+    Acc;
+count_upcrossings([V | Rest], Threshold, Prev, Acc) ->
+    Acc2 =
+        case Prev of
+            P when is_number(P), P < Threshold, V >= Threshold -> Acc + 1;
+            _ -> Acc
+        end,
+    count_upcrossings(Rest, Threshold, V, Acc2).

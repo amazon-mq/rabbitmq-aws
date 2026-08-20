@@ -137,7 +137,21 @@ Low-level application environment manipulation (update/delete operations).
 #### `aws_util.erl`
 Credential management utilities, primarily for resetting AWS credentials after role assumption.
 
+### Node Health Modules
 
+Attribute a partially-degraded cluster node from the node failure detector's per-peer reachability estimates. Off by default; see [NODE_HEALTH.md](NODE_HEALTH.md) for the feature reference.
+
+#### `aws_node_health.erl`
+**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Two-path decision: a flap-rate path (P1, for oscillating/periodic faults the failure detector re-normalises) and a sustained-extreme path (P2), with a cluster-wide guard. No side effects, exhaustively unit-tested against captured probability fixtures.
+
+#### `aws_node_health_worker.erl`
+**Purpose:** `gen_server` that each tick samples the local per-peer probabilities (`aten_sink:get_failure_probabilities/0`), gossips its row to the other cluster members, evicts stale rows, maintains the rolling window, and recomputes the verdict via `aws_node_health`. Holds the latest result for the collector to read at scrape time. Sampler, peer list, and local node are injectable for testing.
+
+#### `aws_node_health_metrics.erl`
+**Purpose:** `prometheus_collector` that reads the worker at scrape time and emits the `rabbitmq_peer_down_probability`, `rabbitmq_peer_down_suspected`, and `rabbitmq_peer_down_confidence` gauges. Crash-safe: a missing or busy worker yields no metrics rather than failing the scrape.
+
+#### `aws_node_health_config.erl`
+**Purpose:** Single home for the feature's application-environment reads (the enable toggle and the numeric knobs), their defaults and bounds, and the assembled worker settings.
 
 ## Configuration Schema
 
@@ -184,6 +198,12 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 
 **STS Custom Headers:**
 - `aws.sts.custom_headers.$header` - Custom headers for STS calls
+
+**Node Health Detection:**
+- `aws.node_health.enabled` - Master toggle (default: false)
+- `aws.node_health.interval_ms` - Sampling/recompute period (default: 1000)
+- `aws.node_health.window` - Rolling decision window size (default: 30)
+- `aws.node_health.stale_ticks` - Evict a peer row not refreshed within this many ticks (default: 5)
 
 ### Schema Translation Logic
 
@@ -283,6 +303,8 @@ application:set_env()
 - `rabbitmq_aws` - AWS API client library
 - `rabbit` - RabbitMQ core
 - `rabbitmq_management` - Management plugin (for HTTP API)
+- `rabbitmq_prometheus` - Prometheus endpoint (exposes the node-health gauges)
+- `aten` - Ra's accrual failure detector; the node-health worker reads its per-peer probabilities (keep the `dep_aten` pin in sync with `rabbitmq/ra`)
 
 ### Build Dependencies
 - `meck` - Mocking framework

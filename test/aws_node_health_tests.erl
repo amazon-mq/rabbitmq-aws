@@ -31,6 +31,17 @@ single_node_fault_is_attributed_test() ->
         verdict(aws_node_health_fixtures:run1(), single_fault_periodic)
     ).
 
+%% Live-captured oscillating fault: the suspect flaps to ~1.0 on each burst then
+%% re-normalises downward, so it spends little time above the elevated threshold
+%% yet crosses the extreme threshold repeatedly while the clean pair stays at
+%% 0.0. A time-above-threshold measure starves here; the flap-rate path attributes
+%% it. This is the regression that motivated the flap-rate P1 trigger.
+oscillating_fault_is_attributed_test() ->
+    ?assertEqual(
+        {suspect, rmq0},
+        verdict(aws_node_health_fixtures:oscillating_fault(), oscillating_single_fault)
+    ).
+
 quiet_baseline_is_clean_test() ->
     ?assertEqual(clean, verdict(aws_node_health_fixtures:run2(), baseline)),
     ?assertEqual(clean, verdict(aws_node_health_fixtures:run3(), baseline)).
