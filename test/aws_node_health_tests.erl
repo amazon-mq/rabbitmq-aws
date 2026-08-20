@@ -87,3 +87,29 @@ empty_window_is_clean_test() ->
         #{verdict => clean, scores => #{}},
         aws_node_health:analyze(#{}, [])
     ).
+
+%% A non-empty window whose snapshots carry no observers must not crash.
+observerless_window_is_clean_test() ->
+    ?assertEqual(
+        #{verdict => clean, scores => #{}},
+        aws_node_health:analyze(#{}, [#{}, #{}])
+    ).
+
+%% A peer seen in only 2 of 30 snapshots, both extreme, must not be attributed:
+%% the sustained/extreme fractions are over the whole window, so 2/30 is far
+%% below the thresholds.
+sparsely_observed_peer_is_not_attributed_test() ->
+    Seen = #{rmq1 => #{rmq0 => 1.0, rmq2 => 0.0}, rmq2 => #{rmq0 => 1.0, rmq1 => 0.0}},
+    Unseen = #{rmq1 => #{rmq2 => 0.0}, rmq2 => #{rmq1 => 0.0}},
+    Window = [Seen, Seen] ++ lists:duplicate(28, Unseen),
+    ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% When the verdict is clean, no peer's confidence may be non-zero, even if the
+%% candidate was mildly elevated (below the sustained fraction).
+clean_verdict_reports_zero_confidence_test() ->
+    Elevated = #{rmq1 => #{rmq0 => 0.6, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.6, rmq1 => 0.0}},
+    Quiet = #{rmq1 => #{rmq0 => 0.0, rmq2 => 0.0}, rmq2 => #{rmq0 => 0.0, rmq1 => 0.0}},
+    Window = lists:duplicate(3, Elevated) ++ lists:duplicate(7, Quiet),
+    #{verdict := Verdict, scores := Scores} = aws_node_health:analyze(#{}, Window),
+    ?assertEqual(clean, Verdict),
+    ?assertEqual(0.0, maps:get(confidence, maps:get(rmq0, Scores))).

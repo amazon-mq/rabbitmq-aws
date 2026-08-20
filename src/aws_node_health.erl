@@ -66,12 +66,20 @@ default_config() ->
 analyze(_Config, []) ->
     #{verdict => clean, scores => #{}};
 analyze(Config0, Window) ->
-    Config = maps:merge(default_config(), Config0),
-    Nodes = all_nodes(Window),
+    case all_nodes(Window) of
+        [] ->
+            %% A non-empty window whose snapshots carry no observers yields no
+            %% nodes to judge; treat it as clean rather than crashing.
+            #{verdict => clean, scores => #{}};
+        Nodes ->
+            analyze(maps:merge(default_config(), Config0), Window, Nodes)
+    end.
+
+-spec analyze(map(), [snapshot()], [node()]) -> result().
+analyze(Config, Window, Nodes) ->
     Med = #{N => node_median(Window, N) || N <- Nodes},
-    FracElev = #{N => frac_ge(inbound_series(Window, N), maps:get(elevated, Config)) || N <- Nodes},
-    FracExtreme =
-        #{N => frac_ge(inbound_series(Window, N), maps:get(extreme, Config)) || N <- Nodes},
+    FracElev = #{N => frac_elevated(Window, N, maps:get(elevated, Config)) || N <- Nodes},
+    FracExtreme = #{N => frac_elevated(Window, N, maps:get(extreme, Config)) || N <- Nodes},
     Candidate = argmax_median(Nodes, Med),
     Others = [N || N <- Nodes, N =/= Candidate],
     OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- Others]]),
@@ -96,20 +104,17 @@ analyze(Config0, Window) ->
             true -> clean
         end,
 
-    P1Conf =
-        case P1Gate of
-            true -> maps:get(Candidate, FracElev);
-            false -> 0.0
-        end,
-    P2Conf =
-        case P2Gate of
-            true -> maps:get(Candidate, FracExtreme);
-            false -> 0.0
-        end,
+    %% Confidence is reported only for a named suspect. A clean or cluster-wide
+    %% verdict carries no per-node confidence, so the confidence gauge can never
+    %% contradict the suspected flag (a peer that is not suspected reads 0.0).
     CandConf =
         case Verdict of
-            cluster_wide -> 0.0;
-            _ -> lists:max([P1Conf, P2Conf])
+            {suspect, _} ->
+                P1Conf = maybe_conf(P1Gate, Candidate, FracElev),
+                P2Conf = maybe_conf(P2Gate, Candidate, FracExtreme),
+                lists:max([P1Conf, P2Conf]);
+            _ ->
+                0.0
         end,
     Scores =
         #{
@@ -121,6 +126,9 @@ analyze(Config0, Window) ->
          || N <- Nodes
         },
     #{verdict => Verdict, scores => Scores}.
+
+maybe_conf(true, Candidate, Fracs) -> maps:get(Candidate, Fracs);
+maybe_conf(false, _Candidate, _Fracs) -> 0.0.
 
 confidence_for(N, N, CandConf) -> CandConf;
 confidence_for(_, _, _) -> 0.0.
@@ -186,8 +194,14 @@ median(List) ->
         0 -> (lists:nth(N div 2, Sorted) + lists:nth((N div 2) + 1, Sorted)) / 2
     end.
 
--spec frac_ge([number()], number()) -> float().
-frac_ge([], _Threshold) ->
+%% Fraction of the whole window in which N's inbound score is at or above
+%% Threshold. The denominator is the window length, not the number of snapshots
+%% in which N happened to be observed, so a peer seen in only a handful of
+%% snapshots cannot reach a high fraction (and be falsely attributed) on a
+%% couple of samples.
+-spec frac_elevated([snapshot()], node(), number()) -> float().
+frac_elevated([], _N, _Threshold) ->
     0.0;
-frac_ge(List, Threshold) ->
-    length([X || X <- List, X >= Threshold]) / length(List).
+frac_elevated(Window, N, Threshold) ->
+    Elevated = [V || V <- inbound_series(Window, N), V >= Threshold],
+    length(Elevated) / length(Window).
