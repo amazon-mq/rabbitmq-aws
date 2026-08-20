@@ -24,7 +24,12 @@
 
 -include("aws.hrl").
 
--export([start_link/0, start_link/1, latest/0, own_view/0, refresh/0]).
+-export([start_link/0, start_link/1, latest/0, report/0, refresh/0]).
+
+%% Bound on how long a metrics scrape will wait for the worker to reply. If the
+%% worker's mailbox is backed up past this, the scrape treats it as unavailable
+%% rather than stalling.
+-define(REPORT_TIMEOUT_MS, 1000).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2]).
 
 %% Exported for unit tests of the otherwise-internal pure helpers.
@@ -72,10 +77,12 @@ latest() ->
     gen_server:call(?MODULE, latest).
 
 %% This node's own most recent view of its peers (its raw failure-detector
-%% row), the value behind the per-node rabbitmq_peer_down_probability metric.
--spec own_view() -> view().
-own_view() ->
-    gen_server:call(?MODULE, own_view).
+%% row) together with the latest verdict and scores, fetched in one call so a
+%% scrape reads a consistent pair from a single tick and blocks at most
+%% REPORT_TIMEOUT_MS rather than making two separate calls.
+-spec report() -> {view(), aws_node_health:result()}.
+report() ->
+    gen_server:call(?MODULE, report, ?REPORT_TIMEOUT_MS).
 
 %% Run one sample/gossip/compute cycle synchronously and return the new latest.
 %% The periodic timer runs the same cycle; this is for tests and diagnostics.
@@ -142,8 +149,8 @@ init(Config0) ->
 
 handle_call(latest, _From, State) ->
     {reply, State#state.latest, State};
-handle_call(own_view, _From, State) ->
-    {reply, State#state.own_row, State};
+handle_call(report, _From, State) ->
+    {reply, {State#state.own_row, State#state.latest}, State};
 handle_call(refresh, _From, State0) ->
     State = cycle(State0),
     {reply, State#state.latest, State};

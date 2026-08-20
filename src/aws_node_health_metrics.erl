@@ -85,12 +85,12 @@ collect_mf(_Registry, Callback) ->
 %% Internal
 %%--------------------------------------------------------------------
 
-%% Read the worker's own view and scores in one place, tolerating a worker that
-%% is not running. A crash here would fail the whole /metrics scrape.
+%% Read the worker's own view and scores in a single call, tolerating a worker
+%% that is not running or is too busy to answer promptly. A crash or a long
+%% block here would fail (or stall) the whole /metrics scrape.
 read_worker() ->
     try
-        OwnView = aws_node_health_worker:own_view(),
-        #{scores := Scores} = aws_node_health_worker:latest(),
+        {OwnView, #{scores := Scores}} = aws_node_health_worker:report(),
         {OwnView, Scores}
     catch
         exit:{noproc, _} -> unavailable;
