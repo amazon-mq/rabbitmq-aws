@@ -21,15 +21,19 @@
 %%
 %%   P1 (isolated): every other node is pristine AND the suspect flaps -- its
 %%      probability crosses the extreme threshold repeatedly within the window.
-%%      This catches a partial/periodic fault whose signal oscillates rather
-%%      than pinning high (the node failure detector re-normalises a steady loss
-%%      downward over time, so a time-above-threshold measure starves, but each
-%%      loss burst still produces a fresh upward crossing). The tell is that the
-%%      rest of the cluster stays quiet while one node keeps spiking.
+%%      This catches an intermittent/periodic fault whose signal oscillates
+%%      rather than pinning high: the loss comes and goes (e.g. bursts of drops
+%%      separated by clean intervals), so the detector's probability spikes on
+%%      each burst and falls back between them. A fraction-of-time-above-a-
+%%      threshold measure starves on that low duty cycle, but each burst still
+%%      produces a fresh upward crossing. The tell is that the rest of the
+%%      cluster stays quiet while one node keeps spiking.
 %%   P2 (extreme): the suspect is extreme for most of the window AND leads the
-%%      next node by a wide margin. This catches a severe fault that pins high
-%%      even when the other nodes are themselves mildly elevated by background
-%%      loss.
+%%      next node by a wide margin. This catches a sustained fault that pins the
+%%      probability high (verified in vivo: continuous ~48% loss keeps the
+%%      failure-detector probability pinned near 1.0, it does not re-normalise
+%%      downward), even when the other nodes are themselves mildly elevated by
+%%      background loss.
 %%
 %% A cluster-wide guard fires first: if two or more nodes are sustained-elevated
 %% without one extreme leader, the condition is symmetric and is reported as
@@ -217,11 +221,13 @@ frac_elevated(Window, N, Threshold) ->
     length(Elevated) / length(Window).
 
 %% Number of upward crossings of Threshold in N's inbound series across the
-%% window: transitions from below the threshold to at-or-above it. A periodic
-%% fault produces one crossing per loss burst even as the detector re-normalises
-%% the baseline downward, so this holds up where a time-above-threshold measure
-%% starves. A steady, pinned-high signal produces no crossings after the first,
-%% which is why P2 (fraction extreme) covers that case separately.
+%% window: transitions from below the threshold to at-or-above it. An
+%% intermittent fault produces one crossing per loss burst -- the probability
+%% falls back between bursts and re-crosses on the next -- so this holds up
+%% where a fraction-of-time-above-threshold measure starves on the low duty
+%% cycle. A sustained fault instead pins the signal high and produces no
+%% crossings after the first, which is why P2 (fraction extreme) covers that
+%% case separately.
 -spec flap_count([snapshot()], node(), number()) -> non_neg_integer().
 flap_count(Window, N, Threshold) ->
     count_upcrossings(inbound_series(Window, N), Threshold, undefined, 0).

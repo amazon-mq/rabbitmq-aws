@@ -142,7 +142,7 @@ Credential management utilities, primarily for resetting AWS credentials after r
 Attribute a partially-degraded cluster node from the node failure detector's per-peer reachability estimates. Off by default; see [NODE_HEALTH.md](NODE_HEALTH.md) for the feature reference.
 
 #### `aws_node_health.erl`
-**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Two-path decision: a flap-rate path (P1, for oscillating/periodic faults the failure detector re-normalises) and a sustained-extreme path (P2), with a cluster-wide guard. No side effects, exhaustively unit-tested against captured probability fixtures.
+**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Two-path decision: a flap-rate path (P1, for oscillating/intermittent faults) and a sustained-extreme path (P2, for continuous faults that pin the probability high), with a cluster-wide guard. No side effects, exhaustively unit-tested against captured probability fixtures.
 
 #### `aws_node_health_worker.erl`
 **Purpose:** `gen_server` that each tick samples the local per-peer probabilities (`aten_sink:get_failure_probabilities/0`), gossips its row to the other cluster members, evicts stale rows, maintains the rolling window, and recomputes the verdict via `aws_node_health`. Holds the latest result for the collector to read at scrape time. Sampler, peer list, and local node are injectable for testing.

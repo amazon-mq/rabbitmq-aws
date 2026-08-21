@@ -103,10 +103,19 @@ default_config() ->
     Runtime = #{
         %% local node whose view is sampled and gossiped
         self_node => node(),
-        %% cluster peers to gossip rows to: the running cluster members other
-        %% than this node. Anchored to broker cluster membership, not the VM's
-        %% raw nodes/0 connection set, so CLI or hidden nodes are not included.
-        peers_fun => fun() -> rabbit_nodes:list_running() -- [node()] end,
+        %% cluster peers to gossip rows to: the configured cluster members
+        %% other than this node. Uses list_members/0 (a local metadata-store
+        %% read), deliberately NOT list_running/0. list_running/0 does a
+        %% cluster-wide erpc:multicall to every member's rabbit:is_running with
+        %% a 10s timeout (rabbit_nodes:?FILTER_RPC_TIMEOUT), so a
+        %% network-degraded peer -- the very fault this detector exists to
+        %% catch -- would block the sample/gossip cycle for up to 10s per tick.
+        %% That throttles the decision window ~10x, so the elevated signal
+        %% never fills enough of the window to cross the firing thresholds and
+        %% the culprit is never attributed. Gossiping a row to a down or
+        %% unreachable member is a harmless no-op (the cast is dropped), so
+        %% filtering by "running" buys nothing and costs correctness.
+        peers_fun => fun() -> rabbit_nodes:list_members() -- [node()] end,
         %% samples this node's per-peer down-probability view
         sample_fun => fun sample_failure_probabilities/0
     },
