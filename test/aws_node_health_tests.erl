@@ -124,3 +124,49 @@ clean_verdict_reports_zero_confidence_test() ->
     #{verdict := Verdict, scores := Scores} = aws_node_health:analyze(#{}, Window),
     ?assertEqual(clean, Verdict),
     ?assertEqual(0.0, maps:get(confidence, maps:get(rmq0, Scores))).
+
+%% P3 (bidirectional): under cluster-wide masking the suspect's inbound hovers at
+%% the extreme threshold (so P2's fraction starves) and a background-elevated peer
+%% compresses the margin (so P2's margin fails) -- yet rmq0 sees EVERY peer
+%% degraded in its own row (bidirectional), which a healthy node would not. P3
+%% must attribute rmq0. Mirrors the in-vivo node1@42%-over-6% case.
+bidirectional_masked_fault_is_attributed_via_p3_test() ->
+    A = #{
+        rmq1 => #{rmq0 => 0.96, rmq2 => 0.45},
+        rmq0 => #{rmq1 => 0.60, rmq2 => 0.65},
+        rmq2 => #{rmq0 => 0.94, rmq1 => 0.28}
+    },
+    B = #{
+        rmq1 => #{rmq0 => 0.84, rmq2 => 0.45},
+        rmq0 => #{rmq1 => 0.60, rmq2 => 0.65},
+        rmq2 => #{rmq0 => 0.85, rmq1 => 0.28}
+    },
+    Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% A congestion-elevated but healthy node reads high inbound (same as the mild
+%% fault above) but sees its own peers normally -- its own row is low, so it is
+%% not bidirectional and P3 must NOT fire. This is the false positive that simply
+%% lowering the inbound thresholds would cause.
+congestion_elevated_healthy_node_is_not_attributed_test() ->
+    A = #{
+        rmq1 => #{rmq0 => 0.95, rmq2 => 0.16},
+        rmq0 => #{rmq1 => 0.17, rmq2 => 0.17},
+        rmq2 => #{rmq0 => 0.93, rmq1 => 0.16}
+    },
+    B = #{
+        rmq1 => #{rmq0 => 0.86, rmq2 => 0.16},
+        rmq0 => #{rmq1 => 0.17, rmq2 => 0.17},
+        rmq2 => #{rmq0 => 0.87, rmq1 => 0.16}
+    },
+    Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
+    ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% P3 needs the suspect's own gossiped row to confirm bidirectionality. When that
+%% row is absent (its gossip never arrived) P3 cannot fire, and with the other
+%% paths also not firing the verdict is clean rather than a guess.
+p3_requires_suspect_own_row_test() ->
+    A = #{rmq1 => #{rmq0 => 0.96, rmq2 => 0.10}, rmq2 => #{rmq0 => 0.94, rmq1 => 0.10}},
+    B = #{rmq1 => #{rmq0 => 0.84, rmq2 => 0.10}, rmq2 => #{rmq0 => 0.85, rmq1 => 0.10}},
+    Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
+    ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).

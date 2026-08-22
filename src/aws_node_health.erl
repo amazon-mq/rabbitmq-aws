@@ -34,6 +34,15 @@
 %%      failure-detector probability pinned near 1.0, it does not re-normalise
 %%      downward), even when the other nodes are themselves mildly elevated by
 %%      background loss.
+%%   P3 (bidirectional): the suspect is elevated inbound AND its own outbound row
+%%      shows every peer degraded -- the signature of a single node whose own link
+%%      is bad, since its lost ACKs stall its inbound too. This attributes a masked
+%%      fault that P2's margin misses under cluster-wide congestion, where a
+%%      congestion-elevated healthy node looks identical by inbound level but is
+%%      NOT bidirectional (it still sees its own peers normally). It fires only
+%%      when exactly one node is bidirectionally degraded, and it needs the
+%%      suspect's own gossiped row to be present, so it complements rather than
+%%      replaces P2 (which covers a severe fault whose own row may be missing).
 %%
 %% A cluster-wide guard fires first: if two or more nodes are sustained-elevated
 %% without one extreme leader, the condition is symmetric and is reported as
@@ -68,7 +77,18 @@ default_config() ->
         %% P2: min lead of suspect over next node
         margin => 0.5,
         %% this many elevated nodes => cluster_wide
-        cluster_min_nodes => 2
+        cluster_min_nodes => 2,
+        %% P3 (bidirectional isolated fault): the suspect's inbound median must be
+        %% at least this...
+        bidir_inbound => 0.5,
+        %% ...AND the suspect's own view of EVERY peer (the minimum over its own
+        %% outbound row) must be at least this. A real single-node fault is
+        %% bidirectional -- the faulty node's lost ACKs stall its inbound, so it
+        %% sees all peers degraded -- whereas a merely congestion-elevated healthy
+        %% node still sees its peers normally. This lets P3 attribute a masked
+        %% fault that P2's margin misses, without the false positives that simply
+        %% lowering the inbound thresholds would cause.
+        bidir_outbound => 0.4
     }.
 
 -spec analyze(map(), [snapshot()]) -> result().
@@ -99,6 +119,7 @@ analyze(Config, Window, Nodes) ->
     Margin = maps:get(Candidate, Med) - OthersMaxMed,
     FlapMin = maps:get(flap_min, Config),
     Flaps = flap_count(Window, Candidate, maps:get(extreme, Config)),
+    OwnOut = #{N => own_outbound_min(Window, N, Nodes) || N <- Nodes},
 
     P1Gate = OthersPristine,
     P2Gate = Margin >= maps:get(margin, Config),
@@ -106,9 +127,23 @@ analyze(Config, Window, Nodes) ->
     P2Fire = P2Gate andalso maps:get(Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
     ClusterWide = NumElevated >= maps:get(cluster_min_nodes, Config),
 
+    %% P3 (bidirectional): a node is bidirectionally degraded when its inbound is
+    %% elevated AND its own outbound row shows every peer degraded. Fire only when
+    %% exactly one node qualifies and it is the candidate; two or more is symmetric
+    %% (left to the cluster-wide test). This catches a masked fault that P2 misses
+    %% while rejecting a congestion-elevated healthy node, which is not bidirectional.
+    BidirInbound = maps:get(bidir_inbound, Config),
+    BidirOutbound = maps:get(bidir_outbound, Config),
+    IsBidir = fun(N) ->
+        maps:get(N, Med) >= BidirInbound andalso maps:get(N, OwnOut) >= BidirOutbound
+    end,
+    BidirNodes = [N || N <- Nodes, IsBidir(N)],
+    P3Fire = BidirNodes =:= [Candidate],
+
     Verdict =
         if
             P2Fire -> {suspect, Candidate};
+            P3Fire -> {suspect, Candidate};
             ClusterWide -> cluster_wide;
             P1Fire -> {suspect, Candidate};
             true -> clean
@@ -126,7 +161,12 @@ analyze(Config, Window, Nodes) ->
                         false -> 0.0
                     end,
                 P2Conf = maybe_conf(P2Gate, Candidate, FracExtreme),
-                lists:max([P1Conf, P2Conf]);
+                P3Conf =
+                    case P3Fire of
+                        true -> maps:get(Candidate, OwnOut);
+                        false -> 0.0
+                    end,
+                lists:max([P1Conf, P2Conf, P3Conf]);
             _ ->
                 0.0
         end,
@@ -243,3 +283,46 @@ count_upcrossings([V | Rest], Threshold, Prev, Acc) ->
             _ -> Acc
         end,
     count_upcrossings(Rest, Threshold, V, Acc2).
+
+%% N's own outbound health: for each other node, the median over the window of
+%% N's OWN view of that node (M[N][Peer]), then the minimum across peers. A real
+%% single-node fault is bidirectional -- the faulty node's lost ACKs stall its
+%% inbound, so it sees EVERY peer degraded and this minimum is high -- whereas a
+%% congestion-elevated but healthy node sees its peers roughly normally, so the
+%% minimum stays low. Returns 0.0 when N's own row never appears in the window
+%% (its gossip never arrived), so P3 cannot fire on an unconfirmed suspect.
+-spec own_outbound_min([snapshot()], node(), [node()]) -> float().
+own_outbound_min(Window, N, Nodes) ->
+    PeerMeds = [
+        M
+     || Peer <- Nodes,
+        Peer =/= N,
+        {ok, M} <- [own_view_median(Window, N, Peer)]
+    ],
+    case PeerMeds of
+        [] -> 0.0;
+        _ -> lists:min(PeerMeds)
+    end.
+
+%% Median over the window of Observer's own view of Peer (M[Observer][Peer]),
+%% skipping snapshots where Observer's row is absent or does not mention Peer.
+-spec own_view_median([snapshot()], node(), node()) -> none | {ok, float()}.
+own_view_median(Window, Observer, Peer) ->
+    Vals = lists:filtermap(
+        fun(Snapshot) ->
+            case maps:get(Observer, Snapshot, undefined) of
+                View when is_map(View) ->
+                    case maps:find(Peer, View) of
+                        {ok, P} -> {true, P};
+                        error -> false
+                    end;
+                _ ->
+                    false
+            end
+        end,
+        Window
+    ),
+    case Vals of
+        [] -> none;
+        _ -> {ok, median(Vals)}
+    end.
