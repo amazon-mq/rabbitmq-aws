@@ -25,7 +25,7 @@ suspected_samples_test() ->
     },
     ?assertEqual(
         lists:sort([{[{peer, rmq0}], 1}, {[{peer, rmq1}], 0}]),
-        lists:sort(aws_node_health_metrics:suspected_samples(Scores))
+        lists:sort(aws_node_health_metrics:suspected_samples(other, Scores))
     ).
 
 confidence_samples_test() ->
@@ -35,8 +35,18 @@ confidence_samples_test() ->
     },
     ?assertEqual(
         lists:sort([{[{peer, rmq0}], 0.9}, {[{peer, rmq1}], 0.0}]),
-        lists:sort(aws_node_health_metrics:confidence_samples(Scores))
+        lists:sort(aws_node_health_metrics:confidence_samples(other, Scores))
     ).
+
+%% Self is excluded from the suspected/confidence gauges so a node never reports
+%% itself as a suspected-down peer and the peer domain matches probability.
+samples_exclude_self_test() ->
+    Scores = #{
+        rmq0 => #{suspected => 1, confidence => 0.9, inbound => 1.0},
+        rmq1 => #{suspected => 0, confidence => 0.0, inbound => 0.0}
+    },
+    ?assertEqual([{[{peer, rmq1}], 0}], aws_node_health_metrics:suspected_samples(rmq0, Scores)),
+    ?assertEqual([{[{peer, rmq1}], 0.0}], aws_node_health_metrics:confidence_samples(rmq0, Scores)).
 
 %%--------------------------------------------------------------------
 %% collect_mf/2 against a running worker

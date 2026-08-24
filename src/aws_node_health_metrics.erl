@@ -27,7 +27,7 @@
 -export([deregister_cleanup/1, collect_mf/2]).
 
 -ifdef(TEST).
--export([probability_samples/1, suspected_samples/1, confidence_samples/1]).
+-export([probability_samples/1, suspected_samples/2, confidence_samples/2]).
 -endif.
 
 -import(prometheus_model_helpers, [create_mf/4]).
@@ -36,9 +36,18 @@
 
 -spec register() -> ok.
 register() ->
-    prometheus_registry:register_collector(?MODULE),
-    ?AWS_LOG_INFO("node_health metrics: registered collector"),
-    ok.
+    %% Idempotent: register/0 runs as a side effect of aws_sup:init/1, which can
+    %% run again if the supervisor is restarted (e.g. the worker crash-loops past
+    %% the supervisor intensity). Registering the same collector twice would emit
+    %% duplicate metric families, so only register when not already present.
+    case lists:member(?MODULE, prometheus_registry:collectors(default)) of
+        true ->
+            ok;
+        false ->
+            prometheus_registry:register_collector(?MODULE),
+            ?AWS_LOG_INFO("node_health metrics: registered collector"),
+            ok
+    end.
 
 -spec deregister() -> ok.
 deregister() ->
@@ -67,7 +76,7 @@ collect_mf(_Registry, Callback) ->
                     rabbitmq_peer_down_suspected,
                     "Whether each peer node is attributed as the single degraded node (1) or not (0)",
                     gauge,
-                    suspected_samples(Scores)
+                    suspected_samples(node(), Scores)
                 )
             ),
             Callback(
@@ -75,7 +84,7 @@ collect_mf(_Registry, Callback) ->
                     rabbitmq_peer_down_confidence,
                     "Confidence in [0,1] that each peer node is the single degraded node",
                     gauge,
-                    confidence_samples(Scores)
+                    confidence_samples(node(), Scores)
                 )
             ),
             ok
@@ -98,11 +107,16 @@ read_worker() ->
         _:_ -> unavailable
     end.
 
+%% The scores map covers every node in the matrix, including this node itself
+%% (it appears as a peer in the other nodes' rows). Exclude Self so the suspected
+%% and confidence gauges share the same `peer` domain as probability (which comes
+%% from aten's own view and never includes self), and so a node never reports
+%% itself as a suspected-down peer on its own /metrics.
 probability_samples(OwnView) ->
     [{[{peer, Peer}], Prob} || Peer := Prob <- OwnView].
 
-suspected_samples(Scores) ->
-    [{[{peer, Peer}], maps:get(suspected, Score)} || Peer := Score <- Scores].
+suspected_samples(Self, Scores) ->
+    [{[{peer, Peer}], maps:get(suspected, Score)} || Peer := Score <- Scores, Peer =/= Self].
 
-confidence_samples(Scores) ->
-    [{[{peer, Peer}], maps:get(confidence, Score)} || Peer := Score <- Scores].
+confidence_samples(Self, Scores) ->
+    [{[{peer, Peer}], maps:get(confidence, Score)} || Peer := Score <- Scores, Peer =/= Self].
