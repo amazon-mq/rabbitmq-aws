@@ -7,7 +7,8 @@
 %%
 %% Pull-based (implements prometheus_collector): Prometheus scrapes and invokes
 %% collect_mf/2, which reads the current state from aws_node_health_worker at
-%% scrape time and emits three gauges keyed by the `peer` label:
+%% scrape time and emits three per-peer gauges keyed by the `peer` label plus one
+%% unlabelled cluster-level gauge:
 %%
 %%   rabbitmq_peer_down_probability -- this node's own view of each peer's
 %%       down-probability (the raw failure-detector row; needs no gossip).
@@ -15,6 +16,9 @@
 %%       that peer as the single degraded node, else 0.
 %%   rabbitmq_peer_down_confidence  -- confidence in [0,1] that the peer is the
 %%       single degraded node.
+%%   rabbitmq_cluster_congested     -- 1 if the degradation is symmetric across
+%%       the cluster (not attributable to any single node), else 0. Cluster-level,
+%%       so it carries no `peer` label.
 %%
 %% Reading the worker is crash-safe: if it is not running (feature disabled or
 %% mid-restart) the scrape emits nothing rather than failing every other
@@ -27,7 +31,7 @@
 -export([deregister_cleanup/1, collect_mf/2]).
 
 -ifdef(TEST).
--export([probability_samples/1, suspected_samples/2, confidence_samples/2]).
+-export([probability_samples/1, suspected_samples/2, confidence_samples/2, congested_sample/1]).
 -endif.
 
 -import(prometheus_model_helpers, [create_mf/4]).
@@ -62,7 +66,7 @@ collect_mf(_Registry, Callback) ->
     case read_worker() of
         unavailable ->
             ok;
-        {OwnView, Scores} ->
+        {OwnView, Verdict, Scores} ->
             Callback(
                 create_mf(
                     rabbitmq_peer_down_probability,
@@ -87,6 +91,14 @@ collect_mf(_Registry, Callback) ->
                     confidence_samples(node(), Scores)
                 )
             ),
+            Callback(
+                create_mf(
+                    rabbitmq_cluster_congested,
+                    "Whether cluster network degradation is symmetric across nodes (1), not attributable to any single node, or not (0)",
+                    gauge,
+                    congested_sample(Verdict)
+                )
+            ),
             ok
     end.
 
@@ -99,8 +111,8 @@ collect_mf(_Registry, Callback) ->
 %% block here would fail (or stall) the whole /metrics scrape.
 read_worker() ->
     try
-        {OwnView, #{scores := Scores}} = aws_node_health_worker:report(),
-        {OwnView, Scores}
+        {OwnView, #{verdict := Verdict, scores := Scores}} = aws_node_health_worker:report(),
+        {OwnView, Verdict, Scores}
     catch
         exit:{noproc, _} -> unavailable;
         exit:{timeout, _} -> unavailable;
@@ -120,3 +132,10 @@ suspected_samples(Self, Scores) ->
 
 confidence_samples(Self, Scores) ->
     [{[{peer, Peer}], maps:get(confidence, Score)} || Peer := Score <- Scores, Peer =/= Self].
+
+%% A single unlabelled sample: 1 when the debounced verdict is cluster_wide
+%% (symmetric congestion, not attributable to any one node), else 0. This is a
+%% cluster-level signal, so unlike the peer gauges it carries no `peer` label.
+-spec congested_sample(aws_node_health:verdict()) -> [{[], 0 | 1}].
+congested_sample(cluster_wide) -> [{[], 1}];
+congested_sample(_) -> [{[], 0}].

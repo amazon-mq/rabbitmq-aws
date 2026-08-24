@@ -67,7 +67,14 @@
     %% published suspect (or none), its held confidence, and consecutive misses
     deb_confirmed = none :: node() | none,
     deb_conf = 0.0 :: float(),
-    deb_miss = 0 :: non_neg_integer()
+    deb_miss = 0 :: non_neg_integer(),
+    %% Independent debounce for the cluster_wide (symmetric congestion) verdict,
+    %% reusing confirm_ticks/clear_ticks: whether it is currently published, the
+    %% consecutive cluster_wide count toward confirmation, and the consecutive
+    %% non-cluster_wide count toward clearing.
+    cw_confirmed = false :: boolean(),
+    cw_arm = 0 :: non_neg_integer(),
+    cw_miss = 0 :: non_neg_integer()
 }).
 
 %%--------------------------------------------------------------------
@@ -290,14 +297,60 @@ debounce(Raw, State) ->
                         end
                 end
         end,
+    %% Independent debounce for the cluster_wide (symmetric congestion) verdict,
+    %% reusing the same confirm/clear thresholds: it is asserted only after the
+    %% raw verdict has been cluster_wide for confirm_ticks consecutive ticks, and
+    %% de-asserted only after clear_ticks consecutive non-cluster_wide ticks. This
+    %% keeps the congestion signal from flapping on a single noisy tick, exactly
+    %% as the suspect flag is debounced.
+    {CwOn, CwArm, CwMiss} = debounce_cluster_wide(RawVerdict, State, ConfirmTicks, ClearTicks),
+    %% Resolve the published verdict. A confirmed single-node suspect takes
+    %% precedence over cluster_wide (a dominant fault is the more actionable
+    %% signal, and the scorer already evaluates the dominant-node paths before
+    %% the symmetric guard); cluster_wide is reported only when no suspect is
+    %% confirmed.
+    Verdict =
+        if
+            Confirmed =/= none -> {suspect, Confirmed};
+            CwOn -> cluster_wide;
+            true -> clean
+        end,
     State1 = State#state{
         deb_stream = Stream,
         deb_arm = Arm,
         deb_confirmed = Confirmed,
         deb_conf = Conf,
-        deb_miss = Miss
+        deb_miss = Miss,
+        cw_confirmed = CwOn,
+        cw_arm = CwArm,
+        cw_miss = CwMiss
     },
-    {State1, publish(RawVerdict, maps:get(scores, Raw), Confirmed, Conf)}.
+    {State1, publish(Verdict, maps:get(scores, Raw), Confirmed, Conf)}.
+
+%% Debounce the cluster_wide verdict with the same confirm/clear thresholds used
+%% for the suspect flag. Returns {NowOn, Arm, Miss}: cluster_wide is asserted
+%% after confirm_ticks consecutive cluster_wide raw verdicts and held until
+%% clear_ticks consecutive non-cluster_wide ones.
+-spec debounce_cluster_wide(aws_node_health:verdict(), #state{}, pos_integer(), pos_integer()) ->
+    {boolean(), non_neg_integer(), non_neg_integer()}.
+debounce_cluster_wide(RawVerdict, State, ConfirmTicks, ClearTicks) ->
+    IsCw = RawVerdict =:= cluster_wide,
+    Arm =
+        case IsCw of
+            true -> State#state.cw_arm + 1;
+            false -> 0
+        end,
+    Miss =
+        case IsCw of
+            true -> 0;
+            false -> State#state.cw_miss + 1
+        end,
+    On =
+        case State#state.cw_confirmed of
+            false -> IsCw andalso Arm >= ConfirmTicks;
+            true -> not (Miss >= ClearTicks)
+        end,
+    {On, Arm, Miss}.
 
 %% Confidence the raw result assigned to node N (0.0 if absent).
 -spec raw_conf(aws_node_health:result(), node()) -> float().
@@ -309,21 +362,16 @@ raw_conf(Raw, N) ->
 
 %% Rebuild the result with the debounced suspect: only the confirmed node reads
 %% suspected=1 (with the held confidence); every other node reads 0. Raw
-%% `inbound` scores are preserved. With no confirmed suspect the verdict is
-%% cluster_wide when the raw result was cluster_wide, else clean (an unconfirmed
-%% raw suspect is not yet published). A confirmed suspect that has dropped out of
-%% the raw scores (its row went stale, e.g. it crashed or fully partitioned)
-%% cannot be given a consistent suspected=1 sample, so it is published clean; the
-%% miss counter then clears it. verdict and scores therefore never contradict.
+%% `inbound` scores are preserved. `Verdict` is the already-resolved published
+%% verdict (cluster_wide or clean when there is no confirmed suspect, else
+%% {suspect, Confirmed}). A confirmed suspect that has dropped out of the raw
+%% scores (its row went stale, e.g. it crashed or fully partitioned) cannot be
+%% given a consistent suspected=1 sample, so it is published clean; the miss
+%% counter then clears it. verdict and scores therefore never contradict.
 -spec publish(aws_node_health:verdict(), map(), node() | none, float()) -> aws_node_health:result().
-publish(RawVerdict, Scores, none, _Conf) ->
-    Verdict =
-        case RawVerdict of
-            cluster_wide -> cluster_wide;
-            _ -> clean
-        end,
+publish(Verdict, Scores, none, _Conf) ->
     #{verdict => Verdict, scores => zero_suspect(Scores)};
-publish(_RawVerdict, Scores, Confirmed, Conf) ->
+publish(_Verdict, Scores, Confirmed, Conf) ->
     case maps:is_key(Confirmed, Scores) of
         true ->
             Scored = maps:map(

@@ -38,6 +38,12 @@ confidence_samples_test() ->
         lists:sort(aws_node_health_metrics:confidence_samples(other, Scores))
     ).
 
+congested_sample_test() ->
+    %% cluster_wide -> 1, everything else -> 0; always a single unlabelled sample.
+    ?assertEqual([{[], 1}], aws_node_health_metrics:congested_sample(cluster_wide)),
+    ?assertEqual([{[], 0}], aws_node_health_metrics:congested_sample(clean)),
+    ?assertEqual([{[], 0}], aws_node_health_metrics:congested_sample({suspect, rmq0})).
+
 %% Self is excluded from the suspected/confidence gauges so a node never reports
 %% itself as a suspected-down peer and the peer domain matches probability.
 samples_exclude_self_test() ->
@@ -70,7 +76,7 @@ drain_mfs(Acc) ->
         lists:reverse(Acc)
     end.
 
-collect_mf_emits_three_families_test() ->
+collect_mf_emits_four_families_test() ->
     SampleFun = fun() -> #{rmq1 => 0.0, rmq2 => 0.0} end,
     {ok, Pid} = aws_node_health_worker:start_link(worker_config(SampleFun)),
     try
@@ -82,7 +88,7 @@ collect_mf_emits_three_families_test() ->
             ok,
             aws_node_health_metrics:collect_mf(default, fun(MF) -> Self ! {mf, MF} end)
         ),
-        ?assertEqual(3, length(drain_mfs([])))
+        ?assertEqual(4, length(drain_mfs([])))
     after
         gen_server:stop(Pid)
     end.

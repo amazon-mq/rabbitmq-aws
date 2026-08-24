@@ -117,6 +117,54 @@ worker_debounces_suspect_until_confirm_ticks_test() ->
         gen_server:stop(Pid)
     end.
 
+%% Hysteresis for the cluster_wide verdict: uniform congestion (every node sees
+%% every peer elevated) must not publish cluster_wide until it has held for
+%% confirm_ticks consecutive ticks. With confirm_ticks=3, ticks 1 and 2 stay
+%% clean (armed but not confirmed); tick 3 publishes cluster_wide.
+worker_debounces_cluster_wide_until_confirm_ticks_test() ->
+    SampleFun = fun() -> #{rmq1 => 0.9, rmq2 => 0.9} end,
+    Cfg = (worker_config(SampleFun))#{confirm_ticks => 3, clear_ticks => 3},
+    {ok, Pid} = aws_node_health_worker:start_link(Cfg),
+    try
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 0.9, rmq2 => 0.9}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 0.9, rmq1 => 0.9}}),
+        ?assertEqual(clean, maps:get(verdict, aws_node_health_worker:refresh())),
+        ?assertEqual(clean, maps:get(verdict, aws_node_health_worker:refresh())),
+        ?assertEqual(cluster_wide, maps:get(verdict, aws_node_health_worker:refresh()))
+    after
+        gen_server:stop(Pid)
+    end.
+
+%% Once published, cluster_wide must hold until clear_ticks consecutive
+%% non-cluster_wide ticks. With clear_ticks=3, the first two healthy ticks after
+%% congestion clears still read cluster_wide; the third clears to clean.
+worker_holds_cluster_wide_until_clear_ticks_test() ->
+    T = ets:new(nh_sampler, [set, public]),
+    ets:insert(T, {row, #{rmq1 => 0.9, rmq2 => 0.9}}),
+    SampleFun = fun() ->
+        [{row, R}] = ets:lookup(T, row),
+        R
+    end,
+    Cfg = (worker_config(SampleFun))#{confirm_ticks => 2, clear_ticks => 3},
+    {ok, Pid} = aws_node_health_worker:start_link(Cfg),
+    try
+        %% Phase 1: uniform congestion -> confirm cluster_wide.
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 0.9, rmq2 => 0.9}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 0.9, rmq1 => 0.9}}),
+        _ = aws_node_health_worker:refresh(),
+        ?assertEqual(cluster_wide, maps:get(verdict, aws_node_health_worker:refresh())),
+        %% Phase 2: congestion clears -> hold until clear_ticks misses.
+        ets:insert(T, {row, #{rmq1 => 0.0, rmq2 => 0.0}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 0.0, rmq2 => 0.0}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 0.0, rmq1 => 0.0}}),
+        ?assertEqual(cluster_wide, maps:get(verdict, aws_node_health_worker:refresh())),
+        ?assertEqual(cluster_wide, maps:get(verdict, aws_node_health_worker:refresh())),
+        ?assertEqual(clean, maps:get(verdict, aws_node_health_worker:refresh()))
+    after
+        gen_server:stop(Pid),
+        ets:delete(T)
+    end.
+
 %% Regression (review finding): a confirmed suspect must NOT stay latched once
 %% the raw verdict turns cluster_wide - a genuine symmetric condition must clear
 %% the held suspect at once, not be overridden by it. clear_ticks is set high so
