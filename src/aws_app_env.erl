@@ -5,7 +5,21 @@
 
 -module(aws_app_env).
 
--export([update/4, delete/3]).
+-export([update/4, delete/3, get_int_env/4]).
+
+%% Read a bounded positive integer from an application's environment. An unset,
+%% non-integer, or out-of-range value falls back to Default rather than failing
+%% the caller; a schema (where present) is what reports a bad value to the
+%% operator. Shared by aws_sup and aws_node_health_config so the bounds/fallback
+%% logic lives in one place.
+-spec get_int_env(atom(), atom(), pos_integer(), pos_integer()) -> pos_integer().
+get_int_env(App, Key, Default, MaxBound) ->
+    case application:get_env(App, Key) of
+        {ok, N} when is_integer(N), N > 0, N =< MaxBound ->
+            N;
+        _ ->
+            Default
+    end.
 
 -spec update(
     App :: atom(),
