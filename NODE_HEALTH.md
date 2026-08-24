@@ -33,7 +33,7 @@ Both `rabbitmq_peer_down_suspected` and `rabbitmq_cluster_congested` are debounc
 
 ## How the decision is made
 
-For each node the detector computes an inbound score - the median of the *other* nodes' views of it - over the window, picks the highest as the candidate, then applies three paths plus a guard:
+For each node the detector computes an inbound score - the median of the *other* nodes' views of it - over the window, picks the highest as the candidate, then applies three paths plus a guard. They are evaluated in this order: **P2, then P3, then the cluster-wide guard, then P1.** The two dominant-single-node paths (P2 and P3) run *before* the guard, so a node that clearly dominates is still attributed even when a background peer is also elevated; the guard then catches the genuinely symmetric case, and the weaker P1 flap path is considered only if nothing above matched.
 
 - **Cluster-wide guard.** If two or more nodes are elevated, the condition is symmetric (congestion, not a single fault) and the verdict is `cluster_wide` - no node is blamed.
 - **P1, isolated fault (flap-rate).** Every other node is pristine *and* the candidate flaps: its probability crosses the extreme threshold repeatedly within the window. This is the key path for an intermittent or periodic fault, where the loss comes and goes so the probability spikes on each burst and falls back between bursts: a "fraction of time above a threshold" measure starves on that low duty cycle, but each burst still produces a fresh upward crossing. The tell is that the rest of the cluster stays quiet while one node keeps spiking.
