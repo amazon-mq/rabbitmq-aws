@@ -131,18 +131,40 @@ clean_verdict_reports_zero_confidence_test() ->
 %% degraded in its own row (bidirectional), which a healthy node would not. P3
 %% must attribute rmq0. Mirrors the in-vivo node1@42%-over-6% case.
 bidirectional_masked_fault_is_attributed_via_p3_test() ->
+    %% rmq0 is the faulty node: both healthy peers see it high (inbound) and it
+    %% sees BOTH peers degraded in its own row (bidirectional), while the two
+    %% healthy nodes each see the culprit high but each other low -- so rmq0's own
+    %% outbound clearly dominates.
     A = #{
-        rmq1 => #{rmq0 => 0.96, rmq2 => 0.45},
+        rmq1 => #{rmq0 => 0.96, rmq2 => 0.12},
         rmq0 => #{rmq1 => 0.60, rmq2 => 0.65},
-        rmq2 => #{rmq0 => 0.94, rmq1 => 0.28}
+        rmq2 => #{rmq0 => 0.94, rmq1 => 0.12}
     },
     B = #{
-        rmq1 => #{rmq0 => 0.84, rmq2 => 0.45},
+        rmq1 => #{rmq0 => 0.84, rmq2 => 0.12},
         rmq0 => #{rmq1 => 0.60, rmq2 => 0.65},
-        rmq2 => #{rmq0 => 0.85, rmq1 => 0.28}
+        rmq2 => #{rmq0 => 0.85, rmq1 => 0.12}
     },
     Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
     ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% Uniform cluster-wide congestion: every node sees every peer degraded, so all
+%% are roughly equally bidirectional and none dominates. P3 must NOT single out a
+%% node -- the verdict is cluster_wide. This is the regression for the in-vivo
+%% uniform-loss false positive that the relative (dominance) test fixes.
+uniform_congestion_all_bidirectional_is_not_attributed_test() ->
+    A = #{
+        rmq0 => #{rmq1 => 0.55, rmq2 => 0.60},
+        rmq1 => #{rmq0 => 0.58, rmq2 => 0.62},
+        rmq2 => #{rmq0 => 0.57, rmq1 => 0.59}
+    },
+    B = #{
+        rmq0 => #{rmq1 => 0.62, rmq2 => 0.56},
+        rmq1 => #{rmq0 => 0.60, rmq2 => 0.58},
+        rmq2 => #{rmq0 => 0.61, rmq1 => 0.57}
+    },
+    Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
+    ?assertEqual(cluster_wide, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
 
 %% A congestion-elevated but healthy node reads high inbound (same as the mild
 %% fault above) but sees its own peers normally -- its own row is low, so it is

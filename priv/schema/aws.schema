@@ -319,3 +319,15 @@ end}.
 %% aws_node_health_config:get_int/3.
 {mapping, "aws.node_health.stale_ticks", "aws.node_health_stale_ticks",
     [{datatype, integer}]}.
+
+%% @doc Hysteresis: a peer must be the raw suspect for this many consecutive
+%% ticks before its `suspected' flag is published (effective default 3). Bound
+%% enforced at runtime by aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.confirm_ticks", "aws.node_health_confirm_ticks",
+    [{datatype, integer}]}.
+
+%% @doc Hysteresis: a published suspect stays suspected until it is no longer the
+%% raw suspect for this many consecutive ticks (effective default 3). Bound
+%% enforced at runtime by aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.clear_ticks", "aws.node_health_clear_ticks",
+    [{datatype, integer}]}.

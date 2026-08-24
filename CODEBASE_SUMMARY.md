@@ -142,10 +142,10 @@ Credential management utilities, primarily for resetting AWS credentials after r
 Attribute a partially-degraded cluster node from the node failure detector's per-peer reachability estimates. Off by default; see [NODE_HEALTH.md](NODE_HEALTH.md) for the feature reference.
 
 #### `aws_node_health.erl`
-**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Two-path decision: a flap-rate path (P1, for oscillating/intermittent faults) and a sustained-extreme path (P2, for continuous faults that pin the probability high), with a cluster-wide guard. No side effects, exhaustively unit-tested against captured probability fixtures.
+**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Three-path decision: a flap-rate path (P1, for oscillating/intermittent faults), a sustained-extreme path (P2, for continuous faults that pin the probability high), and a bidirectional path (P3, for a masked fault under cluster-wide congestion - the candidate's own outbound row must show every peer degraded and dominate the other nodes' by a margin), with a cluster-wide guard. No side effects, exhaustively unit-tested against captured probability fixtures.
 
 #### `aws_node_health_worker.erl`
-**Purpose:** `gen_server` that each tick samples the local per-peer probabilities (`aten_sink:get_failure_probabilities/0`), gossips its row to the other cluster members, evicts stale rows, maintains the rolling window, and recomputes the verdict via `aws_node_health`. Holds the latest result for the collector to read at scrape time. Sampler, peer list, and local node are injectable for testing.
+**Purpose:** `gen_server` that each tick samples the local per-peer probabilities (`aten_sink:get_failure_probabilities/0`), gossips its row to the other cluster members, evicts stale rows, maintains the rolling window, and recomputes the verdict via `aws_node_health`. Applies hysteresis (debounce) so the published `suspected` flag flips only after a suspect has held for `confirm_ticks` consecutive cycles and clears after `clear_ticks` cycles, holding the debounced result for the collector to read at scrape time. Sampler, peer list, and local node are injectable for testing.
 
 #### `aws_node_health_metrics.erl`
 **Purpose:** `prometheus_collector` that reads the worker at scrape time and emits the `rabbitmq_peer_down_probability`, `rabbitmq_peer_down_suspected`, and `rabbitmq_peer_down_confidence` gauges. Crash-safe: a missing or busy worker yields no metrics rather than failing the scrape.
@@ -204,6 +204,8 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 - `aws.node_health.interval_ms` - Sampling/recompute period (default: 1000)
 - `aws.node_health.window` - Rolling decision window size (default: 30)
 - `aws.node_health.stale_ticks` - Evict a peer row not refreshed within this many ticks (default: 5)
+- `aws.node_health.confirm_ticks` - Hysteresis: consecutive cycles a node must be the raw suspect before `suspected` is published (default: 3)
+- `aws.node_health.clear_ticks` - Hysteresis: consecutive cycles without being the raw suspect before a published suspect clears (default: 3)
 
 ### Schema Translation Logic
 

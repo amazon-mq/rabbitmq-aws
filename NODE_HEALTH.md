@@ -30,13 +30,16 @@ The suspected/confidence values are the same across all healthy nodes because th
 
 ## How the decision is made
 
-For each node the detector computes an inbound score - the median of the *other* nodes' views of it - over the window, picks the highest as the candidate, then applies two paths plus a guard:
+For each node the detector computes an inbound score - the median of the *other* nodes' views of it - over the window, picks the highest as the candidate, then applies three paths plus a guard:
 
 - **Cluster-wide guard.** If two or more nodes are elevated, the condition is symmetric (congestion, not a single fault) and the verdict is `cluster_wide` - no node is blamed.
 - **P1, isolated fault (flap-rate).** Every other node is pristine *and* the candidate flaps: its probability crosses the extreme threshold repeatedly within the window. This is the key path for an intermittent or periodic fault, where the loss comes and goes so the probability spikes on each burst and falls back between bursts: a "fraction of time above a threshold" measure starves on that low duty cycle, but each burst still produces a fresh upward crossing. The tell is that the rest of the cluster stays quiet while one node keeps spiking.
 - **P2, sustained fault.** The candidate is extreme for most of the window and leads the next node by a wide margin. This covers a continuous fault that pins the probability high (verified in vivo: continuous ~48% loss keeps the failure-detector probability pinned near 1.0, it does not re-normalise downward) even when other nodes are mildly elevated by background loss.
+- **P3, masked fault (bidirectional).** The candidate is elevated inbound *and* its own outbound row shows every peer degraded, *and* that own-outbound dominates every other node's by a margin. A real single-node network fault is bidirectional - the faulty node's lost ACKs stall its inbound too, so it sees all peers degraded - whereas a healthy node elevated only by cluster-wide congestion still sees its own peers roughly normally. This attributes a masked fault (a single node worse than a congested background) that P2's margin misses. The dominance requirement is what keeps P3 out under *uniform* congestion, where every node is roughly equally bidirectional so none dominates and the verdict stays `cluster_wide`. P3 needs the suspect's own gossiped row, so it complements P2 (which covers a severe fault whose own row may be missing).
 
-The "every other node pristine" gate on P1 is what prevents a false positive under cluster-wide congestion, where the busiest node reads elevated without any real fault.
+The "every other node pristine" gate on P1, and P3's dominance requirement, are what prevent a false positive under cluster-wide congestion, where a node can read elevated inbound without any real fault.
+
+**Hysteresis.** The per-tick verdict is intentionally noisy (under congestion a healthy node can momentarily win the candidate slot), so the published `suspected` flag is debounced: a node is only marked suspected after it has been the raw suspect for `confirm_ticks` consecutive cycles, and stays suspected until it has *not* been the raw suspect for `clear_ticks` consecutive cycles. This applies uniformly to all three paths.
 
 Attribution needs at least three nodes (a two-node view cannot tell which side is bad); Amazon MQ clusters are three-node. It relies on the healthy nodes' views of the suspect, so the suspect's own (unreliable) gossip is not required.
 
@@ -50,6 +53,8 @@ All keys are optional; the feature is disabled unless the toggle is set.
 | `aws.node_health.interval_ms` | `1000` | Sampling and recompute period. |
 | `aws.node_health.window` | `30` | Number of snapshots in the rolling decision window. |
 | `aws.node_health.stale_ticks` | `5` | Drop a peer's row if it has not refreshed within this many ticks. |
+| `aws.node_health.confirm_ticks` | `3` | Hysteresis: consecutive cycles a node must be the raw suspect before `suspected` is published. |
+| `aws.node_health.clear_ticks` | `3` | Hysteresis: consecutive cycles without being the raw suspect before a published suspect clears. |
 
 Example:
 

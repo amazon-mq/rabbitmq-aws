@@ -13,10 +13,10 @@
 %% and decides whether one node is the culprit, or whether the degradation is
 %% cluster-wide (and so must not be attributed to a single node).
 %%
-%% The decision is deliberately two-path, because a single threshold on the
+%% The decision is deliberately multi-path, because a single threshold on the
 %% suspect's own level cannot work: empirically a real single-node fault and
 %% mild cluster-wide congestion on the busiest node produce similar suspect
-%% levels, while a heavier real fault produces a much higher one. The two paths
+%% levels, while a heavier real fault produces a much higher one. The paths
 %% are:
 %%
 %%   P1 (isolated): every other node is pristine AND the suspect flaps -- its
@@ -40,13 +40,19 @@
 %%      fault that P2's margin misses under cluster-wide congestion, where a
 %%      congestion-elevated healthy node looks identical by inbound level but is
 %%      NOT bidirectional (it still sees its own peers normally). It fires only
-%%      when exactly one node is bidirectionally degraded, and it needs the
-%%      suspect's own gossiped row to be present, so it complements rather than
+%%      when the suspect's own outbound DOMINATES every other node's by a margin,
+%%      so uniform congestion (where all nodes are roughly equally bidirectional)
+%%      is left to the cluster-wide test rather than pinned on one node. It needs
+%%      the suspect's own gossiped row to be present, so it complements rather than
 %%      replaces P2 (which covers a severe fault whose own row may be missing).
 %%
-%% A cluster-wide guard fires first: if two or more nodes are sustained-elevated
-%% without one extreme leader, the condition is symmetric and is reported as
-%% cluster_wide rather than blamed on any node.
+%% Precedence: the two dominant-single-node paths, P2 (sustained-extreme with a
+%% wide margin) and P3 (bidirectional dominance), are evaluated BEFORE the
+%% cluster-wide guard, so a node that clearly dominates is attributed even when a
+%% background peer is also elevated. The cluster-wide guard then catches the
+%% symmetric case -- two or more nodes sustained-elevated without one dominant
+%% leader -- and reports cluster_wide rather than blaming any node; only the
+%% weaker P1 flap path is considered after it.
 
 -module(aws_node_health).
 
@@ -88,7 +94,16 @@ default_config() ->
         %% node still sees its peers normally. This lets P3 attribute a masked
         %% fault that P2's margin misses, without the false positives that simply
         %% lowering the inbound thresholds would cause.
-        bidir_outbound => 0.4
+        bidir_outbound => 0.4,
+        %% ...AND the suspect's own outbound must EXCEED every other node's own
+        %% outbound by this margin. Under uniform cluster-wide congestion every
+        %% node is roughly equally bidirectional, so none dominates and P3 stays
+        %% out (the condition is cluster_wide); under a real single-node fault the
+        %% culprit sees all peers degraded while the healthy nodes each see one
+        %% peer (the culprit) high and the other low, so the culprit's own
+        %% outbound clearly dominates. This relative test replaces an absolute
+        %% one, which flickered false-positive at borderline uniform loss.
+        bidir_margin => 0.2
     }.
 
 -spec analyze(map(), [snapshot()]) -> result().
@@ -106,8 +121,26 @@ analyze(Config0, Window) ->
 
 -spec analyze(map(), [snapshot()], [node()]) -> result().
 analyze(Config, Window, Nodes) ->
-    Med = #{N => node_median(Window, N) || N <- Nodes},
-    FracExtreme = #{N => frac_elevated(Window, N, maps:get(extreme, Config)) || N <- Nodes},
+    Extreme = maps:get(extreme, Config),
+    %% Compute each node's inbound series once and reuse it for the median,
+    %% the extreme fraction, and the flap count (each of which would otherwise
+    %% rescan the whole window).
+    InSeries = #{N => inbound_series(Window, N) || N <- Nodes},
+    %% Extreme-fraction denominator: the configured window size, not the current
+    %% (possibly still-filling) length. Right after boot or a worker restart the
+    %% window is short; dividing by its length would let a couple of extreme ticks
+    %% clear the "extreme for most of the window" bar that a full window needs
+    %% ~extreme_frac * window samples for. Using the configured window imposes a
+    %% brief warmup (the window must fill) before P2/P3 attribute, which is
+    %% appropriate for a detector meant to catch sustained faults. Falls back to
+    %% the actual length when the caller does not supply `window` (e.g. tests).
+    WindowDenom = max(length(Window), maps:get(window, Config, length(Window))),
+    Med = #{N => median_or_zero(maps:get(N, InSeries)) || N <- Nodes},
+    FracExtreme =
+        #{
+            N => frac_at_least(maps:get(N, InSeries), Extreme, WindowDenom)
+         || N <- Nodes
+        },
     Candidate = argmax_median(Nodes, Med),
     Others = [N || N <- Nodes, N =/= Candidate],
     OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- Others]]),
@@ -118,7 +151,7 @@ analyze(Config, Window, Nodes) ->
     NumElevated = length([N || N <- Nodes, maps:get(N, Med) >= maps:get(elevated, Config)]),
     Margin = maps:get(Candidate, Med) - OthersMaxMed,
     FlapMin = maps:get(flap_min, Config),
-    Flaps = flap_count(Window, Candidate, maps:get(extreme, Config)),
+    Flaps = flap_count(maps:get(Candidate, InSeries), Extreme),
     OwnOut = #{N => own_outbound_min(Window, N, Nodes) || N <- Nodes},
 
     P1Gate = OthersPristine,
@@ -127,18 +160,22 @@ analyze(Config, Window, Nodes) ->
     P2Fire = P2Gate andalso maps:get(Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
     ClusterWide = NumElevated >= maps:get(cluster_min_nodes, Config),
 
-    %% P3 (bidirectional): a node is bidirectionally degraded when its inbound is
-    %% elevated AND its own outbound row shows every peer degraded. Fire only when
-    %% exactly one node qualifies and it is the candidate; two or more is symmetric
-    %% (left to the cluster-wide test). This catches a masked fault that P2 misses
-    %% while rejecting a congestion-elevated healthy node, which is not bidirectional.
+    %% P3 (bidirectional): the candidate is bidirectionally degraded when its
+    %% inbound is elevated, its own outbound row shows every peer degraded, AND
+    %% its own outbound DOMINATES every other node's by a margin. The dominance
+    %% test is what keeps P3 out under uniform congestion (where every node is
+    %% roughly equally bidirectional, so none dominates -> left to the cluster-wide
+    %% test), while still attributing a real single-node fault (whose culprit's
+    %% own outbound clearly leads the healthy nodes').
     BidirInbound = maps:get(bidir_inbound, Config),
     BidirOutbound = maps:get(bidir_outbound, Config),
-    IsBidir = fun(N) ->
-        maps:get(N, Med) >= BidirInbound andalso maps:get(N, OwnOut) >= BidirOutbound
-    end,
-    BidirNodes = [N || N <- Nodes, IsBidir(N)],
-    P3Fire = BidirNodes =:= [Candidate],
+    BidirMargin = maps:get(bidir_margin, Config),
+    CandOwnOut = maps:get(Candidate, OwnOut),
+    OthersOwnOutMax = lists:max([0.0 | [maps:get(N, OwnOut) || N <- Others]]),
+    P3Fire =
+        maps:get(Candidate, Med) >= BidirInbound andalso
+            CandOwnOut >= BidirOutbound andalso
+            CandOwnOut - OthersOwnOutMax >= BidirMargin,
 
     Verdict =
         if
@@ -210,11 +247,11 @@ snapshot_inbound(Snapshot, N) ->
 inbound_series(Window, N) ->
     [M || Snapshot <- Window, {ok, M} <- [snapshot_inbound(Snapshot, N)]].
 
-node_median(Window, N) ->
-    case inbound_series(Window, N) of
-        [] -> 0.0;
-        Series -> median(Series)
-    end.
+%% Median of a precomputed inbound series, or 0.0 when the node was never
+%% observed in the window.
+-spec median_or_zero([float()]) -> float().
+median_or_zero([]) -> 0.0;
+median_or_zero(Series) -> median(Series).
 
 argmax_median(Nodes, Med) ->
     [First | Rest] = lists:sort(Nodes),
@@ -248,29 +285,27 @@ median(List) ->
         0 -> (lists:nth(N div 2, Sorted) + lists:nth((N div 2) + 1, Sorted)) / 2
     end.
 
-%% Fraction of the whole window in which N's inbound score is at or above
-%% Threshold. The denominator is the window length, not the number of snapshots
-%% in which N happened to be observed, so a peer seen in only a handful of
-%% snapshots cannot reach a high fraction (and be falsely attributed) on a
-%% couple of samples.
--spec frac_elevated([snapshot()], node(), number()) -> float().
-frac_elevated([], _N, _Threshold) ->
-    0.0;
-frac_elevated(Window, N, Threshold) ->
-    Elevated = [V || V <- inbound_series(Window, N), V >= Threshold],
-    length(Elevated) / length(Window).
+%% Fraction of the window (by Denom) in which a node's inbound score is at or
+%% above Threshold. Denom is the configured window size, not the number of
+%% samples in the series, so (a) a peer seen in only a handful of snapshots
+%% cannot reach a high fraction on a couple of samples, and (b) a still-filling
+%% window right after boot cannot reach the fraction on a couple of extreme
+%% ticks either -- both require ~Denom*frac genuine extreme samples.
+-spec frac_at_least([float()], number(), pos_integer()) -> float().
+frac_at_least(Series, Threshold, Denom) ->
+    Elevated = [V || V <- Series, V >= Threshold],
+    length(Elevated) / max(1, Denom).
 
-%% Number of upward crossings of Threshold in N's inbound series across the
-%% window: transitions from below the threshold to at-or-above it. An
-%% intermittent fault produces one crossing per loss burst -- the probability
-%% falls back between bursts and re-crosses on the next -- so this holds up
-%% where a fraction-of-time-above-threshold measure starves on the low duty
-%% cycle. A sustained fault instead pins the signal high and produces no
-%% crossings after the first, which is why P2 (fraction extreme) covers that
-%% case separately.
--spec flap_count([snapshot()], node(), number()) -> non_neg_integer().
-flap_count(Window, N, Threshold) ->
-    count_upcrossings(inbound_series(Window, N), Threshold, undefined, 0).
+%% Number of upward crossings of Threshold in a node's inbound series: transitions
+%% from below the threshold to at-or-above it. An intermittent fault produces one
+%% crossing per loss burst -- the probability falls back between bursts and
+%% re-crosses on the next -- so this holds up where a fraction-of-time-above-
+%% threshold measure starves on the low duty cycle. A sustained fault instead
+%% pins the signal high and produces no crossings after the first, which is why
+%% P2 (fraction extreme) covers that case separately.
+-spec flap_count([float()], number()) -> non_neg_integer().
+flap_count(Series, Threshold) ->
+    count_upcrossings(Series, Threshold, undefined, 0).
 
 -spec count_upcrossings([float()], number(), float() | undefined, non_neg_integer()) ->
     non_neg_integer().

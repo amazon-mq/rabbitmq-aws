@@ -46,7 +46,12 @@ worker_config(SampleFun) ->
         self_node => rmq0,
         peers_fun => fun() -> [] end,
         sample_fun => SampleFun,
-        window_max => 30,
+        %% window_max = 1 keeps the window always "full" (one snapshot), so these
+        %% integration tests exercise the gen_server plumbing and the debounce in
+        %% isolation, without the extreme-fraction warmup (which needs the window
+        %% to fill). The windowing/fraction math is covered by aws_node_health's
+        %% own unit tests, which use full 30-sample windows.
+        window_max => 1,
         stale_ticks => 100,
         %% large so the periodic timer never fires during the test
         interval_ms => 3600000,
@@ -63,7 +68,8 @@ with_worker(SampleFun, Body) ->
 
 fresh_worker_is_clean_test() ->
     with_worker(fun() -> #{} end, fun() ->
-        ?assertEqual(#{verdict => clean, scores => #{}}, aws_node_health_worker:latest())
+        {_OwnRow, Latest} = aws_node_health_worker:report(),
+        ?assertEqual(#{verdict => clean, scores => #{}}, Latest)
     end).
 
 worker_attributes_single_fault_test() ->
@@ -90,3 +96,58 @@ worker_stays_clean_when_peers_healthy_test() ->
         Latest = aws_node_health_worker:refresh(),
         ?assertEqual(clean, maps:get(verdict, Latest))
     end).
+
+%% Hysteresis: even with the raw verdict pointing at rmq0 every tick, the
+%% published `suspected` must not flip until the suspect has held for
+%% confirm_ticks consecutive ticks. Here confirm_ticks=3: ticks 1 and 2 stay
+%% clean (armed but not confirmed); tick 3 publishes the suspect.
+worker_debounces_suspect_until_confirm_ticks_test() ->
+    SampleFun = fun() -> #{rmq1 => 0.0, rmq2 => 0.0} end,
+    Cfg = (worker_config(SampleFun))#{confirm_ticks => 3, clear_ticks => 3},
+    {ok, Pid} = aws_node_health_worker:start_link(Cfg),
+    try
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 1.0, rmq2 => 0.0}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 1.0, rmq1 => 0.0}}),
+        ?assertEqual(clean, maps:get(verdict, aws_node_health_worker:refresh())),
+        ?assertEqual(clean, maps:get(verdict, aws_node_health_worker:refresh())),
+        L3 = aws_node_health_worker:refresh(),
+        ?assertEqual({suspect, rmq0}, maps:get(verdict, L3)),
+        ?assertEqual(1, maps:get(suspected, maps:get(rmq0, maps:get(scores, L3))))
+    after
+        gen_server:stop(Pid)
+    end.
+
+%% Regression (review finding): a confirmed suspect must NOT stay latched once
+%% the raw verdict turns cluster_wide - a genuine symmetric condition must clear
+%% the held suspect at once, not be overridden by it. clear_ticks is set high so
+%% only the cluster_wide immediate-clear (not the miss counter) can clear it
+%% within the test; a mutable sampler and small window let the cluster-wide
+%% matrix fill quickly.
+worker_clears_confirmed_suspect_when_verdict_turns_cluster_wide_test() ->
+    T = ets:new(nh_sampler, [set, public]),
+    ets:insert(T, {row, #{rmq1 => 0.0, rmq2 => 0.0}}),
+    SampleFun = fun() ->
+        [{row, R}] = ets:lookup(T, row),
+        R
+    end,
+    Cfg = (worker_config(SampleFun))#{confirm_ticks => 2, clear_ticks => 10},
+    {ok, Pid} = aws_node_health_worker:start_link(Cfg),
+    try
+        %% Phase 1: single fault -> confirm rmq0.
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 1.0, rmq2 => 0.0}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 1.0, rmq1 => 0.0}}),
+        _ = aws_node_health_worker:refresh(),
+        ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health_worker:refresh())),
+        %% Phase 2: uniform cluster-wide congestion (every node sees every peer high).
+        ets:insert(T, {row, #{rmq1 => 0.9, rmq2 => 0.9}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq1, #{rmq0 => 0.9, rmq2 => 0.9}}),
+        gen_server:cast(aws_node_health_worker, {peer_row, rmq2, #{rmq0 => 0.9, rmq1 => 0.9}}),
+        _ = aws_node_health_worker:refresh(),
+        _ = aws_node_health_worker:refresh(),
+        L = aws_node_health_worker:refresh(),
+        ?assertEqual(cluster_wide, maps:get(verdict, L)),
+        ?assertEqual(0, maps:get(suspected, maps:get(rmq0, maps:get(scores, L))))
+    after
+        gen_server:stop(Pid),
+        ets:delete(T)
+    end.

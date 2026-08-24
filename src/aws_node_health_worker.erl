@@ -24,7 +24,7 @@
 
 -include("aws.hrl").
 
--export([start_link/0, start_link/1, latest/0, report/0, refresh/0]).
+-export([start_link/0, start_link/1, report/0, refresh/0]).
 
 %% Bound on how long a metrics scrape will wait for the worker to reply. If the
 %% worker's mailbox is backed up past this, the scrape treats it as unavailable
@@ -55,7 +55,19 @@
     interval_ms :: pos_integer(),
     analysis :: map(),
     tick = 0 :: integer(),
-    latest = #{verdict => clean, scores => #{}} :: aws_node_health:result()
+    latest = #{verdict => clean, scores => #{}} :: aws_node_health:result(),
+    %% Hysteresis (debounce) so a noisy single-tick verdict cannot flip the
+    %% published `suspected` flag. `latest` above is the DEBOUNCED result the
+    %% collector reads; these fields carry the debounce state between ticks.
+    confirm_ticks :: pos_integer(),
+    clear_ticks :: pos_integer(),
+    %% node currently being armed toward confirmation, and its consecutive count
+    deb_stream = none :: node() | none,
+    deb_arm = 0 :: non_neg_integer(),
+    %% published suspect (or none), its held confidence, and consecutive misses
+    deb_confirmed = none :: node() | none,
+    deb_conf = 0.0 :: float(),
+    deb_miss = 0 :: non_neg_integer()
 }).
 
 %%--------------------------------------------------------------------
@@ -69,12 +81,6 @@ start_link() ->
 -spec start_link(map()) -> {ok, pid()} | ignore | {error, term()}.
 start_link(Config) ->
     gen_server:start_link({local, ?MODULE}, ?MODULE, Config, []).
-
-%% Latest computed verdict and per-node scores. Read by the metrics collector
-%% at scrape time.
--spec latest() -> aws_node_health:result().
-latest() ->
-    gen_server:call(?MODULE, latest).
 
 %% This node's own most recent view of its peers (its raw failure-detector
 %% row) together with the latest verdict and scores, fetched in one call so a
@@ -121,20 +127,44 @@ default_config() ->
     },
     maps:merge(Runtime, aws_node_health_config:worker_config()).
 
+%% Bound on how long a single failure-probability sample may take. Kept well
+%% below interval_ms so a backed-up aten_sink cannot stall the cycle.
+-define(SAMPLE_TIMEOUT_MS, 500).
+
 %% The node failure detector exposes each node's view of its peers as a map of
-%% peer -> probability. Sampling must never crash the worker, so any failure
-%% (detector not started, transient error) yields an empty view.
+%% peer -> probability, read via aten_sink:get_failure_probabilities/0, which
+%% does a gen_server:call to aten_sink with aten's default 5000ms timeout. Under
+%% the very congestion this detector exists to attribute, aten_sink's mailbox can
+%% back up, so we must not run that call unbounded on the cycle path (that would
+%% reintroduce the same stall the list_running fix removed). Run it in a
+%% short-lived monitored process and give up after SAMPLE_TIMEOUT_MS, yielding an
+%% empty view (as for any other sampling failure) so the loop stays responsive.
 -spec sample_failure_probabilities() -> view().
 sample_failure_probabilities() ->
-    try
-        aten_sink:get_failure_probabilities()
-    catch
-        Class:Reason:Stacktrace ->
-            ?AWS_LOG_ERROR("failed to sample peer failure probabilities: ~tp", [
-                {Class, Reason}
-            ]),
-            ?AWS_LOG_DEBUG("~tp", [Stacktrace]),
+    Parent = self(),
+    {Pid, Ref} = spawn_monitor(fun() ->
+        View =
+            try
+                aten_sink:get_failure_probabilities()
+            catch
+                _:_ -> #{}
+            end,
+        Parent ! {sample_result, self(), View}
+    end),
+    receive
+        {sample_result, Pid, View} when is_map(View) ->
+            erlang:demonitor(Ref, [flush]),
+            View;
+        {'DOWN', Ref, process, Pid, Reason} ->
+            ?AWS_LOG_ERROR("failed to sample peer failure probabilities: ~tp", [Reason]),
             #{}
+    after ?SAMPLE_TIMEOUT_MS ->
+        erlang:demonitor(Ref, [flush]),
+        exit(Pid, kill),
+        ?AWS_LOG_ERROR("peer failure-probability sample timed out after ~b ms", [
+            ?SAMPLE_TIMEOUT_MS
+        ]),
+        #{}
     end.
 
 %%--------------------------------------------------------------------
@@ -151,13 +181,15 @@ init(Config0) ->
         window_max = maps:get(window_max, Config),
         stale_ticks = maps:get(stale_ticks, Config),
         interval_ms = Interval,
-        analysis = maps:get(analysis, Config)
+        %% Tell the scorer the configured window size so its extreme-fraction
+        %% denominator is the full window, not the still-filling length.
+        analysis = (maps:get(analysis, Config))#{window => maps:get(window_max, Config)},
+        confirm_ticks = maps:get(confirm_ticks, Config),
+        clear_ticks = maps:get(clear_ticks, Config)
     },
     schedule_tick(Interval),
     {ok, State}.
 
-handle_call(latest, _From, State) ->
-    {reply, State#state.latest, State};
 handle_call(report, _From, State) ->
     {reply, {State#state.own_row, State#state.latest}, State};
 handle_call(refresh, _From, State0) ->
@@ -194,21 +226,131 @@ cycle(State0) ->
     gossip(State0#state.peers_fun, State0#state.self_node, OwnRow),
     Snapshot = assemble_snapshot(Rows0, Tick, State0#state.stale_ticks),
     Window = push_window(State0#state.window, Snapshot, State0#state.window_max),
-    Latest = aws_node_health:analyze(State0#state.analysis, Window),
-    State0#state{
+    Raw = aws_node_health:analyze(State0#state.analysis, Window),
+    {State1, Published} = debounce(Raw, State0),
+    State1#state{
         rows = Rows0,
         own_row = OwnRow,
         window = Window,
         tick = Tick,
-        latest = Latest
+        latest = Published
     }.
+
+%% Hysteresis. `analyze/2` produces a fresh verdict each tick; that per-tick
+%% verdict is noisy (a healthy node can momentarily win the argmax under
+%% congestion), so the published `suspected` flag must not flip on a single
+%% tick. A node becomes the published suspect only after it is the raw suspect
+%% for `confirm_ticks` consecutive ticks, and stays suspected until it is no
+%% longer the raw suspect for `clear_ticks` consecutive ticks. Applies to every
+%% path (P1/P2/P3) uniformly, since it debounces the final verdict.
+-spec debounce(aws_node_health:result(), #state{}) -> {#state{}, aws_node_health:result()}.
+debounce(Raw, State) ->
+    RawVerdict = maps:get(verdict, Raw),
+    RawSuspect =
+        case RawVerdict of
+            {suspect, N} -> N;
+            _ -> none
+        end,
+    %% Arm the counter for the current raw suspect (reset on a change or none).
+    {Stream, Arm} =
+        case RawSuspect of
+            none -> {none, 0};
+            S when S =:= State#state.deb_stream -> {S, State#state.deb_arm + 1};
+            S -> {S, 1}
+        end,
+    ConfirmTicks = State#state.confirm_ticks,
+    ClearTicks = State#state.clear_ticks,
+    {Confirmed, Conf, Miss} =
+        case RawVerdict of
+            cluster_wide ->
+                %% An explicit symmetric verdict clears any held suspect at once.
+                %% cluster_wide requires >= 2 elevated nodes, which a genuine
+                %% single-node fault does not produce, so it is not spurious and
+                %% must not be held under by a stale suspect (which would defeat
+                %% the very guard cluster_wide exists to provide).
+                {none, 0.0, 0};
+            _ ->
+                case State#state.deb_confirmed of
+                    none ->
+                        case RawSuspect =/= none andalso Arm >= ConfirmTicks of
+                            true -> {RawSuspect, raw_conf(Raw, RawSuspect), 0};
+                            false -> {none, 0.0, 0}
+                        end;
+                    C ->
+                        case RawSuspect =:= C of
+                            %% still the raw suspect: refresh held confidence, reset misses
+                            true ->
+                                {C, raw_conf(Raw, C), 0};
+                            false ->
+                                Miss0 = State#state.deb_miss + 1,
+                                case Miss0 >= ClearTicks of
+                                    true -> {none, 0.0, 0};
+                                    false -> {C, State#state.deb_conf, Miss0}
+                                end
+                        end
+                end
+        end,
+    State1 = State#state{
+        deb_stream = Stream,
+        deb_arm = Arm,
+        deb_confirmed = Confirmed,
+        deb_conf = Conf,
+        deb_miss = Miss
+    },
+    {State1, publish(RawVerdict, maps:get(scores, Raw), Confirmed, Conf)}.
+
+%% Confidence the raw result assigned to node N (0.0 if absent).
+-spec raw_conf(aws_node_health:result(), node()) -> float().
+raw_conf(Raw, N) ->
+    case maps:get(N, maps:get(scores, Raw), undefined) of
+        #{confidence := C} -> C;
+        _ -> 0.0
+    end.
+
+%% Rebuild the result with the debounced suspect: only the confirmed node reads
+%% suspected=1 (with the held confidence); every other node reads 0. Raw
+%% `inbound` scores are preserved. With no confirmed suspect the verdict is
+%% cluster_wide when the raw result was cluster_wide, else clean (an unconfirmed
+%% raw suspect is not yet published). A confirmed suspect that has dropped out of
+%% the raw scores (its row went stale, e.g. it crashed or fully partitioned)
+%% cannot be given a consistent suspected=1 sample, so it is published clean; the
+%% miss counter then clears it. verdict and scores therefore never contradict.
+-spec publish(aws_node_health:verdict(), map(), node() | none, float()) -> aws_node_health:result().
+publish(RawVerdict, Scores, none, _Conf) ->
+    Verdict =
+        case RawVerdict of
+            cluster_wide -> cluster_wide;
+            _ -> clean
+        end,
+    #{verdict => Verdict, scores => zero_suspect(Scores)};
+publish(_RawVerdict, Scores, Confirmed, Conf) ->
+    case maps:is_key(Confirmed, Scores) of
+        true ->
+            Scored = maps:map(
+                fun
+                    (N, S) when N =:= Confirmed -> S#{suspected => 1, confidence => Conf};
+                    (_N, S) -> S#{suspected => 0, confidence => 0.0}
+                end,
+                Scores
+            ),
+            #{verdict => {suspect, Confirmed}, scores => Scored};
+        false ->
+            #{verdict => clean, scores => zero_suspect(Scores)}
+    end.
+
+-spec zero_suspect(map()) -> map().
+zero_suspect(Scores) ->
+    maps:map(fun(_N, S) -> S#{suspected => 0, confidence => 0.0} end, Scores).
 
 gossip(PeersFun, Self, Row) ->
     lists:foreach(
         fun(Peer) ->
             gen_server:cast({?MODULE, Peer}, {peer_row, Self, Row})
         end,
-        PeersFun()
+        %% Exclude Self defensively: gossip and sampling use the configured
+        %% self_node, so never cast our own row back to ourselves even if the
+        %% peer list (which excludes node()) disagrees with self_node.
+        [Peer || Peer <- PeersFun(), Peer =/= Self]
     ).
 
 schedule_tick(IntervalMs) ->
