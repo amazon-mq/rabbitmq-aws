@@ -10,13 +10,13 @@
 %% scrape time and emits three per-peer gauges keyed by the `peer` label plus one
 %% unlabelled cluster-level gauge:
 %%
-%%   rabbitmq_peer_down_probability -- this node's own view of each peer's
+%%   rabbitmq_aws_node_health_peer_down_probability -- this node's own view of each peer's
 %%       down-probability (the raw failure-detector row; needs no gossip).
-%%   rabbitmq_peer_down_suspected   -- 1 if the cross-node decision attributes
+%%   rabbitmq_aws_node_health_peer_down_suspected   -- 1 if the cross-node decision attributes
 %%       that peer as the single degraded node, else 0.
-%%   rabbitmq_peer_down_confidence  -- confidence in [0,1] that the peer is the
+%%   rabbitmq_aws_node_health_peer_down_confidence  -- confidence in [0,1] that the peer is the
 %%       single degraded node.
-%%   rabbitmq_cluster_congested     -- 1 if the degradation is symmetric across
+%%   rabbitmq_aws_node_health_cluster_congested     -- 1 if the degradation is symmetric across
 %%       the cluster (not attributable to any single node), else 0. Cluster-level,
 %%       so it carries no `peer` label.
 %%
@@ -69,7 +69,7 @@ collect_mf(_Registry, Callback) ->
         {OwnView, Verdict, Scores} ->
             Callback(
                 create_mf(
-                    rabbitmq_peer_down_probability,
+                    rabbitmq_aws_node_health_peer_down_probability,
                     "This node's estimated probability that each peer node is down",
                     gauge,
                     probability_samples(OwnView)
@@ -77,7 +77,7 @@ collect_mf(_Registry, Callback) ->
             ),
             Callback(
                 create_mf(
-                    rabbitmq_peer_down_suspected,
+                    rabbitmq_aws_node_health_peer_down_suspected,
                     "Whether each peer node is attributed as the single degraded node (1) or not (0)",
                     gauge,
                     suspected_samples(node(), Scores)
@@ -85,7 +85,7 @@ collect_mf(_Registry, Callback) ->
             ),
             Callback(
                 create_mf(
-                    rabbitmq_peer_down_confidence,
+                    rabbitmq_aws_node_health_peer_down_confidence,
                     "Confidence in [0,1] that each peer node is the single degraded node",
                     gauge,
                     confidence_samples(node(), Scores)
@@ -93,7 +93,7 @@ collect_mf(_Registry, Callback) ->
             ),
             Callback(
                 create_mf(
-                    rabbitmq_cluster_congested,
+                    rabbitmq_aws_node_health_cluster_congested,
                     "Whether cluster network degradation is symmetric across nodes (1), not attributable to any single node, or not (0)",
                     gauge,
                     congested_sample(Verdict)

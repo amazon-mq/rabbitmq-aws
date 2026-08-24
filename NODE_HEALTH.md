@@ -20,16 +20,16 @@ All are gauges scraped from the standard `rabbitmq_prometheus` endpoint. The fir
 
 | Metric | Meaning |
 |---|---|
-| `rabbitmq_peer_down_probability{peer}` | This node's own raw estimate that `peer` is down. One row of the matrix; needs no gossip. |
-| `rabbitmq_peer_down_suspected{peer}` | `1` if the cross-node decision attributes `peer` as the single degraded node, else `0`. |
-| `rabbitmq_peer_down_confidence{peer}` | Confidence in `[0.0, 1.0]` that `peer` is the single degraded node. `0.0` whenever the node is not suspected. |
-| `rabbitmq_cluster_congested` | `1` if the degradation is symmetric across the cluster (`cluster_wide` verdict), i.e. congestion not attributable to any single node, else `0`. No `peer` label. |
+| `rabbitmq_aws_node_health_peer_down_probability{peer}` | This node's own raw estimate that `peer` is down. One row of the matrix; needs no gossip. |
+| `rabbitmq_aws_node_health_peer_down_suspected{peer}` | `1` if the cross-node decision attributes `peer` as the single degraded node, else `0`. |
+| `rabbitmq_aws_node_health_peer_down_confidence{peer}` | Confidence in `[0.0, 1.0]` that `peer` is the single degraded node. `0.0` whenever the node is not suspected. |
+| `rabbitmq_aws_node_health_cluster_congested` | `1` if the degradation is symmetric across the cluster (`cluster_wide` verdict), i.e. congestion not attributable to any single node, else `0`. No `peer` label. |
 
-A dumb alarm can watch `rabbitmq_peer_down_suspected` (fire if any node reports a peer suspected for long enough) or threshold `rabbitmq_peer_down_confidence`. `rabbitmq_cluster_congested` is the complementary signal: it fires when *every* node is elevated with no dominant culprit, which is the case `suspected` deliberately does not attribute. `rabbitmq_peer_down_probability` is the raw underlay, useful for dashboards and for confirming the decision.
+A dumb alarm can watch `rabbitmq_aws_node_health_peer_down_suspected` (fire if any node reports a peer suspected for long enough) or threshold `rabbitmq_aws_node_health_peer_down_confidence`. `rabbitmq_aws_node_health_cluster_congested` is the complementary signal: it fires when *every* node is elevated with no dominant culprit, which is the case `suspected` deliberately does not attribute. `rabbitmq_aws_node_health_peer_down_probability` is the raw underlay, useful for dashboards and for confirming the decision.
 
-The suspected/confidence values are the same across all healthy nodes because they share the matrix, so an alarm sees corroborating reports from the peers of the degraded node. A node never reports itself: the three per-peer gauges cover only a node's peers, so `suspected`/`confidence` share the same `peer` domain as `probability`. `rabbitmq_cluster_congested` is likewise identical across healthy nodes (they share the matrix), so any one node's value suffices.
+The suspected/confidence values are the same across all healthy nodes because they share the matrix, so an alarm sees corroborating reports from the peers of the degraded node. A node never reports itself: the three per-peer gauges cover only a node's peers, so `suspected`/`confidence` share the same `peer` domain as `probability`. `rabbitmq_aws_node_health_cluster_congested` is likewise identical across healthy nodes (they share the matrix), so any one node's value suffices.
 
-Both `rabbitmq_peer_down_suspected` and `rabbitmq_cluster_congested` are debounced by the same `confirm_ticks`/`clear_ticks` hysteresis (see below): each is asserted only after its verdict has held for `confirm_ticks` consecutive cycles and de-asserted only after `clear_ticks` consecutive cycles without it. A confirmed single-node suspect takes precedence over `cluster_wide`, so the two never both read `1` at once.
+Both `rabbitmq_aws_node_health_peer_down_suspected` and `rabbitmq_aws_node_health_cluster_congested` are debounced by the same `confirm_ticks`/`clear_ticks` hysteresis (see below): each is asserted only after its verdict has held for `confirm_ticks` consecutive cycles and de-asserted only after `clear_ticks` consecutive cycles without it. A confirmed single-node suspect takes precedence over `cluster_wide`, so the two never both read `1` at once.
 
 ## How the decision is made
 
@@ -67,7 +67,7 @@ aws.node_health.enabled = true
 
 ## Limitations
 
-- Cluster-wide network congestion is not attributed to a node - by design, since it is not a single-node fault. It is instead surfaced on its own via `rabbitmq_cluster_congested`, so an operator can still alarm on symmetric congestion without misattributing it.
+- Cluster-wide network congestion is not attributed to a node - by design, since it is not a single-node fault. It is instead surfaced on its own via `rabbitmq_aws_node_health_cluster_congested`, so an operator can still alarm on symmetric congestion without misattributing it.
 - The signal measures Erlang-distribution reachability, so it identifies the degraded *node*, not the underlying cause (a GC/CPU stall on a node looks similar to a network fault).
 - Gossip relies on the healthy nodes being able to exchange small rows; a fully partitioned node is already covered by the coarser detectors (`net_tick`, cluster partition handling).
 - The underlying failure detector reports, for each peer, the fraction of recent inter-arrival gaps that are small relative to the current silence. Under an *intermittent* fault this oscillates (it falls back during the clean intervals), which is why P1 uses flap-rate. Under a *continuous* fault it stays pinned high (verified in vivo at ~48% loss - the probability does *not* re-normalise downward, because most heartbeats still arrive on time over TCP and only a heavy tail stalls), which is why P2 covers the sustained case. The `window`, `flap_min`, and crossing-threshold defaults are validated in vivo for both the periodic (intermittent-drop) pattern via P1 and continuous loss via P2 - in each case the verdict fires within ~15-20s and holds for the duration of the fault, with the healthy nodes never falsely attributed - and may warrant tuning for a given cluster's fault profile.
