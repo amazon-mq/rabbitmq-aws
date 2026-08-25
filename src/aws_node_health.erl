@@ -120,6 +120,13 @@ analyze(Config0, Window) ->
     end.
 
 -spec analyze(map(), [snapshot()], [node()]) -> result().
+analyze(_Config, _Window, Nodes) when length(Nodes) < 3 ->
+    %% The cross-check majority attribution relies on requires at least three
+    %% observed nodes; a two-node matrix cannot tell which side of a link is
+    %% bad, so any verdict at that size is unreliable. Return the neutral
+    %% verdict and empty scores rather than emit a nonsense attribution during
+    %% transient rolling-restart windows.
+    #{verdict => clean, scores => empty_scores(Nodes)};
 analyze(Config, Window, Nodes) ->
     Extreme = maps:get(extreme, Config),
     %% Compute each node's inbound series once and reuse it for the median,
@@ -141,23 +148,20 @@ analyze(Config, Window, Nodes) ->
             N => frac_at_least(maps:get(N, InSeries), Extreme, WindowDenom)
          || N <- Nodes
         },
-    Candidate = argmax_median(Nodes, Med),
-    Others = [N || N <- Nodes, N =/= Candidate],
-    OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- Others]]),
-    OthersPristine = lists:all(
-        fun(N) -> maps:get(N, Med) < maps:get(pristine, Config) end,
-        Others
-    ),
-    NumElevated = length([N || N <- Nodes, maps:get(N, Med) >= maps:get(elevated, Config)]),
-    Margin = maps:get(Candidate, Med) - OthersMaxMed,
-    FlapMin = maps:get(flap_min, Config),
-    Flaps = flap_count(maps:get(Candidate, InSeries), Extreme),
+    Flaps = #{N => flap_count(maps:get(N, InSeries), Extreme) || N <- Nodes},
     OwnOut = #{N => own_outbound_min(Window, N, Nodes) || N <- Nodes},
+    OwnRowSeen = #{N => own_row_present(Window, N) || N <- Nodes},
 
-    P1Gate = OthersPristine,
-    P2Gate = Margin >= maps:get(margin, Config),
-    P1Fire = P1Gate andalso Flaps >= FlapMin,
-    P2Fire = P2Gate andalso maps:get(Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
+    %% P2/P3 use the argmax-median candidate: the node the *other* observers
+    %% report as most degraded on average.
+    P2Candidate = argmax_median(Nodes, Med),
+    P2Others = [N || N <- Nodes, N =/= P2Candidate],
+    OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- P2Others]]),
+    Margin = maps:get(P2Candidate, Med) - OthersMaxMed,
+    NumElevated = length([N || N <- Nodes, maps:get(N, Med) >= maps:get(elevated, Config)]),
+    P2Fire =
+        Margin >= maps:get(margin, Config) andalso
+            maps:get(P2Candidate, FracExtreme) >= maps:get(extreme_frac, Config),
     ClusterWide = NumElevated >= maps:get(cluster_min_nodes, Config),
 
     %% P3 (bidirectional): the candidate is bidirectionally degraded when its
@@ -165,67 +169,87 @@ analyze(Config, Window, Nodes) ->
     %% its own outbound DOMINATES every other node's by a margin. The dominance
     %% test is what keeps P3 out under uniform congestion (where every node is
     %% roughly equally bidirectional, so none dominates -> left to the cluster-wide
-    %% test), while still attributing a real single-node fault (whose culprit's
-    %% own outbound clearly leads the healthy nodes').
+    %% test), while still attributing a real single-node fault. But dominance is
+    %% only meaningful when the *other* nodes' own gossip rows have actually
+    %% been observed; otherwise own_outbound_min for those nodes reads 0.0
+    %% (the "row never arrived" default) and any elevated candidate would
+    %% trivially "dominate" that zero. Gate P3 on every other node having a
+    %% present own row in the window, so the guard cannot fire under a real
+    %% cluster-wide congestion event where gossip has stalled.
     BidirInbound = maps:get(bidir_inbound, Config),
     BidirOutbound = maps:get(bidir_outbound, Config),
     BidirMargin = maps:get(bidir_margin, Config),
-    CandOwnOut = maps:get(Candidate, OwnOut),
-    OthersOwnOutMax = lists:max([0.0 | [maps:get(N, OwnOut) || N <- Others]]),
+    CandOwnOut = maps:get(P2Candidate, OwnOut),
+    OthersOwnOutMax = lists:max([0.0 | [maps:get(N, OwnOut) || N <- P2Others]]),
+    P3OthersRowsPresent = lists:all(fun(N) -> maps:get(N, OwnRowSeen) end, P2Others),
     P3Fire =
-        maps:get(Candidate, Med) >= BidirInbound andalso
+        maps:get(P2Candidate, Med) >= BidirInbound andalso
             CandOwnOut >= BidirOutbound andalso
-            CandOwnOut - OthersOwnOutMax >= BidirMargin,
+            CandOwnOut - OthersOwnOutMax >= BidirMargin andalso
+            P3OthersRowsPresent,
 
-    Verdict =
+    %% P1 (isolated flap): pick the node that flaps the most, not the one with
+    %% the highest median. An intermittent low-duty-cycle fault has near-zero
+    %% median (spikes to ~1.0 during bursts, decays to ~0.0 between them), so
+    %% argmax_median would not name it and its flaps would go uncounted. P1
+    %% therefore chooses its own candidate independently of P2/P3.
+    P1Candidate = argmax_by(Nodes, Flaps),
+    P1Others = [N || N <- Nodes, N =/= P1Candidate],
+    Pristine = maps:get(pristine, Config),
+    FlapMin = maps:get(flap_min, Config),
+    %% Others must be quiet on BOTH signals for P1 to attribute: elevated
+    %% median or their own flapping would make this a cluster-level condition,
+    %% not an isolated fault.
+    P1OthersPristine = lists:all(
+        fun(N) ->
+            maps:get(N, Med) < Pristine andalso
+                maps:get(N, Flaps) < FlapMin
+        end,
+        P1Others
+    ),
+    P1Fire = P1OthersPristine andalso maps:get(P1Candidate, Flaps) >= FlapMin,
+
+    %% Verdict and confidence are tied together: each firing path publishes its
+    %% own candidate and its own confidence, so a suspect's confidence always
+    %% describes the path that actually attributed it. When nothing fires we
+    %% report cluster_wide (if applicable) or clean, with no suspect.
+    {Verdict, Suspect, CandConf} =
         if
-            P2Fire -> {suspect, Candidate};
-            P3Fire -> {suspect, Candidate};
-            ClusterWide -> cluster_wide;
-            P1Fire -> {suspect, Candidate};
-            true -> clean
+            P2Fire ->
+                {{suspect, P2Candidate}, P2Candidate, maps:get(P2Candidate, FracExtreme)};
+            P3Fire ->
+                {{suspect, P2Candidate}, P2Candidate, CandOwnOut};
+            ClusterWide ->
+                {cluster_wide, none, 0.0};
+            P1Fire ->
+                {
+                    {suspect, P1Candidate},
+                    P1Candidate,
+                    min(1.0, maps:get(P1Candidate, Flaps) / (2 * FlapMin))
+                };
+            true ->
+                {clean, none, 0.0}
         end,
 
-    %% Confidence is reported only for a named suspect. A clean or cluster-wide
-    %% verdict carries no per-node confidence, so the confidence gauge can never
-    %% contradict the suspected flag (a peer that is not suspected reads 0.0).
-    CandConf =
-        case Verdict of
-            {suspect, _} ->
-                P1Conf =
-                    case P1Gate of
-                        true -> min(1.0, Flaps / (2 * FlapMin));
-                        false -> 0.0
-                    end,
-                P2Conf = maybe_conf(P2Gate, Candidate, FracExtreme),
-                P3Conf =
-                    case P3Fire of
-                        true -> maps:get(Candidate, OwnOut);
-                        false -> 0.0
-                    end,
-                lists:max([P1Conf, P2Conf, P3Conf]);
-            _ ->
-                0.0
-        end,
     Scores =
         #{
             N => #{
                 inbound => maps:get(N, Med),
-                confidence => confidence_for(N, Candidate, CandConf),
+                confidence => confidence_for(N, Suspect, CandConf),
                 suspected => suspected_for(N, Verdict)
             }
          || N <- Nodes
         },
     #{verdict => Verdict, scores => Scores}.
 
-maybe_conf(true, Candidate, Fracs) -> maps:get(Candidate, Fracs);
-maybe_conf(false, _Candidate, _Fracs) -> 0.0.
-
 confidence_for(N, N, CandConf) -> CandConf;
 confidence_for(_, _, _) -> 0.0.
 
 suspected_for(N, {suspect, N}) -> 1;
 suspected_for(_, _) -> 0.
+
+empty_scores(Nodes) ->
+    #{N => #{inbound => 0.0, confidence => 0.0, suspected => 0} || N <- Nodes}.
 
 %% A node's inbound score at one snapshot is the median of the other nodes'
 %% views of it. Absent views are skipped; a snapshot with no observers of N
@@ -254,10 +278,17 @@ median_or_zero([]) -> 0.0;
 median_or_zero(Series) -> median(Series).
 
 argmax_median(Nodes, Med) ->
+    argmax_by(Nodes, Med).
+
+%% Node with the greatest value in Scores. Sorts the nodes first so ties break
+%% lexicographically (deterministic), then folds picking the strictly-greater
+%% element. Scores must contain a numeric value for every node in Nodes.
+-spec argmax_by([node()], #{node() => number()}) -> node().
+argmax_by(Nodes, Scores) ->
     [First | Rest] = lists:sort(Nodes),
     lists:foldl(
         fun(N, Best) ->
-            case maps:get(N, Med) > maps:get(Best, Med) of
+            case maps:get(N, Scores) > maps:get(Best, Scores) of
                 true -> N;
                 false -> Best
             end
@@ -265,6 +296,14 @@ argmax_median(Nodes, Med) ->
         First,
         Rest
     ).
+
+%% Whether a node's own gossip row was ever observed in the window (i.e. its
+%% row appears as an observer key in at least one snapshot). Used to gate P3:
+%% dominance across the other nodes' own-outbound rows is meaningless if some
+%% of those rows are absent (own_outbound_min returns 0.0 for absent rows).
+-spec own_row_present([snapshot()], node()) -> boolean().
+own_row_present(Window, N) ->
+    lists:any(fun(Snapshot) -> maps:is_key(N, Snapshot) end, Window).
 
 all_nodes(Window) ->
     lists:usort(

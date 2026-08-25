@@ -115,6 +115,67 @@ sparsely_observed_peer_is_not_attributed_test() ->
     Window = [Seen, Seen] ++ lists:duplicate(28, Unseen),
     ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
 
+%% Regression for the "P1 flap counted on argmax-median" bug: an intermittent
+%% low-duty-cycle fault has near-zero median (mostly-zero series with a few
+%% high spikes), so argmax_median would not name the faulty node and the
+%% flap-based P1 path used to miss the exact case it exists to catch. The fix
+%% picks the P1 candidate by flap count, independently of median.
+p1_low_duty_cycle_fault_is_attributed_by_flap_count_test() ->
+    %% rmq0 fault: 3 out of 30 samples spike to ~1.0 (three distinct bursts,
+    %% each preceded by a 0.0 sample so it counts as an upward crossing of the
+    %% extreme threshold). Median stays 0.0 - identical to rmq1/rmq2 - so
+    %% argmax_median picks lexicographically first (rmq0 by luck of ordering,
+    %% but the point is: even if it did not, P1 must still fire on flap
+    %% count). Flap count for rmq0 = 3 >= flap_min(2); others = 0.
+    ExtremeView = #{
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.0}
+    },
+    QuietView = #{
+        rmq1 => #{rmq0 => 0.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 0.0, rmq1 => 0.0}
+    },
+    %% Interleave so each burst has a crossing: Q E Q E Q E Q ... (last few Q).
+    Window =
+        lists:duplicate(1, QuietView) ++ [ExtremeView] ++
+            lists:duplicate(1, QuietView) ++ [ExtremeView] ++
+            lists:duplicate(1, QuietView) ++ [ExtremeView] ++
+            lists:duplicate(24, QuietView),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% Regression for the "P3 dominance relies on absent-row zeros" bug: during real
+%% cluster-wide congestion gossip rows may be delayed or evicted, leaving some
+%% peers' own_outbound_min at the "row never arrived" default of 0.0. Before
+%% the guard, a still-elevated candidate would spuriously dominate that zero
+%% and P3 would fire {suspect, N} instead of cluster_wide. P3 must not attribute
+%% when any *other* node lacks a present own row.
+p3_requires_all_other_nodes_own_rows_present_test() ->
+    %% rmq1's inbound is high (rmq0 and rmq2 see it as 0.9 in their own rows).
+    %% rmq1's own row is present with every peer high (would satisfy the raw P3
+    %% gates). But rmq2's own row is ABSENT from every snapshot - so its
+    %% own_outbound_min is 0.0 by the "absent row" default, and letting P3 fire
+    %% would misattribute the cluster-wide condition to rmq1. The guard must
+    %% keep P3 out here (the verdict must not be {suspect, rmq1}).
+    Snapshot = #{
+        rmq0 => #{rmq1 => 0.9, rmq2 => 0.15},
+        rmq1 => #{rmq0 => 0.7, rmq2 => 0.7}
+        %% rmq2 has no own row anywhere in the window
+    },
+    Window = lists:duplicate(30, Snapshot),
+    ?assertNotEqual({suspect, rmq1}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% Regression for the "attribute at <3 observed nodes" hazard: the scorer's
+%% cross-check majority relies on at least 3 nodes, so during a rolling restart
+%% (matrix transiently drops to 2 observed nodes) any attribution is unreliable.
+%% Return clean rather than emit a nonsense verdict.
+under_three_nodes_returns_clean_test() ->
+    TwoNode = #{
+        rmq0 => #{rmq1 => 1.0},
+        rmq1 => #{rmq0 => 1.0}
+    },
+    Window = lists:duplicate(30, TwoNode),
+    ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
 %% When the verdict is clean, no peer's confidence may be non-zero, even if the
 %% candidate was mildly elevated (below the sustained fraction).
 clean_verdict_reports_zero_confidence_test() ->
