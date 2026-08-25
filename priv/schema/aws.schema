@@ -294,7 +294,7 @@ fun(Conf) ->
     ])
 end}.
 
-%% @doc Master toggle for the node-health detector (default DISABLED). When
+%% @doc Main toggle for the node-health detector (default DISABLED). When
 %% off, no worker runs and no peer-health metrics are registered. Like
 %% aws.auth_validation.enabled, the default lives in code
 %% (aws_node_health_config:enabled/0 reads this with a `false' fallback) and is

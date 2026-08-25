@@ -52,7 +52,7 @@ All keys are optional; the feature is disabled unless the toggle is set.
 
 | Key | Default | Meaning |
 |---|---|---|
-| `aws.node_health.enabled` | `false` | Master toggle. When off, no worker runs and no metrics are registered. |
+| `aws.node_health.enabled` | `false` | Main toggle. When off, no worker runs and no metrics are registered. |
 | `aws.node_health.interval_ms` | `1000` | Sampling and recompute period. |
 | `aws.node_health.window` | `30` | Number of snapshots in the rolling decision window. |
 | `aws.node_health.stale_ticks` | `5` | Drop a peer's row if it has not refreshed within this many ticks. |

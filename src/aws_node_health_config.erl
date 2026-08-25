@@ -35,7 +35,7 @@
 -define(DEFAULT_CLEAR_TICKS, 3).
 -define(MAX_CLEAR_TICKS, 10000).
 
-%% Master toggle. Default off: with the feature disabled the supervisor starts
+%% Main toggle. Default off: with the feature disabled the supervisor starts
 %% no worker and registers no metrics.
 -spec enabled() -> boolean().
 enabled() ->

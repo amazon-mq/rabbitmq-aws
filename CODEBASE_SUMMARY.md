@@ -200,7 +200,7 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 - `aws.sts.custom_headers.$header` - Custom headers for STS calls
 
 **Node Health Detection:**
-- `aws.node_health.enabled` - Master toggle (default: false)
+- `aws.node_health.enabled` - Main toggle (default: false)
 - `aws.node_health.interval_ms` - Sampling/recompute period (default: 1000)
 - `aws.node_health.window` - Rolling decision window size (default: 30)
 - `aws.node_health.stale_ticks` - Evict a peer row not refreshed within this many ticks (default: 5)
