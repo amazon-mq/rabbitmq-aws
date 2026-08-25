@@ -114,9 +114,22 @@ read_worker() ->
         {OwnView, #{verdict := Verdict, scores := Scores}} = aws_node_health_worker:report(),
         {OwnView, Verdict, Scores}
     catch
-        exit:{noproc, _} -> unavailable;
-        exit:{timeout, _} -> unavailable;
-        _:_ -> unavailable
+        %% Expected fast paths when the feature is disabled or the worker's
+        %% mailbox is backed up: emit no families and stay silent.
+        exit:{noproc, _} ->
+            unavailable;
+        exit:{timeout, _} ->
+            unavailable;
+        %% Anything else means the worker returned a shape we cannot pattern
+        %% match (contract drift) or a sample builder raised. Log once at
+        %% error level so a regression does not just present as "metrics
+        %% silently absent" with nothing in the logs.
+        Class:Reason:Stack ->
+            ?AWS_LOG_ERROR(
+                "node_health metrics: unexpected ~p:~p reading worker; emitting no families~n~p",
+                [Class, Reason, Stack]
+            ),
+            unavailable
     end.
 
 %% The scores map covers every node in the matrix, including this node itself

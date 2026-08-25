@@ -5,19 +5,29 @@
 
 -module(aws_app_env).
 
+-include("aws.hrl").
+
 -export([update/4, delete/3, get_int_env/4]).
 
 %% Read a bounded positive integer from an application's environment. An unset,
 %% non-integer, or out-of-range value falls back to Default rather than failing
-%% the caller; a schema (where present) is what reports a bad value to the
-%% operator. Shared by aws_sup and aws_node_health_config so the bounds/fallback
-%% logic lives in one place.
+%% the caller. A schema (where present) is the primary line of defense against
+%% bad values, but the schema does not always declare a range, so an
+%% out-of-range value can still reach here; log a warning in that case so the
+%% silent fallback does not leave the operator wondering why their setting
+%% appears to have no effect.
 -spec get_int_env(atom(), atom(), pos_integer(), pos_integer()) -> pos_integer().
 get_int_env(App, Key, Default, MaxBound) ->
     case application:get_env(App, Key) of
+        undefined ->
+            Default;
         {ok, N} when is_integer(N), N > 0, N =< MaxBound ->
             N;
-        _ ->
+        {ok, Bad} ->
+            ?AWS_LOG_WARNING(
+                "~p env key ~p rejected (value ~p; expected integer in [1, ~b]); using default ~p",
+                [App, Key, Bad, MaxBound, Default]
+            ),
             Default
     end.
 
