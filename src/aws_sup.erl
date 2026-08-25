@@ -17,10 +17,12 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    %% Tolerate a few transient worker crashes before giving up: a very low
-    %% intensity would tear down the whole supervisor on a second crash in a
-    %% short window. The validation worker is an independent gen_server, so
-    %% allow several restarts in a slightly wider window before escalating.
+    %% Tolerate a few transient child crashes before giving up. Each feature
+    %% is scoped so it consumes its own restart budget rather than the
+    %% top-level's: the auth_validation semaphore runs directly under this
+    %% supervisor, while node_health runs under its own aws_node_health_sup
+    %% (see node_health_children/0). A crash-looping feature therefore takes
+    %% only itself offline, not the plugin's other features.
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
@@ -105,19 +107,20 @@ node_health_children() ->
             %% registration and the first sample simply reports the worker as
             %% unavailable rather than missing the collector entirely.
             aws_node_health_metrics:register(),
-            [node_health_spec()];
+            [node_health_sup_spec()];
         false ->
             []
     end.
 
-%% The worker reads its own settings from aws_node_health_config, so no config
-%% is threaded through here.
-node_health_spec() ->
+%% The worker lives under its own supervisor (aws_node_health_sup) so that a
+%% crash-looping worker consumes only its own restart budget and cannot cascade
+%% a top-level restart that would also take down auth_validation.
+node_health_sup_spec() ->
     #{
-        id => aws_node_health_worker,
-        start => {aws_node_health_worker, start_link, []},
+        id => aws_node_health_sup,
+        start => {aws_node_health_sup, start_link, []},
         restart => permanent,
-        shutdown => 5_000,
-        type => worker,
-        modules => [aws_node_health_worker]
+        shutdown => infinity,
+        type => supervisor,
+        modules => [aws_node_health_sup]
     }.
