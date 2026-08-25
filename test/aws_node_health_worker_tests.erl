@@ -28,6 +28,25 @@ assemble_snapshot_evicts_stale_rows_test() ->
     ?assertEqual([rmq0, rmq1], lists:sort(maps:keys(Snapshot))),
     ?assertEqual(#{rmq0 => 1.0, rmq2 => 0.0}, maps:get(rmq1, Snapshot)).
 
+prune_stale_rows_drops_stale_entries_test() ->
+    %% Same input assemble_snapshot uses, but here we assert the persistent
+    %% rows map is filtered in place (memory hygiene, not just per-tick view).
+    Rows = #{
+        rmq0 => {10, #{rmq1 => 0.0, rmq2 => 0.0}},
+        rmq1 => {10, #{rmq0 => 1.0, rmq2 => 0.0}},
+        %% last refreshed at tick 3; at tick 12 with stale_ticks 5 this is dropped
+        rmq2 => {3, #{rmq0 => 1.0, rmq1 => 0.0}}
+    },
+    Pruned = aws_node_health_worker:prune_stale_rows(Rows, 12, 5),
+    ?assertEqual([rmq0, rmq1], lists:sort(maps:keys(Pruned))).
+
+valid_row_accepts_numeric_and_rejects_others_test() ->
+    ?assert(aws_node_health_worker:valid_row(#{})),
+    ?assert(aws_node_health_worker:valid_row(#{rmq0 => 0.5, rmq1 => 1})),
+    %% One non-number invalidates the row (would otherwise crash median/1).
+    ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => 0.5, rmq1 => busy})),
+    ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => <<"0.5">>})).
+
 push_window_keeps_most_recent_first_and_trims_test() ->
     Snap = fun(N) -> #{tag => N} end,
     Window = lists:foldl(

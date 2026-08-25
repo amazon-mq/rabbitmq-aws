@@ -34,7 +34,14 @@
 
 %% Exported for unit tests of the otherwise-internal pure helpers.
 -ifdef(TEST).
--export([record_row/4, assemble_snapshot/3, push_window/3, default_config/0]).
+-export([
+    record_row/4,
+    assemble_snapshot/3,
+    prune_stale_rows/3,
+    push_window/3,
+    valid_row/1,
+    default_config/0
+]).
 -endif.
 
 -type view() :: #{node() => float()}.
@@ -206,8 +213,20 @@ handle_call(_Request, _From, State) ->
     {reply, {error, unknown_request}, State}.
 
 handle_cast({peer_row, From, Row}, State) when is_map(Row) ->
-    Rows = record_row(State#state.rows, From, Row, State#state.tick),
-    {noreply, State#state{rows = Rows}};
+    %% A row is a #{peer => probability_float}. Reject a row whose values are
+    %% not numeric so a version-skewed or buggy peer cannot crash the cycle
+    %% path downstream in median/1. Silently drop unknown casts.
+    case valid_row(Row) of
+        true ->
+            Rows = record_row(State#state.rows, From, Row, State#state.tick),
+            {noreply, State#state{rows = Rows}};
+        false ->
+            ?AWS_LOG_WARNING(
+                "node_health: dropping malformed peer_row from ~p (non-numeric values)",
+                [From]
+            ),
+            {noreply, State}
+    end;
 handle_cast(_Msg, State) ->
     {noreply, State}.
 
@@ -231,12 +250,17 @@ cycle(State0) ->
     OwnRow = SampleFun(),
     Rows0 = record_row(State0#state.rows, State0#state.self_node, OwnRow, Tick),
     gossip(State0#state.peers_fun, State0#state.self_node, OwnRow),
-    Snapshot = assemble_snapshot(Rows0, Tick, State0#state.stale_ticks),
+    StaleTicks = State0#state.stale_ticks,
+    Snapshot = assemble_snapshot(Rows0, Tick, StaleTicks),
+    %% Also write the staleness filter back through to the persistent rows so
+    %% node names that never come back (e.g. after an instance replacement)
+    %% drop out of state, not just out of each transient snapshot.
+    Rows = prune_stale_rows(Rows0, Tick, StaleTicks),
     Window = push_window(State0#state.window, Snapshot, State0#state.window_max),
     Raw = aws_node_health:analyze(State0#state.analysis, Window),
     {State1, Published} = debounce(Raw, State0),
     State1#state{
-        rows = Rows0,
+        rows = Rows,
         own_row = OwnRow,
         window = Window,
         tick = Tick,
@@ -391,6 +415,24 @@ zero_suspect(Scores) ->
     maps:map(fun(_N, S) -> S#{suspected => 0, confidence => 0.0} end, Scores).
 
 gossip(PeersFun, Self, Row) ->
+    %% PeersFun typically reads the cluster metadata store
+    %% (rabbit_nodes:list_members). During metadata-store instability -- the
+    %% exact condition this detector targets -- that read can raise; a
+    %% propagated exception here would crash the worker and, under the shared
+    %% supervisor intensity, could take down sibling features. Fall back to an
+    %% empty peer list on exception: a missed gossip round is recoverable, a
+    %% crash-loop is not.
+    Peers =
+        try
+            PeersFun()
+        catch
+            Class:Reason ->
+                ?AWS_LOG_WARNING(
+                    "node_health: peers_fun raised ~p:~p; gossiping to no peers this tick",
+                    [Class, Reason]
+                ),
+                []
+        end,
     lists:foreach(
         fun(Peer) ->
             gen_server:cast({?MODULE, Peer}, {peer_row, Self, Row})
@@ -398,7 +440,7 @@ gossip(PeersFun, Self, Row) ->
         %% Exclude Self defensively: gossip and sampling use the configured
         %% self_node, so never cast our own row back to ourselves even if the
         %% peer list (which excludes node()) disagrees with self_node.
-        [Peer || Peer <- PeersFun(), Peer =/= Self]
+        [Peer || Peer <- Peers, Peer =/= Self]
     ).
 
 schedule_tick(IntervalMs) ->
@@ -426,7 +468,34 @@ assemble_snapshot(Rows, Tick, StaleTicks) ->
         Tick - RowTick =< StaleTicks
     }.
 
+%% Return the rows map with stale entries removed. On AWS, node names change
+%% with every instance replacement (the ip-A-B-C-D hostname is derived from the
+%% private IP), so the persistent state.rows map would otherwise accumulate a
+%% row for every distinct node name ever observed over the broker's lifetime.
+%% assemble_snapshot/3 only filters into a transient per-tick map; use this to
+%% write the same filter back through to state.
+-spec prune_stale_rows(rows(), integer(), non_neg_integer()) -> rows().
+prune_stale_rows(Rows, Tick, StaleTicks) ->
+    maps:filter(
+        fun(_Observer, {RowTick, _Row}) -> Tick - RowTick =< StaleTicks end,
+        Rows
+    ).
+
 %% Prepend the newest snapshot and keep at most Max (most recent first).
 -spec push_window([snapshot()], snapshot(), pos_integer()) -> [snapshot()].
 push_window(Window, Snapshot, Max) ->
     lists:sublist([Snapshot | Window], Max).
+
+%% A well-formed row is a map of node() => number(). is_map/1 alone (the guard
+%% on handle_cast/2) does not vet the values, so a version-skewed or buggy
+%% peer could otherwise cast a row containing atoms/binaries/nested terms that
+%% would later crash the pure scorer inside median/1 (badarith / badarg).
+%% Callers must have already established that Row is a map (the handle_cast
+%% guard does).
+-spec valid_row(view()) -> boolean().
+valid_row(Row) ->
+    maps:fold(
+        fun(_K, V, Acc) -> Acc andalso is_number(V) end,
+        true,
+        Row
+    ).
