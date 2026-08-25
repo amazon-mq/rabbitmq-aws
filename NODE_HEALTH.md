@@ -44,7 +44,7 @@ The "every other node pristine" gate on P1, and P3's dominance-with-present-othe
 
 **Hysteresis.** The per-tick verdict is intentionally noisy (under congestion a healthy node can momentarily win the candidate slot), so the published `suspected` flag is debounced: a node is only marked suspected after it has been the raw suspect for `confirm_ticks` consecutive cycles, and stays suspected until it has *not* been the raw suspect for `clear_ticks` consecutive cycles. This applies uniformly to all three paths.
 
-Attribution needs at least three nodes (a two-node view cannot tell which side is bad); Amazon MQ clusters are three-node. It relies on the healthy nodes' views of the suspect, so the suspect's own (unreliable) gossip is not required.
+Attribution needs at least three observed nodes (a two-node view cannot tell which side of a link is bad), so below that the detector returns `clean` rather than guess; Amazon MQ clusters are three-node. It relies on the healthy nodes' views of the suspect, so the suspect's own (unreliable) gossip is not required.
 
 ## Configuration
 
