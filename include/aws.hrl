@@ -10,29 +10,29 @@
 ).
 
 -define(AWS_LOG_DEBUG(Fmt, Args),
-    ?LOG_DEBUG("~tp: " ++ Fmt, [?MODULE | Args])
+    ?LOG_DEBUG(?MODULE_STRING ": " ++ Fmt, Args)
 ).
 
 -define(AWS_LOG_WARNING(Arg),
-    ?LOG_WARNING("~tp: ~ts", [?MODULE, Arg])
+    ?LOG_WARNING(?MODULE_STRING ": ~ts", [Arg])
 ).
 
 -define(AWS_LOG_WARNING(Fmt, Args),
-    ?LOG_WARNING("~tp: " ++ Fmt, [?MODULE | Args])
+    ?LOG_WARNING(?MODULE_STRING ": " ++ Fmt, Args)
 ).
 
 -define(AWS_LOG_ERROR(Arg),
-    ?LOG_ERROR("~tp: ~tp", [?MODULE, Arg])
+    ?LOG_ERROR(?MODULE_STRING ": ~tp", [Arg])
 ).
 
 -define(AWS_LOG_ERROR(Fmt, Args),
-    ?LOG_ERROR("~tp: " ++ Fmt, [?MODULE | Args])
+    ?LOG_ERROR(?MODULE_STRING ": " ++ Fmt, Args)
 ).
 
 -define(AWS_LOG_INFO(Arg),
-    ?LOG_INFO("~tp: ~ts", [?MODULE, Arg])
+    ?LOG_INFO(?MODULE_STRING ": ~ts", [Arg])
 ).
 
 -define(AWS_LOG_INFO(Fmt, Args),
-    ?LOG_INFO("~tp: " ++ Fmt, [?MODULE | Args])
+    ?LOG_INFO(?MODULE_STRING ": " ++ Fmt, Args)
 ).
