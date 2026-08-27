@@ -29,6 +29,7 @@ start(normal, _StartArgs) ->
     aws_sup:start_link().
 
 stop(_State) ->
+    aws_sup:deregister_collectors(),
     ok.
 
 boot_step(aws_arn_config) ->
