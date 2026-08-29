@@ -150,7 +150,7 @@ analyze(Config, Window, Nodes) ->
         },
     Flaps = #{N => flap_count(maps:get(N, InSeries), Extreme) || N <- Nodes},
     OwnOut = #{N => own_outbound_min(Window, N, Nodes) || N <- Nodes},
-    OwnRowSeen = #{N => own_row_present(Window, N) || N <- Nodes},
+    OwnOutSeen = #{N => own_outbound_seen(Window, N, Nodes) || N <- Nodes},
 
     %% P2/P3 use the argmax-median candidate: the node the *other* observers
     %% report as most degraded on average.
@@ -171,17 +171,19 @@ analyze(Config, Window, Nodes) ->
     %% roughly equally bidirectional, so none dominates -> left to the cluster-wide
     %% test), while still attributing a real single-node fault. But dominance is
     %% only meaningful when the *other* nodes' own gossip rows have actually
-    %% been observed; otherwise own_outbound_min for those nodes reads 0.0
-    %% (the "row never arrived" default) and any elevated candidate would
-    %% trivially "dominate" that zero. Gate P3 on every other node having a
-    %% present own row in the window, so the guard cannot fire under a real
-    %% cluster-wide congestion event where gossip has stalled.
+    %% been observed AND carry at least one peer view; otherwise
+    %% own_outbound_min for those nodes reads 0.0 (an absent row, or a present
+    %% but empty one from a just-restarted node) and any elevated candidate
+    %% would trivially "dominate" that zero. Gate P3 on every other node having
+    %% a usable own row (one that yields an own-outbound value) in the window,
+    %% so the guard cannot fire under a real cluster-wide congestion event where
+    %% gossip has stalled or a peer has just restarted.
     BidirInbound = maps:get(bidir_inbound, Config),
     BidirOutbound = maps:get(bidir_outbound, Config),
     BidirMargin = maps:get(bidir_margin, Config),
     CandOwnOut = maps:get(P2Candidate, OwnOut),
     OthersOwnOutMax = lists:max([0.0 | [maps:get(N, OwnOut) || N <- P2Others]]),
-    P3OthersRowsPresent = lists:all(fun(N) -> maps:get(N, OwnRowSeen) end, P2Others),
+    P3OthersRowsPresent = lists:all(fun(N) -> maps:get(N, OwnOutSeen) end, P2Others),
     P3Fire =
         maps:get(P2Candidate, Med) >= BidirInbound andalso
             CandOwnOut >= BidirOutbound andalso
@@ -297,13 +299,16 @@ argmax_by(Nodes, Scores) ->
         Rest
     ).
 
-%% Whether a node's own gossip row was ever observed in the window (i.e. its
-%% row appears as an observer key in at least one snapshot). Used to gate P3:
-%% dominance across the other nodes' own-outbound rows is meaningless if some
-%% of those rows are absent (own_outbound_min returns 0.0 for absent rows).
--spec own_row_present([snapshot()], node()) -> boolean().
-own_row_present(Window, N) ->
-    lists:any(fun(Snapshot) -> maps:is_key(N, Snapshot) end, Window).
+%% Whether a node's own gossip row is usable for the P3 dominance comparison:
+%% it must yield at least one own-view median in the window. A fully-absent row
+%% and a present-but-empty one (a just-restarted node that gossiped before
+%% observing any peer) both leave own_outbound_min at 0.0, so P3 must treat them
+%% alike; letting an elevated candidate dominate that zero is the misattribution
+%% the guard prevents.
+-spec own_outbound_seen([snapshot()], node(), [node()]) -> boolean().
+own_outbound_seen(Window, N, Nodes) ->
+    Peers = [Peer || Peer <- Nodes, Peer =/= N],
+    lists:any(fun(Peer) -> own_view_median(Window, N, Peer) =/= none end, Peers).
 
 all_nodes(Window) ->
     lists:usort(

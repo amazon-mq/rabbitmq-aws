@@ -187,6 +187,25 @@ p3_requires_all_other_nodes_own_rows_present_test() ->
     Window = lists:duplicate(30, Snapshot),
     ?assertNotEqual({suspect, rmq1}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
 
+%% Regression for the "present-but-empty own row satisfies the P3 guard" bug: a
+%% just-restarted node can gossip an empty own row (#{}) before it observes any
+%% peer. A presence-only guard treats that as present, but own_outbound_min
+%% still reads 0.0 (no peer views), so an elevated candidate could dominate the
+%% zero and P3 would fire {suspect, N}. The guard must treat a present-but-empty
+%% row like an absent one.
+p3_requires_other_nodes_own_rows_nonempty_test() ->
+    %% rmq1 is bidirectionally elevated (inbound 0.6, own outbound 0.45 to both
+    %% peers). rmq2's own row is PRESENT but EMPTY, so its own_outbound_min is
+    %% 0.0 - the same "no data" zero as an absent row. Before the fix rmq1 would
+    %% dominate that zero and P3 would misattribute the congestion to rmq1.
+    Snapshot = #{
+        rmq0 => #{rmq1 => 0.6, rmq2 => 0.1},
+        rmq1 => #{rmq0 => 0.45, rmq2 => 0.45},
+        rmq2 => #{}
+    },
+    Window = lists:duplicate(30, Snapshot),
+    ?assertNotEqual({suspect, rmq1}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
 %% Regression for the "attribute at <3 observed nodes" hazard: the scorer's
 %% cross-check majority relies on at least 3 nodes, so during a rolling restart
 %% (matrix transiently drops to 2 observed nodes) any attribution is unreliable.
