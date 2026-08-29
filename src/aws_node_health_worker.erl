@@ -276,6 +276,14 @@ cycle(State0) ->
 %% for `confirm_ticks` consecutive ticks, and stays suspected until it is no
 %% longer the raw suspect for `clear_ticks` consecutive ticks. Applies to every
 %% path (P1/P2/P3) uniformly, since it debounces the final verdict.
+%%
+%% This suspect debouncer is a node-tracking, two-phase state machine: it tracks
+%% which node is armed/confirmed, carries that node's confidence, re-arms (to 1)
+%% when the raw suspect changes node, and clears at once on a `cluster_wide`
+%% verdict. It deliberately does NOT share a helper with debounce_cluster_wide/4,
+%% which debounces a plain boolean flag: unifying them would have to parameterize
+%% away the node identity, confidence, and per-stream re-arm, adding more
+%% complexity than the shared confirm/clear threshold check removes.
 -spec debounce(aws_node_health:result(), #state{}) -> {#state{}, aws_node_health:result()}.
 debounce(Raw, State) ->
     RawVerdict = maps:get(verdict, Raw),
@@ -351,6 +359,12 @@ debounce(Raw, State) ->
 %% for the suspect flag. Returns {NowOn, Arm, Miss}: cluster_wide is asserted
 %% after confirm_ticks consecutive cluster_wide raw verdicts and held until
 %% clear_ticks consecutive non-cluster_wide ones.
+%%
+%% This is a plain boolean-signal debouncer, kept as its own function rather
+%% than shared with the suspect debouncer in debounce/2. That one is a
+%% node-tracking machine (it carries node identity, confidence, and a per-stream
+%% re-arm); collapsing the two into one helper would obscure both rather than
+%% simplify either.
 -spec debounce_cluster_wide(aws_node_health:verdict(), #state{}, pos_integer(), pos_integer()) ->
     {boolean(), non_neg_integer(), non_neg_integer()}.
 debounce_cluster_wide(RawVerdict, State, ConfirmTicks, ClearTicks) ->
