@@ -344,7 +344,11 @@ frac_at_least(Series, Threshold, Denom) ->
 %% P2 (fraction extreme) covers that case separately.
 -spec flap_count([float()], number()) -> non_neg_integer().
 flap_count(Series, Threshold) ->
-    count_upcrossings(Series, Threshold, undefined, 0).
+    %% Series is newest-first (push_window/3 prepends); up-crossing counting is
+    %% time-directional, so reverse to chronological order first. Counting
+    %% newest-first would tally falling edges and miss a burst still active at
+    %% the newest sample, undercounting by one.
+    count_upcrossings(lists:reverse(Series), Threshold, undefined, 0).
 
 -spec count_upcrossings([float()], number(), float() | undefined, non_neg_integer()) ->
     non_neg_integer().

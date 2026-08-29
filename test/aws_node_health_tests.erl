@@ -143,6 +143,29 @@ p1_low_duty_cycle_fault_is_attributed_by_flap_count_test() ->
             lists:duplicate(24, QuietView),
     ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
 
+%% Regression for the "flap count uses window order" bug: the window is stored
+%% newest-first (push_window/3 prepends), so counting up-crossings in list order
+%% tallies falling edges and undercounts by one when the newest sample is still
+%% extreme (a burst active at the window end). A fault with exactly flap_min(2)
+%% bursts whose newest sample is extreme then counts 1 and P1 never fires. This
+%% window ends (chronologically) extreme, exercising the order the symmetric
+%% p1_low_duty_cycle window above cannot.
+p1_flap_count_uses_chronological_order_test() ->
+    ExtremeView = #{
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.0}
+    },
+    QuietView = #{
+        rmq1 => #{rmq0 => 0.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 0.0, rmq1 => 0.0}
+    },
+    %% Newest-first window: newest sample is extreme (fault active at window end).
+    %% Chronological series for rmq0 (oldest->newest) is [0 x27, 1, 0, 1] -> two
+    %% rising edges, so rmq0 flaps 2 >= flap_min while rmq1/rmq2 stay pristine.
+    Window =
+        [ExtremeView, QuietView, ExtremeView] ++ lists:duplicate(27, QuietView),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
 %% Regression for the "P3 dominance relies on absent-row zeros" bug: during real
 %% cluster-wide congestion gossip rows may be delayed or evicted, leaving some
 %% peers' own_outbound_min at the "row never arrived" default of 0.0. Before
