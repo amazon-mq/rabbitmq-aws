@@ -152,9 +152,9 @@ analyze(Config, Window, Nodes) ->
     OwnOut = #{N => own_outbound_min(Window, N, Nodes) || N <- Nodes},
     OwnOutSeen = #{N => own_outbound_seen(Window, N, Nodes) || N <- Nodes},
 
-    %% P2/P3 use the argmax-median candidate: the node the *other* observers
+    %% P2/P3 use the highest-median candidate: the node the *other* observers
     %% report as most degraded on average.
-    P2Candidate = argmax_median(Nodes, Med),
+    P2Candidate = argmax_by(Nodes, Med),
     P2Others = [N || N <- Nodes, N =/= P2Candidate],
     OthersMaxMed = lists:max([0.0 | [maps:get(N, Med) || N <- P2Others]]),
     Margin = maps:get(P2Candidate, Med) - OthersMaxMed,
@@ -193,7 +193,7 @@ analyze(Config, Window, Nodes) ->
     %% P1 (isolated flap): pick the node that flaps the most, not the one with
     %% the highest median. An intermittent low-duty-cycle fault has near-zero
     %% median (spikes to ~1.0 during bursts, decays to ~0.0 between them), so
-    %% argmax_median would not name it and its flaps would go uncounted. P1
+    %% choosing by median would not name it and its flaps would go uncounted. P1
     %% therefore chooses its own candidate independently of P2/P3.
     P1Candidate = argmax_by(Nodes, Flaps),
     P1Others = [N || N <- Nodes, N =/= P1Candidate],
@@ -278,9 +278,6 @@ inbound_series(Window, N) ->
 -spec median_or_zero([float()]) -> float().
 median_or_zero([]) -> 0.0;
 median_or_zero(Series) -> median(Series).
-
-argmax_median(Nodes, Med) ->
-    argmax_by(Nodes, Med).
 
 %% Node with the greatest value in Scores. Sorts the nodes first so ties break
 %% lexicographically (deterministic), then folds picking the strictly-greater

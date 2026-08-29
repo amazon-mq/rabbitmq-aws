@@ -149,14 +149,14 @@ sparsely_observed_peer_is_not_attributed_test() ->
 
 %% Regression for the "P1 flap counted on argmax-median" bug: an intermittent
 %% low-duty-cycle fault has near-zero median (mostly-zero series with a few
-%% high spikes), so argmax_median would not name the faulty node and the
+%% high spikes), so choosing by median would not name the faulty node and the
 %% flap-based P1 path used to miss the exact case it exists to catch. The fix
 %% picks the P1 candidate by flap count, independently of median.
 p1_low_duty_cycle_fault_is_attributed_by_flap_count_test() ->
     %% rmq0 fault: 3 out of 30 samples spike to ~1.0 (three distinct bursts,
     %% each preceded by a 0.0 sample so it counts as an upward crossing of the
     %% extreme threshold). Median stays 0.0 - identical to rmq1/rmq2 - so
-    %% argmax_median picks lexicographically first (rmq0 by luck of ordering,
+    %% choosing by median picks lexicographically first (rmq0 by luck of ordering,
     %% but the point is: even if it did not, P1 must still fire on flap
     %% count). Flap count for rmq0 = 3 >= flap_min(2); others = 0.
     ExtremeView = #{
