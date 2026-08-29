@@ -9,7 +9,8 @@
 
 -export([
     start_link/0,
-    init/1
+    init/1,
+    deregister_collectors/0
 ]).
 
 start_link() ->
@@ -38,16 +39,37 @@ init([]) ->
 auth_validation_children() ->
     case application:get_env(aws, auth_validation_enabled, false) of
         true ->
-            %% Register the Prometheus metrics collector before starting the
-            %% semaphore worker. The collector has no process (it is a callback
-            %% module registered with prometheus_registry), so no child spec is
-            %% needed. rabbitmq_prometheus is a declared dependency (which
-            %% transitively pulls in prometheus), so a failure here is a real
-            %% fault and must surface rather than be swallowed.
-            aws_auth_validate_metrics:register(),
+            register_collectors(),
             [semaphore_spec()];
         _ ->
             []
+    end.
+
+%% Register the Prometheus collectors this plugin owns. A collector has no
+%% process (it is a callback module registered with prometheus_registry), so no
+%% child spec is needed. rabbitmq_prometheus is a declared dependency (which
+%% transitively pulls in prometheus), so a failure here is a real fault and must
+%% surface rather than be swallowed.
+register_collectors() ->
+    aws_auth_validate_metrics:register().
+
+%% Tear down every collector register_collectors/0 owns so none outlives the
+%% application: an orphan stays on the default registry and keeps running
+%% collect_mf/2 on every scrape. Called from aws_app:stop/1.
+deregister_collectors() ->
+    lists:foreach(fun deregister_collector/1, [aws_auth_validate_metrics]).
+
+%% Deregister one collector if it is currently registered. Driven by actual
+%% registration state rather than the feature toggle, so a still-registered
+%% collector is torn down even if the toggle no longer reads true; deregister/0
+%% is idempotent. The catch tolerates prometheus not being started, in which
+%% case nothing was ever registered.
+deregister_collector(Mod) ->
+    try prometheus_registry:collector_registeredp(Mod) of
+        true -> Mod:deregister();
+        false -> ok
+    catch
+        _:_ -> ok
     end.
 
 %% The concurrency semaphore bounds simultaneous outbound LDAP connections;

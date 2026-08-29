@@ -43,7 +43,11 @@
     crash_safety/1,
     unknown_method_no_crash/1,
     unknown_category_no_crash/1,
-    register_preserves_counters/1
+    register_preserves_counters/1,
+    deregister_collectors_removes_registered/1,
+    deregister_collectors_ignores_feature_toggle/1,
+    deregister_collectors_not_registered_noop/1,
+    app_stop_deregisters/1
 ]).
 
 all() ->
@@ -60,7 +64,11 @@ all() ->
         crash_safety,
         unknown_method_no_crash,
         unknown_category_no_crash,
-        register_preserves_counters
+        register_preserves_counters,
+        deregister_collectors_removes_registered,
+        deregister_collectors_ignores_feature_toggle,
+        deregister_collectors_not_registered_noop,
+        app_stop_deregisters
     ].
 
 init_per_suite(Config) ->
@@ -71,12 +79,13 @@ init_per_suite(Config) ->
 end_per_suite(_Config) ->
     ok.
 
-init_per_testcase(no_state_when_disabled, Config) ->
+init_per_testcase(TestCase, Config) when
+    TestCase =:= no_state_when_disabled;
+    TestCase =:= crash_safety;
+    TestCase =:= deregister_collectors_not_registered_noop
+->
     %% Ensure metrics are NOT registered for this test case.
-    _ = persistent_term:erase({aws_auth_validate_metrics, counters}),
-    Config;
-init_per_testcase(crash_safety, Config) ->
-    %% Ensure metrics are NOT registered for this test case.
+    catch aws_auth_validate_metrics:deregister(),
     _ = persistent_term:erase({aws_auth_validate_metrics, counters}),
     Config;
 init_per_testcase(_TestCase, Config) ->
@@ -86,9 +95,11 @@ init_per_testcase(_TestCase, Config) ->
     aws_auth_validate_metrics:register(),
     Config.
 
-end_per_testcase(no_state_when_disabled, _Config) ->
-    ok;
-end_per_testcase(crash_safety, _Config) ->
+end_per_testcase(TestCase, _Config) when
+    TestCase =:= no_state_when_disabled;
+    TestCase =:= crash_safety;
+    TestCase =:= deregister_collectors_not_registered_noop
+->
     ok;
 end_per_testcase(_TestCase, _Config) ->
     %% Clean up: deregister collector and erase persistent_term.
@@ -306,6 +317,43 @@ register_preserves_counters(_Config) ->
     Val2 = counters:get(Counters2, 1),
     ?assertEqual(1, Val2),
     ok.
+
+%% A registered collector is removed from the registry and its counters erased,
+%% symmetric with the boot-time registration.
+deregister_collectors_removes_registered(_Config) ->
+    ?assert(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    ?assertEqual(ok, aws_sup:deregister_collectors()),
+    ?assertNot(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    ?assertEqual(undefined, aws_auth_validate_metrics:counter_ref()).
+
+%% Teardown is driven by registration state, not the feature toggle: a
+%% registered collector is torn down even when the toggle reads false, the
+%% orphan case a toggle-gated teardown would miss.
+deregister_collectors_ignores_feature_toggle(_Config) ->
+    ?assert(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    application:set_env(aws, auth_validation_enabled, false),
+    try
+        ?assertEqual(ok, aws_sup:deregister_collectors()),
+        ?assertNot(prometheus_registry:collector_registeredp(aws_auth_validate_metrics))
+    after
+        application:unset_env(aws, auth_validation_enabled)
+    end.
+
+%% With no collector registered, teardown is a safe no-op: it returns ok without
+%% raising and touches nothing (deregister/0 is never called, so no spurious
+%% deregistration log is emitted on a feature-off shutdown).
+deregister_collectors_not_registered_noop(_Config) ->
+    ?assertNot(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    ?assertEqual(ok, aws_sup:deregister_collectors()),
+    ?assertNot(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)).
+
+%% aws_app:stop/1 drives the teardown, so a registered collector does not
+%% outlive the application.
+app_stop_deregisters(_Config) ->
+    ?assert(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    ?assertEqual(ok, aws_app:stop(undefined)),
+    ?assertNot(prometheus_registry:collector_registeredp(aws_auth_validate_metrics)),
+    ?assertEqual(undefined, aws_auth_validate_metrics:counter_ref()).
 
 %%--------------------------------------------------------------------
 %% Helpers
