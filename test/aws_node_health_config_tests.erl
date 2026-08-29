@@ -49,6 +49,22 @@ interval_out_of_range_falls_back_test() ->
         ?assertEqual(1000, aws_node_health_config:interval_ms())
     end).
 
+%% A too-small interval (below the 500 ms floor) is rejected and falls back to
+%% the default rather than hammering the failure detector.
+interval_below_floor_falls_back_test() ->
+    with_env(node_health_interval_ms, 1, fun() ->
+        ?assertEqual(1000, aws_node_health_config:interval_ms())
+    end),
+    with_env(node_health_interval_ms, 499, fun() ->
+        ?assertEqual(1000, aws_node_health_config:interval_ms())
+    end).
+
+%% The floor itself (500 ms) is accepted.
+interval_floor_boundary_is_accepted_test() ->
+    with_env(node_health_interval_ms, 500, fun() ->
+        ?assertEqual(500, aws_node_health_config:interval_ms())
+    end).
+
 window_override_test() ->
     with_env(node_health_window, 60, fun() ->
         ?assertEqual(60, aws_node_health_config:window())

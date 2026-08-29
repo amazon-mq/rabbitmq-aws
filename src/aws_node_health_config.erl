@@ -26,6 +26,12 @@
 
 -define(DEFAULT_INTERVAL_MS, 1000).
 -define(MAX_INTERVAL_MS, 60000).
+%% Lower bound on the sampling interval. A single sample may take up to the
+%% worker's SAMPLE_TIMEOUT_MS (500 ms); an interval below that would drive the
+%% sample/gossip cycle faster than one sample can complete, hammering aten_sink
+%% (which sits on the real failure-detection hot path) and flooding gossip. An
+%% out-of-range value falls back to the default rather than being honoured.
+-define(MIN_INTERVAL_MS, 500).
 -define(DEFAULT_WINDOW, 30).
 -define(MAX_WINDOW, 10000).
 -define(DEFAULT_STALE_TICKS, 5).
@@ -41,10 +47,11 @@
 enabled() ->
     application:get_env(aws, node_health_enabled, false) =:= true.
 
-%% Sampling and recompute period in milliseconds.
+%% Sampling and recompute period in milliseconds. Bounded below by
+%% MIN_INTERVAL_MS so a too-small setting cannot hammer the failure detector.
 -spec interval_ms() -> pos_integer().
 interval_ms() ->
-    get_int(node_health_interval_ms, ?DEFAULT_INTERVAL_MS, ?MAX_INTERVAL_MS).
+    get_int(node_health_interval_ms, ?DEFAULT_INTERVAL_MS, ?MIN_INTERVAL_MS, ?MAX_INTERVAL_MS).
 
 %% Number of snapshots retained in the rolling decision window.
 -spec window() -> pos_integer().
@@ -89,3 +96,9 @@ worker_config() ->
 -spec get_int(atom(), pos_integer(), pos_integer()) -> pos_integer().
 get_int(Key, Default, MaxBound) ->
     aws_app_env:get_int_env(aws, Key, Default, MaxBound).
+
+%% As get_int/3, with an explicit lower bound (currently only interval_ms needs
+%% one; the other knobs are safe down to 1).
+-spec get_int(atom(), pos_integer(), pos_integer(), pos_integer()) -> pos_integer().
+get_int(Key, Default, MinBound, MaxBound) ->
+    aws_app_env:get_int_env(aws, Key, Default, MinBound, MaxBound).
