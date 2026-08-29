@@ -93,6 +93,38 @@ cluster_wide_suspects_no_node_test() ->
         maps:to_list(Scores)
     ).
 
+%% Precedence invariant: the dominant-single-node paths (P2, P3) are evaluated
+%% BEFORE the cluster-wide guard, so a dominating node is attributed even when
+%% enough nodes are elevated to satisfy the cluster-wide condition. The
+%% debounce's instant clear of a held suspect on a raw cluster_wide verdict
+%% relies on this (see aws_node_health_worker:debounce/2): a raw cluster_wide is
+%% emitted only when no node dominates. These tests pin the order so a future
+%% reordering that let cluster_wide pre-empt P2/P3 is caught.
+
+%% P2 (sustained-extreme, wide margin) wins over a co-occurring cluster-wide
+%% condition: rmq0 is extreme while rmq1/rmq2 are elevated enough that all three
+%% count toward cluster_min_nodes.
+p2_dominant_suspect_takes_precedence_over_cluster_wide_test() ->
+    Snapshot = #{
+        rmq0 => #{rmq1 => 0.5, rmq2 => 0.5},
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.5},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.5}
+    },
+    Window = lists:duplicate(30, Snapshot),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% P3 (masked bidirectional fault) wins over a co-occurring cluster-wide
+%% condition: rmq0's margin is too small for P2, but it dominates its own
+%% outbound row while all three nodes are elevated.
+p3_dominant_suspect_takes_precedence_over_cluster_wide_test() ->
+    Snapshot = #{
+        rmq0 => #{rmq1 => 0.7, rmq2 => 0.7},
+        rmq1 => #{rmq0 => 0.6, rmq2 => 0.4},
+        rmq2 => #{rmq0 => 0.6, rmq1 => 0.4}
+    },
+    Window = lists:duplicate(30, Snapshot),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
 empty_window_is_clean_test() ->
     ?assertEqual(
         #{verdict => clean, scores => #{}},

@@ -297,10 +297,15 @@ debounce(Raw, State) ->
         case RawVerdict of
             cluster_wide ->
                 %% An explicit symmetric verdict clears any held suspect at once.
-                %% cluster_wide requires >= 2 elevated nodes, which a genuine
-                %% single-node fault does not produce, so it is not spurious and
-                %% must not be held under by a stale suspect (which would defeat
-                %% the very guard cluster_wide exists to provide).
+                %% This is safe because the scorer evaluates the dominant-node
+                %% paths (P2/P3) BEFORE the cluster-wide guard, so a raw
+                %% cluster_wide verdict is emitted only when no node dominates
+                %% this tick (see aws_node_health:analyze/3's verdict order,
+                %% pinned by the precedence tests in aws_node_health_tests). A
+                %% stale suspect must not be held under it, which would defeat
+                %% the very guard cluster_wide exists to provide. If a future
+                %% scorer change ever let cluster_wide co-occur with a dominating
+                %% node, revisit this instant clear.
                 {none, 0.0, 0};
             _ ->
                 case State#state.deb_confirmed of
