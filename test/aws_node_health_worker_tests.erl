@@ -17,15 +17,17 @@ record_row_overwrites_with_latest_tick_test() ->
     R2 = aws_node_health_worker:record_row(R1, rmq1, #{rmq0 => 0.5}, 7),
     ?assertEqual({7, #{rmq0 => 0.5}}, maps:get(rmq1, R2)).
 
-assemble_snapshot_evicts_stale_rows_test() ->
+strip_ticks_yields_observer_views_test() ->
+    %% strip_ticks drops the record-tick, leaving observer -> view. Staleness
+    %% filtering is prune_stale_rows/3's job (tested below); the cycle prunes
+    %% first, then strips the pruned map.
     Rows = #{
         rmq0 => {10, #{rmq1 => 0.0, rmq2 => 0.0}},
-        rmq1 => {10, #{rmq0 => 1.0, rmq2 => 0.0}},
-        %% last refreshed at tick 3; at tick 12 with stale_ticks 5 this is dropped
-        rmq2 => {3, #{rmq0 => 1.0, rmq1 => 0.0}}
+        rmq1 => {10, #{rmq0 => 1.0, rmq2 => 0.0}}
     },
-    Snapshot = aws_node_health_worker:assemble_snapshot(Rows, 12, 5),
+    Snapshot = aws_node_health_worker:strip_ticks(Rows),
     ?assertEqual([rmq0, rmq1], lists:sort(maps:keys(Snapshot))),
+    ?assertEqual(#{rmq1 => 0.0, rmq2 => 0.0}, maps:get(rmq0, Snapshot)),
     ?assertEqual(#{rmq0 => 1.0, rmq2 => 0.0}, maps:get(rmq1, Snapshot)).
 
 prune_stale_rows_drops_stale_entries_test() ->

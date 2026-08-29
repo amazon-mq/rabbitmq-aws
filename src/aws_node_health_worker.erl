@@ -36,7 +36,7 @@
 -ifdef(TEST).
 -export([
     record_row/4,
-    assemble_snapshot/3,
+    strip_ticks/1,
     prune_stale_rows/3,
     push_window/3,
     valid_row/1,
@@ -253,11 +253,13 @@ cycle(State0) ->
     Rows0 = record_row(State0#state.rows, State0#state.self_node, OwnRow, Tick),
     gossip(State0#state.peers_fun, State0#state.self_node, OwnRow),
     StaleTicks = State0#state.stale_ticks,
-    Snapshot = assemble_snapshot(Rows0, Tick, StaleTicks),
-    %% Also write the staleness filter back through to the persistent rows so
-    %% node names that never come back (e.g. after an instance replacement)
-    %% drop out of state, not just out of each transient snapshot.
+    %% Prune stale rows once, then derive this tick's snapshot (observer -> view)
+    %% from the pruned map, so the staleness predicate runs a single pass. The
+    %% prune is written back to persistent state so node names that never come
+    %% back (e.g. after an instance replacement) drop out of state, not just out
+    %% of each transient snapshot.
     Rows = prune_stale_rows(Rows0, Tick, StaleTicks),
+    Snapshot = strip_ticks(Rows),
     Window = push_window(State0#state.window, Snapshot, State0#state.window_max),
     Raw = aws_node_health:analyze(State0#state.analysis, Window),
     {State1, Published} = debounce(Raw, State0),
@@ -476,17 +478,13 @@ schedule_tick(IntervalMs) ->
 record_row(Rows, Observer, Row, Tick) ->
     Rows#{Observer => {Tick, Row}}.
 
-%% Build one observer x peer snapshot from the known rows, dropping any row not
-%% refreshed within StaleTicks of the current tick. A crashed or partitioned
-%% peer thus falls out of the matrix rather than pinning a stale view; the
-%% surviving observers still carry the signal about it.
--spec assemble_snapshot(rows(), integer(), non_neg_integer()) -> snapshot().
-assemble_snapshot(Rows, Tick, StaleTicks) ->
-    #{
-        Observer => Row
-     || Observer := {RowTick, Row} <- Rows,
-        Tick - RowTick =< StaleTicks
-    }.
+%% Drop the record-tick from each (already-pruned) row, yielding the
+%% observer -> view snapshot the scorer consumes. A crashed or partitioned peer
+%% has already fallen out via prune_stale_rows/3, so the surviving observers
+%% carry the signal about it.
+-spec strip_ticks(rows()) -> snapshot().
+strip_ticks(Rows) ->
+    maps:map(fun(_Observer, {_RowTick, Row}) -> Row end, Rows).
 
 %% Return the rows map with stale entries removed. On AWS, node names change
 %% with every instance replacement (the ip-A-B-C-D hostname is derived from the
