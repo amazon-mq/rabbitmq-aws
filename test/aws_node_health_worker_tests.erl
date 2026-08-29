@@ -69,6 +69,43 @@ push_window_keeps_most_recent_first_and_trims_test() ->
     ),
     ?assertEqual([Snap(4), Snap(3), Snap(2)], Window).
 
+%% Regression for "publish emits clean while a debounced cluster_wide is held":
+%% a confirmed suspect that has dropped out of the raw scores (it crashed or
+%% fully partitioned) must not mask a still-held cluster_wide as clean.
+resolve_published_falls_back_to_cluster_wide_when_suspect_absent_test() ->
+    Scores = #{
+        rmq1 => #{inbound => 0.6, confidence => 0.0, suspected => 0},
+        rmq2 => #{inbound => 0.6, confidence => 0.0, suspected => 0}
+    },
+    %% Confirmed suspect rmq0 is absent from Scores; cluster_wide is held.
+    Result = aws_node_health_worker:resolve_published(rmq0, 0.9, true, Scores),
+    ?assertEqual(cluster_wide, maps:get(verdict, Result)),
+    ?assert(
+        lists:all(
+            fun(#{suspected := S}) -> S =:= 0 end,
+            maps:values(maps:get(scores, Result))
+        )
+    ).
+
+%% With the suspect absent and cluster_wide NOT held, fall back to clean.
+resolve_published_falls_back_to_clean_when_suspect_absent_test() ->
+    Scores = #{rmq1 => #{inbound => 0.2, confidence => 0.0, suspected => 0}},
+    Result = aws_node_health_worker:resolve_published(rmq0, 0.9, false, Scores),
+    ?assertEqual(clean, maps:get(verdict, Result)).
+
+%% A present confirmed suspect is published as {suspect, N} with its held
+%% confidence, taking precedence over a held cluster_wide.
+resolve_published_present_suspect_takes_precedence_test() ->
+    Scores = #{
+        rmq0 => #{inbound => 0.9, confidence => 0.0, suspected => 0},
+        rmq1 => #{inbound => 0.6, confidence => 0.0, suspected => 0}
+    },
+    Result = aws_node_health_worker:resolve_published(rmq0, 0.8, true, Scores),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, Result)),
+    Rmq0 = maps:get(rmq0, maps:get(scores, Result)),
+    ?assertEqual(1, maps:get(suspected, Rmq0)),
+    ?assertEqual(0.8, maps:get(confidence, Rmq0)).
+
 %%--------------------------------------------------------------------
 %% gen_server integration (injected sampler and peers; no real cluster)
 %%--------------------------------------------------------------------

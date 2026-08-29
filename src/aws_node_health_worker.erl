@@ -40,6 +40,7 @@
     prune_stale_rows/3,
     push_window/3,
     valid_row/1,
+    resolve_published/4,
     default_config/0
 ]).
 -endif.
@@ -329,17 +330,6 @@ debounce(Raw, State) ->
     %% keeps the congestion signal from flapping on a single noisy tick, exactly
     %% as the suspect flag is debounced.
     {CwOn, CwArm, CwMiss} = debounce_cluster_wide(RawVerdict, State, ConfirmTicks, ClearTicks),
-    %% Resolve the published verdict. A confirmed single-node suspect takes
-    %% precedence over cluster_wide (a dominant fault is the more actionable
-    %% signal, and the scorer already evaluates the dominant-node paths before
-    %% the symmetric guard); cluster_wide is reported only when no suspect is
-    %% confirmed.
-    Verdict =
-        if
-            Confirmed =/= none -> {suspect, Confirmed};
-            CwOn -> cluster_wide;
-            true -> clean
-        end,
     State1 = State#state{
         deb_stream = Stream,
         deb_arm = Arm,
@@ -350,7 +340,7 @@ debounce(Raw, State) ->
         cw_arm = CwArm,
         cw_miss = CwMiss
     },
-    {State1, publish(Verdict, maps:get(scores, Raw), Confirmed, Conf)}.
+    {State1, resolve_published(Confirmed, Conf, CwOn, maps:get(scores, Raw))}.
 
 %% Debounce the cluster_wide verdict with the same confirm/clear thresholds used
 %% for the suspect flag. Returns {NowOn, Arm, Miss}: cluster_wide is asserted
@@ -385,18 +375,22 @@ raw_conf(Raw, N) ->
         _ -> 0.0
     end.
 
-%% Rebuild the result with the debounced suspect: only the confirmed node reads
-%% suspected=1 (with the held confidence); every other node reads 0. Raw
-%% `inbound` scores are preserved. `Verdict` is the already-resolved published
-%% verdict (cluster_wide or clean when there is no confirmed suspect, else
-%% {suspect, Confirmed}). A confirmed suspect that has dropped out of the raw
-%% scores (its row went stale, e.g. it crashed or fully partitioned) cannot be
-%% given a consistent suspected=1 sample, so it is published clean; the miss
-%% counter then clears it. verdict and scores therefore never contradict.
--spec publish(aws_node_health:verdict(), map(), node() | none, float()) -> aws_node_health:result().
-publish(Verdict, Scores, none, _Conf) ->
-    #{verdict => Verdict, scores => zero_suspect(Scores)};
-publish(_Verdict, Scores, Confirmed, Conf) ->
+%% Resolve the published result from the debounced signals, so the verdict is
+%% decided in exactly one place. A confirmed single-node suspect takes
+%% precedence over cluster_wide (a dominant fault is the more actionable signal,
+%% and the scorer already evaluates the dominant-node paths before the symmetric
+%% guard), but only when it still has a score to attribute. A suspect that has
+%% dropped out of the raw scores (its row went stale, e.g. it crashed or fully
+%% partitioned) cannot be given a consistent suspected=1 sample, so it falls
+%% back to the other held signal -- cluster_wide when that is confirmed, else
+%% clean -- rather than masking a real, confirmed congestion as clean. Only the
+%% confirmed node ever reads suspected=1 (with the held confidence); every other
+%% node reads 0, and raw `inbound` scores are preserved. verdict and scores
+%% therefore never contradict.
+-spec resolve_published(node() | none, float(), boolean(), map()) -> aws_node_health:result().
+resolve_published(none, _Conf, CwOn, Scores) ->
+    #{verdict => non_suspect_verdict(CwOn), scores => zero_suspect(Scores)};
+resolve_published(Confirmed, Conf, CwOn, Scores) ->
     case maps:is_key(Confirmed, Scores) of
         true ->
             Scored = maps:map(
@@ -408,8 +402,14 @@ publish(_Verdict, Scores, Confirmed, Conf) ->
             ),
             #{verdict => {suspect, Confirmed}, scores => Scored};
         false ->
-            #{verdict => clean, scores => zero_suspect(Scores)}
+            #{verdict => non_suspect_verdict(CwOn), scores => zero_suspect(Scores)}
     end.
+
+%% The verdict when no single-node suspect is published: the held cluster_wide
+%% signal if it is confirmed, otherwise clean.
+-spec non_suspect_verdict(boolean()) -> clean | cluster_wide.
+non_suspect_verdict(true) -> cluster_wide;
+non_suspect_verdict(false) -> clean.
 
 -spec zero_suspect(map()) -> map().
 zero_suspect(Scores) ->
