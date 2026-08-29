@@ -222,7 +222,8 @@ handle_cast({peer_row, From, Row}, State) when is_map(Row) ->
             {noreply, State#state{rows = Rows}};
         false ->
             ?AWS_LOG_WARNING(
-                "node_health: dropping malformed peer_row from ~p (non-numeric values)",
+                "node_health: dropping malformed peer_row from ~p "
+                "(invalid keys or out-of-range values)",
                 [From]
             ),
             {noreply, State}
@@ -486,16 +487,23 @@ prune_stale_rows(Rows, Tick, StaleTicks) ->
 push_window(Window, Snapshot, Max) ->
     lists:sublist([Snapshot | Window], Max).
 
-%% A well-formed row is a map of node() => number(). is_map/1 alone (the guard
-%% on handle_cast/2) does not vet the values, so a version-skewed or buggy
-%% peer could otherwise cast a row containing atoms/binaries/nested terms that
-%% would later crash the pure scorer inside median/1 (badarith / badarg).
+%% A well-formed row is a map of node() => probability in [0.0, 1.0]. is_map/1
+%% alone (the handle_cast/2 guard) vets neither keys nor values, so a
+%% version-skewed or buggy peer could otherwise cast a row with a non-atom key
+%% (injecting a phantom node into all_nodes/1 and the scores) or a value outside
+%% [0,1] (breaching the score contract and able to inflate a median past the
+%% extreme/elevated thresholds), besides a non-number that would crash the pure
+%% scorer inside median/1. Reject the whole row if any entry is malformed.
 %% Callers must have already established that Row is a map (the handle_cast
 %% guard does).
 -spec valid_row(view()) -> boolean().
 valid_row(Row) ->
     maps:fold(
-        fun(_K, V, Acc) -> Acc andalso is_number(V) end,
+        fun(K, V, Acc) -> Acc andalso is_atom(K) andalso is_probability(V) end,
         true,
         Row
     ).
+
+-spec is_probability(term()) -> boolean().
+is_probability(V) ->
+    is_number(V) andalso V >= 0.0 andalso V =< 1.0.

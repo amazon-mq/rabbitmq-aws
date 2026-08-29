@@ -47,6 +47,19 @@ valid_row_accepts_numeric_and_rejects_others_test() ->
     ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => 0.5, rmq1 => busy})),
     ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => <<"0.5">>})).
 
+%% valid_row rejects values outside [0,1] and non-node (non-atom) keys, so a
+%% version-skewed or buggy peer cannot inflate a median past the thresholds or
+%% inject a phantom node into the scores.
+valid_row_rejects_out_of_range_and_bad_keys_test() ->
+    %% Out-of-range values invalidate the row.
+    ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => 1.5})),
+    ?assertNot(aws_node_health_worker:valid_row(#{rmq0 => -0.1})),
+    %% The boundary values are accepted.
+    ?assert(aws_node_health_worker:valid_row(#{rmq0 => 0.0, rmq1 => 1.0})),
+    %% Non-atom keys invalidate the row.
+    ?assertNot(aws_node_health_worker:valid_row(#{<<"rmq0">> => 0.5})),
+    ?assertNot(aws_node_health_worker:valid_row(#{{rmq, 0} => 0.5})).
+
 push_window_keeps_most_recent_first_and_trims_test() ->
     Snap = fun(N) -> #{tag => N} end,
     Window = lists:foldl(
