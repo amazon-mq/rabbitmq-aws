@@ -53,14 +53,16 @@ Attribution needs at least three observed nodes (a two-node view cannot tell whi
 
 All keys are optional; the feature is disabled unless the toggle is set.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `aws.node_health.enabled` | `false` | Main toggle. When off, no worker runs and no metrics are registered. |
-| `aws.node_health.interval_ms` | `1000` | Sampling and recompute period. |
-| `aws.node_health.window` | `30` | Number of snapshots in the rolling decision window. |
-| `aws.node_health.stale_ticks` | `5` | Drop a peer's row if it has not refreshed within this many ticks. |
-| `aws.node_health.confirm_ticks` | `3` | Hysteresis: consecutive cycles a node must be the raw suspect before `suspected` is published. |
-| `aws.node_health.clear_ticks` | `3` | Hysteresis: consecutive cycles without being the raw suspect before a published suspect clears. |
+| Key | Default | Accepted range | Meaning |
+|---|---|---|---|
+| `aws.node_health.enabled` | `false` | `true` / `false` | Main toggle. When off, no worker runs and no metrics are registered. |
+| `aws.node_health.interval_ms` | `1000` | 500..60000 | Sampling and recompute period, in ms. Floored at 500 (a single sample may take up to that). |
+| `aws.node_health.window` | `30` | 1..600 | Number of snapshots in the rolling decision window. Capped because each tick rescans the whole window per node pair. |
+| `aws.node_health.stale_ticks` | `5` | 1..10000 | Drop a peer's row if it has not refreshed within this many ticks. |
+| `aws.node_health.confirm_ticks` | `3` | 1..10000 | Hysteresis: consecutive cycles a node must be the raw suspect before `suspected` is published. |
+| `aws.node_health.clear_ticks` | `3` | 1..10000 | Hysteresis: consecutive cycles without being the raw suspect before a published suspect clears. |
+
+A numeric value outside its accepted range is replaced by the default, and a warning is logged; the bounds are enforced in code, not by the config schema.
 
 Example:
 

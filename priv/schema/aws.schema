@@ -304,8 +304,9 @@ end}.
     [{datatype, {enum, [true, false]}}]}.
 
 %% @doc Sampling and recompute period in milliseconds (effective default
-%% 1000). The bound is enforced at runtime by aws_node_health_config:get_int/3,
-%% which falls back to the default for a non-positive or out-of-range value.
+%% 1000). The bounds (500..60000) are enforced at runtime by
+%% aws_node_health_config:get_int/4, which falls back to the default for a value
+%% below the 500 ms floor or otherwise out of range.
 {mapping, "aws.node_health.interval_ms", "aws.node_health_interval_ms",
     [{datatype, integer}]}.
 
