@@ -70,6 +70,22 @@ window_override_test() ->
         ?assertEqual(60, aws_node_health_config:window())
     end).
 
+%% A window above the cap (or non-positive) falls back to the default rather
+%% than driving an oversized O(Nodes^2 * Window) recompute each tick.
+window_out_of_range_falls_back_test() ->
+    with_env(node_health_window, 601, fun() ->
+        ?assertEqual(30, aws_node_health_config:window())
+    end),
+    with_env(node_health_window, 0, fun() ->
+        ?assertEqual(30, aws_node_health_config:window())
+    end).
+
+%% The cap itself (600) is accepted.
+window_cap_boundary_is_accepted_test() ->
+    with_env(node_health_window, 600, fun() ->
+        ?assertEqual(600, aws_node_health_config:window())
+    end).
+
 stale_ticks_override_test() ->
     with_env(node_health_stale_ticks, 8, fun() ->
         ?assertEqual(8, aws_node_health_config:stale_ticks())

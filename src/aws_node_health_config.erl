@@ -33,7 +33,12 @@
 %% out-of-range value falls back to the default rather than being honoured.
 -define(MIN_INTERVAL_MS, 500).
 -define(DEFAULT_WINDOW, 30).
--define(MAX_WINDOW, 10000).
+%% Upper bound on the decision window. analyze/3 rescans the whole window for
+%% every (node, peer) pair each tick (own_outbound_min/own_view_median), an
+%% O(Nodes^2 * Window) recompute, so an oversized window makes every interval
+%% expensive for no detection benefit. Cap it well above the default (30) but
+%% far below the old 10000. An out-of-range value falls back to the default.
+-define(MAX_WINDOW, 600).
 -define(DEFAULT_STALE_TICKS, 5).
 -define(MAX_STALE_TICKS, 10000).
 -define(DEFAULT_CONFIRM_TICKS, 3).
