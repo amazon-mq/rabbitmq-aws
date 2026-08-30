@@ -4,6 +4,9 @@ A cluster node whose networking is partially degraded - a host or uplink droppin
 
 This feature turns the signal the broker already has - the node failure detector's per-peer reachability estimate - into per-node metrics an alarm can act on, so a degraded node can be attributed and replaced early. It is **off by default**.
 
+> [!IMPORTANT]
+> This detector is designed and calibrated for **three-node clusters** (Amazon MQ's topology). It runs on larger clusters and still attributes a clear single-node fault, but its attribution gates tighten as the node count grows (see Limitations), so on clusters larger than three nodes a real fault can be under-attributed. Larger-cluster support is future work.
+
 ## What it does
 
 Each node continuously estimates, for every peer, a probability in `[0.0, 1.0]` that the peer is down (this comes from `aten`, the accrual failure detector that ships with Ra). A single node only has its own row of that picture. The nodes gossip their rows to each other so that each node holds the full observer-by-peer matrix, keeps a bounded rolling window of it, and decides one of:
@@ -67,6 +70,7 @@ aws.node_health.enabled = true
 
 ## Limitations
 
+- The detector is calibrated for three-node clusters and its gates do not scale up. P1 requires *every* other node to be pristine, and P3 requires the candidate to dominate *every* other node's own-outbound, so on a larger cluster one unrelated noisy node defeats P1 and a second independently-degraded node defeats P3. The failure mode is under-attribution (a real fault is missed), never a false positive - P2, which needs only a wide margin over the next node, still attributes a clear single-node fault. There is no test coverage or threshold tuning above three nodes; larger-cluster support is future work.
 - Cluster-wide network congestion is not attributed to a node - by design, since it is not a single-node fault. It is instead surfaced on its own via `rabbitmq_aws_node_health_cluster_congested`, so an operator can still alarm on symmetric congestion without misattributing it.
 - The signal measures Erlang-distribution reachability, so it identifies the degraded *node*, not the underlying cause (a GC/CPU stall on a node looks similar to a network fault).
 - Gossip relies on the healthy nodes being able to exchange small rows; a fully partitioned node is already covered by the coarser detectors (`net_tick`, cluster partition handling).

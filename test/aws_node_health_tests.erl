@@ -250,6 +250,20 @@ under_three_nodes_returns_clean_test() ->
     Window = lists:duplicate(30, TwoNode),
     ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
 
+%% Behaviour pin above the calibrated three-node topology (see NODE_HEALTH.md):
+%% the detector is designed for three-node clusters, but a clear single-node
+%% fault on a four-node cluster is still attributed via P2, which needs only a
+%% wide margin over the next node rather than the P1/P3 all-other-nodes gates.
+%% A regression guard for >3-node behaviour, not a support guarantee.
+four_node_clear_fault_is_attributed_test() ->
+    Snapshot = #{
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.0, rmq3 => 0.0},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.0, rmq3 => 0.0},
+        rmq3 => #{rmq0 => 1.0, rmq1 => 0.0, rmq2 => 0.0}
+    },
+    Window = lists:duplicate(30, Snapshot),
+    ?assertEqual({suspect, rmq0}, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
 %% When the verdict is clean, no peer's confidence may be non-zero, even if the
 %% candidate was mildly elevated (below the sustained fraction).
 clean_verdict_reports_zero_confidence_test() ->
