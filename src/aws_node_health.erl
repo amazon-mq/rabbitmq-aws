@@ -215,36 +215,35 @@ analyze(Config, Window, Nodes) ->
     %% own candidate and its own confidence, so a suspect's confidence always
     %% describes the path that actually attributed it. When nothing fires we
     %% report cluster_wide (if applicable) or clean, with no suspect.
-    {Verdict, Suspect, CandConf} =
+    {Verdict, CandConf} =
         if
             P2Fire ->
-                {{suspect, P2Candidate}, P2Candidate, maps:get(P2Candidate, FracExtreme)};
+                {{suspect, P2Candidate}, maps:get(P2Candidate, FracExtreme)};
             P3Fire ->
-                {{suspect, P2Candidate}, P2Candidate, CandOwnOut};
+                {{suspect, P2Candidate}, CandOwnOut};
             ClusterWide ->
-                {cluster_wide, none, 0.0};
+                {cluster_wide, 0.0};
             P1Fire ->
-                {
-                    {suspect, P1Candidate},
-                    P1Candidate,
-                    min(1.0, maps:get(P1Candidate, Flaps) / (2 * FlapMin))
-                };
+                {{suspect, P1Candidate}, min(1.0, maps:get(P1Candidate, Flaps) / (2 * FlapMin))};
             true ->
-                {clean, none, 0.0}
+                {clean, 0.0}
         end,
 
     Scores =
         #{
             N => #{
                 inbound => maps:get(N, Med),
-                confidence => confidence_for(N, Suspect, CandConf),
+                confidence => confidence_for(N, Verdict, CandConf),
                 suspected => suspected_for(N, Verdict)
             }
          || N <- Nodes
         },
     #{verdict => Verdict, scores => Scores}.
 
-confidence_for(N, N, CandConf) -> CandConf;
+%% The candidate confidence applies only to the attributed suspect; every other
+%% node reads 0.0. Derived from the verdict, like suspected_for/2, so the two
+%% cannot disagree.
+confidence_for(N, {suspect, N}, CandConf) -> CandConf;
 confidence_for(_, _, _) -> 0.0.
 
 suspected_for(N, {suspect, N}) -> 1;
