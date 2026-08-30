@@ -100,3 +100,18 @@ collect_mf_is_noop_when_worker_absent_test() ->
         aws_node_health_metrics:collect_mf(default, fun(MF) -> Self ! {mf, MF} end)
     ),
     ?assertEqual([], drain_mfs([])).
+
+%% aws_sup:deregister_collectors/0 tears down the node-health collector. Guards
+%% that this module is actually in the teardown list: the state-based helper
+%% would otherwise silently skip a wrong or missing module name.
+deregister_collectors_removes_node_health_collector_test() ->
+    {ok, _} = application:ensure_all_started(prometheus),
+    catch aws_node_health_metrics:deregister(),
+    aws_node_health_metrics:register(),
+    ?assert(prometheus_registry:collector_registeredp(aws_node_health_metrics)),
+    try
+        ?assertEqual(ok, aws_sup:deregister_collectors()),
+        ?assertNot(prometheus_registry:collector_registeredp(aws_node_health_metrics))
+    after
+        catch aws_node_health_metrics:deregister()
+    end.

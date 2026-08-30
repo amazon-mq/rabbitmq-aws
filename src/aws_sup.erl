@@ -28,6 +28,11 @@ init([]) ->
         intensity => 5,
         period => 10
     },
+    %% Register the collectors before building the child specs so each is
+    %% present before its worker starts (a scrape landing between registration
+    %% and the first sample reports the worker as unavailable rather than the
+    %% collector as missing).
+    register_collectors(),
     ChildSpecs = auth_validation_children() ++ node_health_children(),
     {ok, {SupFlags, ChildSpecs}}.
 
@@ -39,27 +44,37 @@ init([]) ->
 %%--------------------------------------------------------------------
 
 auth_validation_children() ->
-    case application:get_env(aws, auth_validation_enabled, false) of
+    case auth_validation_enabled() of
         true ->
-            register_collectors(),
             [semaphore_spec()];
         _ ->
             []
     end.
 
-%% Register the Prometheus collectors this plugin owns. A collector has no
-%% process (it is a callback module registered with prometheus_registry), so no
-%% child spec is needed. rabbitmq_prometheus is a declared dependency (which
-%% transitively pulls in prometheus), so a failure here is a real fault and must
-%% surface rather than be swallowed.
-register_collectors() ->
-    aws_auth_validate_metrics:register().
+auth_validation_enabled() ->
+    application:get_env(aws, auth_validation_enabled, false) =:= true.
 
-%% Tear down every collector register_collectors/0 owns so none outlives the
-%% application: an orphan stays on the default registry and keeps running
-%% collect_mf/2 on every scrape. Called from aws_app:stop/1.
+%% Register each feature's Prometheus collector when that feature is enabled,
+%% symmetric with deregister_collectors/0. A collector has no process (it is a
+%% callback module registered with prometheus_registry), so no child spec is
+%% needed. rabbitmq_prometheus is a declared dependency (which transitively
+%% pulls in prometheus), so a failure here is a real fault and must surface
+%% rather than be swallowed.
+register_collectors() ->
+    maybe_register(auth_validation_enabled(), aws_auth_validate_metrics),
+    maybe_register(aws_node_health_config:enabled(), aws_node_health_metrics).
+
+maybe_register(true, Mod) -> Mod:register();
+maybe_register(false, _Mod) -> ok.
+
+%% Tear down every Prometheus collector register_collectors/0 registers, so
+%% none outlives the application: an orphan stays on the default registry and
+%% keeps running collect_mf/2 on every scrape. Each is deregistered only if
+%% actually registered, so listing both regardless of which feature is enabled
+%% is safe. Called from aws_app:stop/1.
 deregister_collectors() ->
-    lists:foreach(fun deregister_collector/1, [aws_auth_validate_metrics]).
+    deregister_collector(aws_auth_validate_metrics),
+    deregister_collector(aws_node_health_metrics).
 
 %% Deregister one collector if it is currently registered. Driven by actual
 %% registration state rather than the feature toggle, so a still-registered
@@ -103,10 +118,6 @@ semaphore_config() ->
 node_health_children() ->
     case aws_node_health_config:enabled() of
         true ->
-            %% Register the collector before the worker so a scrape between
-            %% registration and the first sample simply reports the worker as
-            %% unavailable rather than missing the collector entirely.
-            aws_node_health_metrics:register(),
             [node_health_sup_spec()];
         false ->
             []
