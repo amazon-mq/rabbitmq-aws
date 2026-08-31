@@ -49,6 +49,8 @@ The "every other node pristine" gate on P1, and P3's dominance-with-present-othe
 
 Attribution needs at least three observed nodes (a two-node view cannot tell which side of a link is bad), so below that the detector returns `clean` rather than guess; Amazon MQ clusters are three-node. It relies on the healthy nodes' views of the suspect, so the suspect's own (unreliable) gossip is not required.
 
+For how the detector is tested - the automated suites and the in-vivo validation procedure, with a reproducible probe that recovers the firing path and a fault-injection driver - see [NODE_HEALTH_TESTING.md](NODE_HEALTH_TESTING.md).
+
 ## Configuration
 
 All keys are optional; the feature is disabled unless the toggle is set.
