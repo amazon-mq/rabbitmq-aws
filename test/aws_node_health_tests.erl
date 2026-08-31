@@ -341,3 +341,52 @@ p3_requires_suspect_own_row_test() ->
     B = #{rmq1 => #{rmq0 => 0.84, rmq2 => 0.10}, rmq2 => #{rmq0 => 0.85, rmq1 => 0.10}},
     Window = lists:duplicate(15, A) ++ lists:duplicate(15, B),
     ?assertEqual(clean, maps:get(verdict, aws_node_health:analyze(#{}, Window))).
+
+%% Continuous-loss hand-off, part 1 of 2 (sustained phase). In vivo a continuous
+%% ~50% loss fault pins the failure-detector probability high: the inbound series
+%% is extreme across the whole window with no oscillation, so the flap count
+%% decays to zero and P1 can no longer fire. P2 must keep holding the suspect on
+%% the sustained-extreme fraction alone - this is the regression for the tail
+%% under-attribution scare (a degraded node reading `clean` once its flaps age
+%% out), which measurement showed does not happen. The fault is also unidirectional
+%% at the detector (single-interface egress loss): rmq0 still sees its own peers
+%% normally, so its own-outbound row is low and P3 correctly abstains. The
+%% confidence equals the extreme fraction (1.0), P2's signature - not the flap
+%% ratio (P1) or an own-outbound value (P3) - which pins the attributing path
+%% through the public result.
+sustained_egress_fault_is_held_via_p2_without_flaps_test() ->
+    Snapshot = #{
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.0},
+        %% rmq0's own row: it sees both peers fine (egress-only, not bidirectional).
+        rmq0 => #{rmq1 => 0.1, rmq2 => 0.1}
+    },
+    Window = lists:duplicate(30, Snapshot),
+    #{verdict := Verdict, scores := Scores} = aws_node_health:analyze(#{}, Window),
+    ?assertEqual({suspect, rmq0}, Verdict),
+    ?assertEqual(1.0, maps:get(confidence, maps:get(rmq0, Scores))).
+
+%% Continuous-loss hand-off, part 2 of 2 (onset phase). Packet loss is stochastic,
+%% so at the onset of a continuous fault the probability oscillates across the
+%% extreme threshold before it pins high. Those crossings trip P1 within a few
+%% seconds - well before the extreme fraction can fill P2's gate. Here rmq0
+%% crosses twice (flap_min) while the extreme fraction is far below extreme_frac,
+%% so P2 cannot fire yet; P1 attributes the onset. The confidence equals the flap
+%% ratio (flaps / (2 * flap_min) = 0.5), P1's signature, distinct from the P2
+%% fraction the sustained phase above reports - together the two tests pin the
+%% onset -> sustained hand-off with no attribution gap.
+continuous_loss_onset_is_attributed_via_p1_test() ->
+    ExtremeView = #{
+        rmq1 => #{rmq0 => 1.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 1.0, rmq1 => 0.0}
+    },
+    QuietView = #{
+        rmq1 => #{rmq0 => 0.0, rmq2 => 0.0},
+        rmq2 => #{rmq0 => 0.0, rmq1 => 0.0}
+    },
+    %% Newest-first window; chronological rmq0 series is [0 x27, 1, 0, 1] - two
+    %% upward crossings (flap_min), extreme fraction 2/30, far below extreme_frac.
+    Window = [ExtremeView, QuietView, ExtremeView] ++ lists:duplicate(27, QuietView),
+    #{verdict := Verdict, scores := Scores} = aws_node_health:analyze(#{}, Window),
+    ?assertEqual({suspect, rmq0}, Verdict),
+    ?assertEqual(0.5, maps:get(confidence, maps:get(rmq0, Scores))).
