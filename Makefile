@@ -8,7 +8,11 @@ define PROJECT_ENV
 []
 endef
 
-DEPS = rabbit_common rabbit rabbitmq_management rabbitmq_prometheus gun jose
+# aws depends on aten directly (aws_node_health_worker calls aten_sink). ra
+# also declares dep_aten, so keep this pin in sync with rabbitmq/ra's Makefile
+# to avoid a version-set conflict between the two declarations.
+dep_aten = hex 0.6.0 aten
+DEPS = rabbit_common rabbit rabbitmq_management rabbitmq_prometheus gun jose aten
 TEST_DEPS = meck proper rabbitmq_ct_helpers rabbitmq_ct_client_helpers rabbitmq_auth_backend_ldap rabbitmq_auth_backend_http rabbitmq_auth_backend_oauth2
 LOCAL_DEPS = crypto inets ssl xmerl public_key eldap
 

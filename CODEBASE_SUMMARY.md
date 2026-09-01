@@ -14,7 +14,10 @@ The `rabbitmq-aws` plugin enables RabbitMQ to fetch sensitive configuration data
 
 ```
 aws_app (OTP Application)
-  └── aws_sup (Supervisor - currently empty)
+  └── aws_sup (Supervisor; children are per-feature and toggle-gated)
+        ├── aws_auth_validate_semaphore   (when aws.auth_validation.enabled)
+        └── aws_node_health_sup           (when aws.node_health.enabled)
+              └── aws_node_health_worker
   └── aws_arn_config (Boot Step Handler)
 ```
 
@@ -137,7 +140,24 @@ Low-level application environment manipulation (update/delete operations).
 #### `aws_util.erl`
 Credential management utilities, primarily for resetting AWS credentials after role assumption.
 
+### Node Health Modules
 
+Attribute a partially-degraded cluster node from the node failure detector's per-peer reachability estimates. Off by default; see [NODE_HEALTH.md](NODE_HEALTH.md) for the feature reference.
+
+#### `aws_node_health.erl`
+**Purpose:** Pure scorer. Given a window of observer-by-peer probability snapshots, returns a verdict (`clean` | `{suspect, Node}` | `cluster_wide`) plus per-node `inbound`/`confidence`/`suspected` scores. Three-path decision, evaluated P2 then P3 then the cluster-wide guard then P1: a sustained-extreme path (P2, for continuous faults that pin the probability high), a bidirectional path (P3, for a masked fault under cluster-wide congestion - the candidate's own outbound row must show every peer degraded and dominate the other nodes' by a margin, and every other node must have a usable (present and non-empty) own gossip row), and a flap-rate path (P1, for oscillating/intermittent faults - candidate is the node with the most extreme-crossing flaps, others must be pristine on both median and flap count). Attribution runs only with three or more observed nodes; below that, returns `clean`. No side effects; tested against captured probability fixtures and example-based cases, plus property-based invariants (`prop_aws_node_health_SUITE`: never crashes, verdict and scores never contradict, a symmetric matrix is never attributed, below three nodes is clean).
+
+#### `aws_node_health_worker.erl`
+**Purpose:** `gen_server` that each tick samples the local per-peer probabilities (`aten_sink:get_failure_probabilities/0`), gossips its row to the other cluster members, evicts stale rows from both the per-tick snapshot and its persistent state (so node names that never return, e.g. after an ASG instance replacement, do not accumulate), maintains the rolling window, and recomputes the verdict via `aws_node_health`. Applies hysteresis (debounce) so the published `suspected` flag flips only after a suspect has held for `confirm_ticks` consecutive cycles and clears after `clear_ticks` cycles; the `cluster_wide` verdict is debounced independently with the same thresholds (a confirmed single-node suspect takes precedence), holding the debounced result for the collector to read at scrape time. The cycle path is defensive against the degraded-cluster conditions it observes: the sampling call is bounded in a monitored short-lived process, the peer-list read is wrapped so a metadata-store exception cannot crash the cycle, and gossiped rows whose keys are not node names or whose values are not probabilities in [0,1] are rejected before they reach the scorer. Sampler, peer list, and local node are injectable for testing.
+
+#### `aws_node_health_sup.erl`
+**Purpose:** Dedicated sub-supervisor for the node-health worker (`one_for_one`, intensity 5 / period 10). Isolating the worker under its own supervisor means a crash-looping worker consumes only its own restart budget and cannot cascade a top-level restart that would also take down the unrelated auth-validation worker.
+
+#### `aws_node_health_metrics.erl`
+**Purpose:** `prometheus_collector` that reads the worker at scrape time and emits the `rabbitmq_aws_node_health_peer_down_probability`, `rabbitmq_aws_node_health_peer_down_suspected`, and `rabbitmq_aws_node_health_peer_down_confidence` per-peer gauges plus the unlabelled cluster-level `rabbitmq_aws_node_health_cluster_congested` gauge (1 when the debounced verdict is `cluster_wide`). Crash-safe: a missing or busy worker yields no metrics rather than failing the scrape.
+
+#### `aws_node_health_config.erl`
+**Purpose:** Single home for the feature's application-environment reads (the enable toggle and the numeric knobs), their defaults and bounds, and the assembled worker settings.
 
 ## Configuration Schema
 
@@ -184,6 +204,14 @@ The plugin uses Cuttlefish schema (`priv/schema/aws.schema`) to translate `rabbi
 
 **STS Custom Headers:**
 - `aws.sts.custom_headers.$header` - Custom headers for STS calls
+
+**Node Health Detection:**
+- `aws.node_health.enabled` - Main toggle (default: false)
+- `aws.node_health.interval_ms` - Sampling/recompute period (default: 1000)
+- `aws.node_health.window` - Rolling decision window size (default: 30)
+- `aws.node_health.stale_ticks` - Evict a peer row not refreshed within this many ticks (default: 5)
+- `aws.node_health.confirm_ticks` - Hysteresis: consecutive cycles a node must be the raw suspect before `suspected` is published (default: 3)
+- `aws.node_health.clear_ticks` - Hysteresis: consecutive cycles without being the raw suspect before a published suspect clears (default: 3)
 
 ### Schema Translation Logic
 
@@ -283,6 +311,8 @@ application:set_env()
 - `rabbitmq_aws` - AWS API client library
 - `rabbit` - RabbitMQ core
 - `rabbitmq_management` - Management plugin (for HTTP API)
+- `rabbitmq_prometheus` - Prometheus endpoint (exposes the node-health gauges)
+- `aten` - Ra's accrual failure detector; the node-health worker reads its per-peer probabilities (keep the `dep_aten` pin in sync with `rabbitmq/ra`)
 
 ### Build Dependencies
 - `meck` - Mocking framework

@@ -435,5 +435,40 @@
     {aws_auth_validation_allowed_fields,
         "aws.auth_validation.allowed_fields.ldap = servers,port,password_arn",
         [{aws, [{auth_validation_allowed_fields, [{<<"ldap">>, [<<"servers">>, <<"port">>, <<"password_arn">>]}]}]}],
-        [aws_auth_validation_allowed_fields]}
+        [aws_auth_validation_allowed_fields]},
+
+    {aws_node_health_enabled,
+        "aws.node_health.enabled = true",
+        [{aws, [{node_health_enabled, true}]}],
+        [aws_node_health_enabled]},
+
+    {aws_node_health_disabled,
+        "aws.node_health.enabled = false",
+        [{aws, [{node_health_enabled, false}]}],
+        [aws_node_health_disabled]},
+
+    {aws_node_health_interval_ms,
+        "aws.node_health.interval_ms = 2000",
+        [{aws, [{node_health_interval_ms, 2000}]}],
+        [aws_node_health_interval_ms]},
+
+    {aws_node_health_window,
+        "aws.node_health.window = 60",
+        [{aws, [{node_health_window, 60}]}],
+        [aws_node_health_window]},
+
+    {aws_node_health_stale_ticks,
+        "aws.node_health.stale_ticks = 8",
+        [{aws, [{node_health_stale_ticks, 8}]}],
+        [aws_node_health_stale_ticks]},
+
+    {aws_node_health_confirm_ticks,
+        "aws.node_health.confirm_ticks = 4",
+        [{aws, [{node_health_confirm_ticks, 4}]}],
+        [aws_node_health_confirm_ticks]},
+
+    {aws_node_health_clear_ticks,
+        "aws.node_health.clear_ticks = 6",
+        [{aws, [{node_health_clear_ticks, 6}]}],
+        [aws_node_health_clear_ticks]}
 ].

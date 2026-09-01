@@ -120,6 +120,32 @@ See **[AUTH_VALIDATION.md](AUTH_VALIDATION.md)** for the full reference: the
 per-method behaviour, request fields, response categories, security model, and
 the configuration keys needed to enable it.
 
+## Node Health Detection
+
+A partially-degraded cluster node -- one whose host or uplink drops a large
+fraction of packets while the node still answers and participates -- is hard to
+spot with reachability-based health checks. This plugin turns the broker's
+existing node failure detector into per-node Prometheus metrics that attribute
+a degraded node so it can be replaced early:
+
+```
+rabbitmq_aws_node_health_peer_down_probability{peer="..."}
+rabbitmq_aws_node_health_peer_down_suspected{peer="..."}
+rabbitmq_aws_node_health_peer_down_confidence{peer="..."}
+rabbitmq_aws_node_health_cluster_congested
+```
+
+Each node samples its per-peer reachability, gossips it to the others so every
+node holds the full picture, and decides whether one node is degraded, or
+whether the condition is cluster-wide (and so must not be blamed on a single
+node). A dumb alarm can threshold `rabbitmq_aws_node_health_peer_down_suspected` to catch a
+single degraded node, or watch the unlabelled `rabbitmq_aws_node_health_cluster_congested`
+(1 when the condition is symmetric across the cluster) for uniform congestion.
+The feature is admin-neutral, opt-in, and disabled by default.
+
+See **[NODE_HEALTH.md](NODE_HEALTH.md)** for the full reference: the metrics, the
+detection logic, and the configuration keys needed to enable it.
+
 ## Installation
 
 Visit the [GitHub Releases](https://github.com/amazon-mq/rabbitmq-aws/releases)

@@ -293,3 +293,42 @@ fun(Conf) ->
         {"aws.arns.auth_oauth2.oauth_providers.https.cacertfile", aws_arn_config_oauth2, providers_https_cacertfile}
     ])
 end}.
+
+%% @doc Main toggle for the node-health detector (default DISABLED). When
+%% off, no worker runs and no peer-health metrics are registered. Like
+%% aws.auth_validation.enabled, the default lives in code
+%% (aws_node_health_config:enabled/0 reads this with a `false' fallback) and is
+%% intentionally NOT declared here so the key is only emitted into the
+%% generated config when an operator sets it.
+{mapping, "aws.node_health.enabled", "aws.node_health_enabled",
+    [{datatype, {enum, [true, false]}}]}.
+
+%% @doc Sampling and recompute period in milliseconds (effective default
+%% 1000). The bounds (500..60000) are enforced at runtime by
+%% aws_node_health_config:get_int/4, which falls back to the default for a value
+%% below the 500 ms floor or otherwise out of range.
+{mapping, "aws.node_health.interval_ms", "aws.node_health_interval_ms",
+    [{datatype, integer}]}.
+
+%% @doc Number of snapshots retained in the rolling decision window (effective
+%% default 30). Bound enforced at runtime by aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.window", "aws.node_health_window",
+    [{datatype, integer}]}.
+
+%% @doc Drop a peer's row from the matrix if it has not refreshed within this
+%% many ticks (effective default 5). Bound enforced at runtime by
+%% aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.stale_ticks", "aws.node_health_stale_ticks",
+    [{datatype, integer}]}.
+
+%% @doc Hysteresis: a peer must be the raw suspect for this many consecutive
+%% ticks before its `suspected' flag is published (effective default 3). Bound
+%% enforced at runtime by aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.confirm_ticks", "aws.node_health_confirm_ticks",
+    [{datatype, integer}]}.
+
+%% @doc Hysteresis: a published suspect stays suspected until it is no longer the
+%% raw suspect for this many consecutive ticks (effective default 3). Bound
+%% enforced at runtime by aws_node_health_config:get_int/3.
+{mapping, "aws.node_health.clear_ticks", "aws.node_health_clear_ticks",
+    [{datatype, integer}]}.

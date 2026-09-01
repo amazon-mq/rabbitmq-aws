@@ -17,16 +17,23 @@ start_link() ->
     supervisor:start_link({local, ?MODULE}, ?MODULE, []).
 
 init([]) ->
-    %% Tolerate a few transient worker crashes before giving up: a very low
-    %% intensity would tear down the whole supervisor on a second crash in a
-    %% short window. The validation worker is an independent gen_server, so
-    %% allow several restarts in a slightly wider window before escalating.
+    %% Tolerate a few transient child crashes before giving up. Each feature
+    %% is scoped so it consumes its own restart budget rather than the
+    %% top-level's: the auth_validation semaphore runs directly under this
+    %% supervisor, while node_health runs under its own aws_node_health_sup
+    %% (see node_health_children/0). A crash-looping feature therefore takes
+    %% only itself offline, not the plugin's other features.
     SupFlags = #{
         strategy => one_for_one,
         intensity => 5,
         period => 10
     },
-    ChildSpecs = auth_validation_children(),
+    %% Register the collectors before building the child specs so each is
+    %% present before its worker starts (a scrape landing between registration
+    %% and the first sample reports the worker as unavailable rather than the
+    %% collector as missing).
+    register_collectors(),
+    ChildSpecs = auth_validation_children() ++ node_health_children(),
     {ok, {SupFlags, ChildSpecs}}.
 
 %%--------------------------------------------------------------------
@@ -37,27 +44,37 @@ init([]) ->
 %%--------------------------------------------------------------------
 
 auth_validation_children() ->
-    case application:get_env(aws, auth_validation_enabled, false) of
+    case auth_validation_enabled() of
         true ->
-            register_collectors(),
             [semaphore_spec()];
         _ ->
             []
     end.
 
-%% Register the Prometheus collectors this plugin owns. A collector has no
-%% process (it is a callback module registered with prometheus_registry), so no
-%% child spec is needed. rabbitmq_prometheus is a declared dependency (which
-%% transitively pulls in prometheus), so a failure here is a real fault and must
-%% surface rather than be swallowed.
-register_collectors() ->
-    aws_auth_validate_metrics:register().
+auth_validation_enabled() ->
+    application:get_env(aws, auth_validation_enabled, false) =:= true.
 
-%% Tear down every collector register_collectors/0 owns so none outlives the
-%% application: an orphan stays on the default registry and keeps running
-%% collect_mf/2 on every scrape. Called from aws_app:stop/1.
+%% Register each feature's Prometheus collector when that feature is enabled,
+%% symmetric with deregister_collectors/0. A collector has no process (it is a
+%% callback module registered with prometheus_registry), so no child spec is
+%% needed. rabbitmq_prometheus is a declared dependency (which transitively
+%% pulls in prometheus), so a failure here is a real fault and must surface
+%% rather than be swallowed.
+register_collectors() ->
+    maybe_register(auth_validation_enabled(), aws_auth_validate_metrics),
+    maybe_register(aws_node_health_config:enabled(), aws_node_health_metrics).
+
+maybe_register(true, Mod) -> Mod:register();
+maybe_register(false, _Mod) -> ok.
+
+%% Tear down every Prometheus collector register_collectors/0 registers, so
+%% none outlives the application: an orphan stays on the default registry and
+%% keeps running collect_mf/2 on every scrape. Each is deregistered only if
+%% actually registered, so listing both regardless of which feature is enabled
+%% is safe. Called from aws_app:stop/1.
 deregister_collectors() ->
-    lists:foreach(fun deregister_collector/1, [aws_auth_validate_metrics]).
+    deregister_collector(aws_auth_validate_metrics),
+    deregister_collector(aws_node_health_metrics).
 
 %% Deregister one collector if it is currently registered. Driven by actual
 %% registration state rather than the feature toggle, so a still-registered
@@ -89,15 +106,32 @@ semaphore_spec() ->
     }.
 
 semaphore_config() ->
-    #{max => get_int_env(auth_validation_max_concurrent, 5, 100)}.
+    #{max => aws_app_env:get_int_env(aws, auth_validation_max_concurrent, 5, 100)}.
 
-%% An out-of-range or non-integer value falls back to Default rather than
-%% failing the boot; the schema is what reports a bad value to the operator.
--spec get_int_env(atom(), pos_integer(), pos_integer()) -> pos_integer().
-get_int_env(Key, Default, MaxBound) ->
-    case application:get_env(aws, Key) of
-        {ok, N} when is_integer(N), N > 0, N =< MaxBound ->
-            N;
-        _ ->
-            Default
+%%--------------------------------------------------------------------
+%% Node-health feature: like auth validation, workers start only when the
+%% toggle is on. When on, the Prometheus collector is registered and the
+%% gossip worker is started; when off, the supervisor stays empty and no
+%% peer-health metrics are emitted.
+%%--------------------------------------------------------------------
+
+node_health_children() ->
+    case aws_node_health_config:enabled() of
+        true ->
+            [node_health_sup_spec()];
+        false ->
+            []
     end.
+
+%% The worker lives under its own supervisor (aws_node_health_sup) so that a
+%% crash-looping worker consumes only its own restart budget and cannot cascade
+%% a top-level restart that would also take down auth_validation.
+node_health_sup_spec() ->
+    #{
+        id => aws_node_health_sup,
+        start => {aws_node_health_sup, start_link, []},
+        restart => permanent,
+        shutdown => infinity,
+        type => supervisor,
+        modules => [aws_node_health_sup]
+    }.
