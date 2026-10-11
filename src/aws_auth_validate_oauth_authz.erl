@@ -43,6 +43,11 @@
 %% The broker functions used (all verified pure -- no app-env / ETS / mnesia on
 %% this path; they read all config from the #resource_server{} record we build):
 %%   * rabbit_oauth2_resource_server:new_resource_server/1  -- record constructor
+%%   * rabbit_oauth2_schema:tokenize_additional_scopes_key/1 -- (when present) splits
+%%       the caller's `additional_scopes_key' the SAME way rabbitmq.conf does, so an
+%%       escaped `\.' stays a literal dot in a flat claim name (rabbitmq/rabbitmq-server
+%%       #16947). Absent on pre-fix series -> we pass the raw binary through and the
+%%       backend's own split_path/1 applies (see tokenize_additional_scopes_key/1).
 %%   * rabbit_auth_backend_oauth2:normalize_token_scope/2   -- alias / additional-
 %%       scopes-key / prefix-filter expansion (the IAM `scope_aliases' path)
 %%   * rabbit_auth_backend_oauth2:get_expanded_scopes/3     -- {vhost} placeholder
@@ -99,6 +104,7 @@
 -define(OAUTH2_MOD, rabbit_auth_backend_oauth2).
 -define(SCOPE_MOD, rabbit_oauth2_scope).
 -define(RS_MOD, rabbit_oauth2_resource_server).
+-define(SCHEMA_MOD, rabbit_oauth2_schema).
 
 %% Fixed reasons. NOTE on granularity: the fixed-category rule guards against
 %% leaking BROKER INFRASTRUCTURE or an SSRF target (hostnames, IPs, raw
@@ -312,7 +318,9 @@ evaluate(Params, Check, Claims) ->
     %% brokers that support it without a record-shape dependency.
     RS = RS0#resource_server{
         scope_aliases = maps:get(scope_aliases, Params, undefined),
-        additional_scopes_key = maps:get(additional_scopes_key, Params, undefined),
+        additional_scopes_key = tokenize_additional_scopes_key(
+            maps:get(additional_scopes_key, Params, undefined)
+        ),
         scope_prefix = maps:get(scope_prefix, Params, RS0#resource_server.scope_prefix)
     },
     Syntax = maps:get(scope_pattern_syntax, Params, wildcard),
@@ -371,6 +379,44 @@ decide(Scopes, Resource, PermAtom, Syntax) ->
 to_permission_atom(<<"configure">>) -> configure;
 to_permission_atom(<<"write">>) -> write;
 to_permission_atom(<<"read">>) -> read.
+
+%% Interpret the customer-supplied `additional_scopes_key' exactly as the broker's
+%% own config path does. The caller sends a plain string (the request contract is
+%% unchanged); its dots are ambiguous: an UNESCAPED `.' is a nesting separator,
+%% while an ESCAPED `\.' is a literal dot in a flat claim name -- the case that
+%% matters for STS/OIDC keys like `https://sts\.amazonaws\.com/.request_tags.scope'
+%% (rabbitmq/rabbitmq-server #16947).
+%%
+%% When the broker exposes rabbit_oauth2_schema:tokenize_additional_scopes_key/1
+%% (the post-#16947 series), we call it so the endpoint splits the key IDENTICALLY
+%% to `auth_oauth2.additional_scopes_key' in rabbitmq.conf: it returns [[binary()]]
+%% (a list of paths, each a list of segments) with `\.' kept literal, and the
+%% record's list-form `additional_scopes_key' clause consumes it WITHOUT re-splitting.
+%% Parity is preserved in both directions -- an unescaped key still tokenizes to the
+%% same nested path split_path/1 produced, so it still fails to resolve a flat dotted
+%% claim (the pinned #16947 behavior), and an escaped key now resolves.
+%%
+%% Fallback: on a pre-#16947 broker series the tokenizer is absent. We pass the raw
+%% binary through unchanged, so normalize_token_scope/2 takes its own binary clause
+%% (split_path/1) -- the endpoint behaves exactly as it did before this change. The
+%% feature stays available on old brokers; it simply lacks escaped-dot support there,
+%% matching what those brokers themselves can do.
+tokenize_additional_scopes_key(undefined) ->
+    undefined;
+tokenize_additional_scopes_key(Key) when is_binary(Key) ->
+    %% module_ready/1 (code:ensure_loaded) before function_exported/3: a bare
+    %% function_exported returns false for a beam that is on the path but not yet
+    %% loaded, which would make escaped-dot support depend on load order (the same
+    %% trap available/0 documents). ensure_loaded triggers the load if the beam is
+    %% present, so this reflects "is the tokenizer installed", not "has it been
+    %% called yet this boot".
+    case
+        module_ready(?SCHEMA_MOD) andalso
+            erlang:function_exported(?SCHEMA_MOD, tokenize_additional_scopes_key, 1)
+    of
+        true -> ?SCHEMA_MOD:tokenize_additional_scopes_key(Key);
+        false -> Key
+    end.
 
 -else.
 
