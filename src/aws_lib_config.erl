@@ -604,10 +604,11 @@ lookup_credentials_from_config(_, AccessKey, SecretKey, SessionToken, Config) ->
 %% @doc Check to see if the shared credentials file exists and if it does,
 %%      invoke ``lookup_credentials_from_shared_creds_section/2`` to attempt to
 %%      get the credentials values out of it. If the file does not exist,
-%%      attempt to lookup the values from the EC2 instance metadata service.
+%%      attempt to lookup the values from the container credentials endpoint or
+%%      the EC2 instance metadata service.
 %% @end
 lookup_credentials_from_file(_, {error, _}, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
+    lookup_credentials_from_container_or_imds(Config);
 lookup_credentials_from_file(Profile, Credentials, Config) ->
     Section = proplists:get_value(Profile, Credentials),
     lookup_credentials_from_section(Section, Config).
@@ -620,10 +621,11 @@ lookup_credentials_from_file(Profile, Credentials, Config) ->
 %% @doc Return the access key and secret access key if they are set in
 %%      for the specified profile from the shared credentials file. If the
 %%      profile is not set or the values are not set in the profile, attempt to
-%%      lookup the values from the EC2 instance metadata service.
+%%      lookup the values from the container credentials endpoint or the EC2
+%%      instance metadata service.
 %% @end
 lookup_credentials_from_section(undefined, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
+    lookup_credentials_from_container_or_imds(Config);
 lookup_credentials_from_section(Credentials, Config) ->
     AccessKey = proplists:get_value(aws_access_key_id, Credentials, undefined),
     SecretKey = proplists:get_value(aws_secret_access_key, Credentials, undefined),
@@ -641,9 +643,9 @@ lookup_credentials_from_section(Credentials, Config) ->
 %%      access key and secret access key are both set.
 %% @end
 lookup_credentials_from_proplist(undefined, _, _, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
+    lookup_credentials_from_container_or_imds(Config);
 lookup_credentials_from_proplist(_, undefined, _, Config) ->
-    lookup_credentials_from_instance_metadata(Config);
+    lookup_credentials_from_container_or_imds(Config);
 lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
     Creds = #aws_credentials{
         access_key = AccessKey,
@@ -652,6 +654,388 @@ lookup_credentials_from_proplist(AccessKey, SecretKey, SessionToken, Config) ->
         expiration = undefined
     },
     {ok, Creds, Config}.
+
+%% =============================================================================
+%% Container Credentials (ECS/EKS)
+%%
+%% The AWS credential chain for containers inserts between config/credentials
+%% files and IMDS. When AWS_CONTAINER_CREDENTIALS_RELATIVE_URI or
+%% AWS_CONTAINER_CREDENTIALS_FULL_URI is set, credentials are fetched from that
+%% endpoint. If the env var is set but the fetch fails, we HARD ERROR (no
+%% fallthrough to IMDS) -- falling through would silently use the EC2 host
+%% instance role instead of the intended ECS task role.
+%% =============================================================================
+
+-spec lookup_credentials_from_container_or_imds(aws_config()) ->
+    {ok, aws_credentials(), aws_config()} | error().
+%% @doc Funnel that ALL IMDS fallthrough sites call. Checks for container
+%%      credential env vars; if present, fetches from the container endpoint.
+%%      If absent, falls through to IMDS as before.
+%% @end
+lookup_credentials_from_container_or_imds(Config) ->
+    case container_credentials_url() of
+        {ok, URL} ->
+            try container_auth_token() of
+                Token ->
+                    case fetch_container_credentials(URL, Token) of
+                        {ok, Creds} ->
+                            {ok, Creds, Config};
+                        {error, Reason} ->
+                            %% Hard error: the operator explicitly configured container
+                            %% credentials (env var is set) but the fetch failed. Do NOT
+                            %% fall through to IMDS -- that would silently use the EC2
+                            %% host instance role instead of the intended task role.
+                            %% Log only the error category, not the full reason -- the
+                            %% reason may contain response body fragments (P0 R6).
+                            ?LOG_ERROR(
+                                "Container credentials fetch failed: ~tp. "
+                                "Not falling through to IMDS because "
+                                "AWS_CONTAINER_CREDENTIALS_*_URI is set.",
+                                [sanitize_container_error(Reason)]
+                            ),
+                            {error, {container_credentials_failed, Reason}}
+                    end
+            catch
+                error:TokenErr ->
+                    %% Token file configured but unreadable/oversized -- hard error.
+                    ?LOG_ERROR(
+                        "Container credentials authorization token error: ~tp. "
+                        "Not falling through to IMDS.",
+                        [TokenErr]
+                    ),
+                    {error, {container_credentials_failed, {token_error, TokenErr}}}
+            end;
+        {error, uri_not_allowed, Reason} ->
+            %% FULL_URI failed SSRF allowlist validation -- hard error, no fallthrough.
+            ?LOG_ERROR(
+                "Container credentials FULL_URI not allowed: ~tp. "
+                "Not falling through to IMDS.",
+                [Reason]
+            ),
+            {error, {container_credentials_failed, Reason}};
+        not_configured ->
+            lookup_credentials_from_instance_metadata(Config)
+    end.
+
+-spec container_credentials_url() ->
+    {ok, string()} | not_configured | {error, uri_not_allowed, term()}.
+%% @doc Build the container credentials URL from environment variables.
+%%      AWS_CONTAINER_CREDENTIALS_RELATIVE_URI: a path appended to the
+%%      ECS credentials host (169.254.170.2).
+%%      AWS_CONTAINER_CREDENTIALS_FULL_URI: a complete URL subject to SSRF
+%%      allowlist validation.
+%%      RELATIVE_URI takes precedence (matches AWS SDK behavior).
+%% @end
+container_credentials_url() ->
+    case os:getenv("AWS_CONTAINER_CREDENTIALS_RELATIVE_URI") of
+        RelUri when is_list(RelUri), RelUri =/= "" ->
+            BaseHost = container_credentials_base_host(),
+            {ok, "http://" ++ BaseHost ++ RelUri};
+        _ ->
+            case os:getenv("AWS_CONTAINER_CREDENTIALS_FULL_URI") of
+                FullUri when is_list(FullUri), FullUri =/= "" ->
+                    case validate_full_uri(FullUri) of
+                        ok -> {ok, FullUri};
+                        {error, Reason} -> {error, uri_not_allowed, Reason}
+                    end;
+                _ ->
+                    not_configured
+            end
+    end.
+
+-spec container_credentials_base_host() -> string().
+%% @doc Return the base host for RELATIVE_URI. Defaults to the ECS task
+%%      metadata endpoint (169.254.170.2). In test builds only, an
+%%      application env override allows integration tests to point at a
+%%      local stub; this compiles out in production.
+%% @end
+-ifdef(TEST).
+container_credentials_base_host() ->
+    case application:get_env(aws, container_credentials_host_override) of
+        {ok, Host} when is_list(Host), Host =/= "" ->
+            Host;
+        _ ->
+            ?ECS_CREDENTIALS_HOST
+    end.
+-else.
+container_credentials_base_host() ->
+    ?ECS_CREDENTIALS_HOST.
+-endif.
+
+-spec validate_full_uri(string()) -> ok | {error, term()}.
+%% @doc SSRF allowlist for AWS_CONTAINER_CREDENTIALS_FULL_URI.
+%%
+%%      The AWS SDKs restrict this to:
+%%        - Loopback (127.0.0.0/8, ::1)
+%%        - ECS/EKS link-local (169.254.170.2, 169.254.170.23, fd00:ec2::23)
+%%        - OR any host when the scheme is HTTPS (TLS authenticates the endpoint)
+%%
+%%      This is an ALLOWLIST (not a denylist). Plaintext HTTP is ONLY permitted
+%%      to loopback or the specific ECS/EKS link-local addresses above.
+%%
+%%      We do NOT reuse aws_auth_validate_net.erl -- that module uses a denylist
+%%      model (blocks known-bad CIDRs) for a different use case (outbound
+%%      validation to arbitrary customer servers). Our use case is simpler and
+%%      stricter: allowlist a small set for plaintext, HTTPS bypasses.
+%% @end
+validate_full_uri(URI) ->
+    case aws_lib_uri:parse(URI) of
+        {ok, UriMap} ->
+            Scheme = string:lowercase(
+                unicode:characters_to_list(maps:get(scheme, UriMap, ""))
+            ),
+            case Scheme of
+                "https" ->
+                    %% HTTPS to any host is allowed -- TLS authenticates the endpoint.
+                    ok;
+                "http" ->
+                    Host = aws_lib_uri:host(UriMap),
+                    case is_allowed_plaintext_host(Host) of
+                        true -> ok;
+                        false -> {error, {full_uri_not_allowed, Host}}
+                    end;
+                Other ->
+                    {error, {unsupported_scheme, Other}}
+            end;
+        {error, Reason} ->
+            {error, {malformed_full_uri, Reason}}
+    end.
+
+-spec is_allowed_plaintext_host(string()) -> boolean().
+%% @doc Return true if the host is safe for plaintext HTTP container credential
+%%      requests. Only loopback and the specific ECS/EKS link-local addresses
+%%      are permitted.
+%% @end
+is_allowed_plaintext_host(Host) ->
+    case inet:parse_address(Host) of
+        {ok, {127, _, _, _}} ->
+            true;
+        {ok, {0, 0, 0, 0, 0, 0, 0, 1}} ->
+            %% ::1
+            true;
+        {ok, IPv4} when tuple_size(IPv4) =:= 4 ->
+            is_ecs_link_local_v4(IPv4);
+        {ok, IPv6} when tuple_size(IPv6) =:= 8 ->
+            is_ecs_link_local_v6(IPv6);
+        {error, einval} ->
+            %% Not a literal IP -- hostnames are NOT allowed for plaintext.
+            false
+    end.
+
+is_ecs_link_local_v4(IP) ->
+    case inet:parse_address(?ECS_CREDENTIALS_HOST) of
+        {ok, IP} ->
+            true;
+        _ ->
+            case inet:parse_address(?ECS_CREDENTIALS_HOST_ALT) of
+                {ok, IP} -> true;
+                _ -> false
+            end
+    end.
+
+is_ecs_link_local_v6(IP) ->
+    case inet:parse_address(?ECS_CREDENTIALS_HOST_V6) of
+        {ok, IP} -> true;
+        _ -> false
+    end.
+
+-spec container_auth_token() -> string() | undefined.
+%% @doc Read the authorization token for the container credentials endpoint.
+%%      AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE takes precedence over
+%%      AWS_CONTAINER_AUTHORIZATION_TOKEN (matches SDK behavior).
+%%      If TOKEN_FILE is set but unreadable/oversized, raises an error tuple
+%%      that the caller treats as a hard failure.
+%%      NEVER logs the token value (P0 R6 -- no credential leakage).
+%% @end
+container_auth_token() ->
+    case os:getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE") of
+        TokenFile when is_list(TokenFile), TokenFile =/= "" ->
+            read_token_file(TokenFile);
+        _ ->
+            case os:getenv("AWS_CONTAINER_AUTHORIZATION_TOKEN") of
+                Token when is_list(Token), Token =/= "" ->
+                    Token;
+                _ ->
+                    undefined
+            end
+    end.
+
+-spec read_token_file(string()) -> string() | no_return().
+%% @doc Read a bearer token from a file. Validates the file is readable and
+%%      within the size cap. Raises on failure so the credential chain can
+%%      distinguish "token configured but broken" from "no token configured".
+%%      Reads first, then checks size -- eliminates TOCTOU between stat and read.
+%% @end
+read_token_file(Path) ->
+    case file:read_file(Path) of
+        {ok, Bin} when byte_size(Bin) =< ?CONTAINER_AUTH_TOKEN_MAX_SIZE ->
+            string:trim(binary_to_list(Bin));
+        {ok, Bin} ->
+            error({container_token_file_too_large, byte_size(Bin)});
+        {error, Reason} ->
+            error({container_token_file_unreadable, Reason})
+    end.
+
+-spec fetch_container_credentials(string(), string() | undefined) ->
+    {ok, aws_credentials()} | {error, term()}.
+%% @doc Fetch temporary credentials from an ECS/EKS container credential
+%%      endpoint. The endpoint returns the same JSON shape as the IMDS
+%%      security-credentials endpoint.
+%%
+%%      Security:
+%%        - Never follows HTTP redirects (a redirect could leak the Authorization
+%%          token to an attacker-controlled host; gun does not follow by default).
+%%        - Enforces a response body size cap. The cap is checked after the body
+%%          is buffered (gun reads the full body before returning). Practical OOM
+%%          risk is bounded by the 5s response timeout and the fact that for HTTP
+%%          the endpoint MUST be loopback or ECS link-local (both trusted). For
+%%          HTTPS, the attacker must hold a valid TLS certificate for the host.
+%%        - Never logs the token or credential values.
+%% @end
+fetch_container_credentials(URL, Token) ->
+    case aws_lib_uri:parse(URL) of
+        {ok, Uri} ->
+            Host = aws_lib_uri:host(Uri),
+            Port = aws_lib_uri:port(Uri),
+            Path = aws_lib_uri:target(Uri),
+            Transport = aws_lib_uri:transport(Uri),
+            Headers = container_creds_headers(Token),
+            Opts = container_creds_open_opts(Transport, Host),
+            case aws_lib_httpc:request(Host, Port, get, Path, Headers, <<>>, Opts) of
+                {ok, {{_, 200, _}, RespHeaders, Body}} ->
+                    %% Check body size cap. Also verify Content-Length if present
+                    %% (early reject before full buffering on compliant servers).
+                    CLHeaderOk =
+                        case content_length_value(RespHeaders) of
+                            undefined -> true;
+                            CL when CL =< ?CONTAINER_CREDS_MAX_BODY -> true;
+                            _ -> false
+                        end,
+                    case CLHeaderOk andalso byte_size(Body) =< ?CONTAINER_CREDS_MAX_BODY of
+                        true ->
+                            parse_container_credentials_body(Body);
+                        false ->
+                            {error, response_body_too_large}
+                    end;
+                {ok, {{_, Status, Reason}, _RespHeaders, _Body}} ->
+                    {error, {http_error, Status, Reason}};
+                {error, Reason} ->
+                    {error, {transport_error, Reason}}
+            end;
+        {error, Reason} ->
+            {error, {malformed_url, Reason}}
+    end.
+
+-spec content_length_value([{string(), string()}]) -> non_neg_integer() | undefined.
+%% @doc Extract the Content-Length header value, if present and parseable.
+%% @end
+content_length_value([]) ->
+    undefined;
+content_length_value([{Key, Value} | Rest]) ->
+    case string:lowercase(Key) of
+        "content-length" ->
+            case string:to_integer(string:trim(Value)) of
+                {Int, ""} when Int >= 0 -> Int;
+                _ -> undefined
+            end;
+        _ ->
+            content_length_value(Rest)
+    end.
+
+-spec container_creds_headers(string() | undefined) -> headers().
+%% @doc Build request headers for the container credentials endpoint.
+%% @end
+container_creds_headers(undefined) ->
+    [];
+container_creds_headers(Token) ->
+    [{"Authorization", Token}].
+
+-spec container_creds_open_opts(tls | tcp, string()) -> map().
+%% @doc Build gun open options for the container credentials connection.
+%%      For HTTPS, configures TLS with verify_peer using OTP system CAs and
+%%      hostname verification. For plaintext, uses plain TCP.
+%% @end
+container_creds_open_opts(tls, Host) ->
+    BaseTlsOpts = [
+        {verify, verify_peer},
+        {cacerts, public_key:cacerts_get()},
+        {customize_hostname_check, [
+            {match_fun, public_key:pkix_verify_hostname_match_fun(https)}
+        ]}
+    ],
+    %% SNI must be a DNS hostname per RFC 6066; do not set it for IP literals.
+    TlsOpts =
+        case inet:parse_address(Host) of
+            {ok, _IP} -> BaseTlsOpts;
+            {error, einval} -> [{server_name_indication, Host} | BaseTlsOpts]
+        end,
+    #{
+        transport => tls,
+        protocols => [http],
+        connect_timeout => ?CONTAINER_CREDS_CONNECT_TIMEOUT,
+        timeout => ?CONTAINER_CREDS_RESPONSE_TIMEOUT,
+        tls_opts => TlsOpts
+    };
+container_creds_open_opts(tcp, _Host) ->
+    #{
+        transport => tcp,
+        protocols => [http],
+        connect_timeout => ?CONTAINER_CREDS_CONNECT_TIMEOUT,
+        timeout => ?CONTAINER_CREDS_RESPONSE_TIMEOUT
+    }.
+
+-spec parse_container_credentials_body(binary()) ->
+    {ok, aws_credentials()} | {error, term()}.
+%% @doc Parse the JSON credentials response from the container endpoint.
+%%      The response format matches IMDS security-credentials:
+%%      {"AccessKeyId", "SecretAccessKey", "Token", "Expiration"}.
+%% @end
+parse_container_credentials_body(Body) ->
+    try
+        Parsed = aws_lib_json:decode(Body),
+        AccessKey = proplists:get_value("AccessKeyId", Parsed),
+        SecretKey = proplists:get_value("SecretAccessKey", Parsed),
+        SecurityToken = proplists:get_value("Token", Parsed),
+        Expiration = proplists:get_value("Expiration", Parsed),
+        case AccessKey =:= undefined orelse SecretKey =:= undefined of
+            true ->
+                {error, missing_credential_fields};
+            false ->
+                Creds = #aws_credentials{
+                    access_key = AccessKey,
+                    secret_key = SecretKey,
+                    security_token = SecurityToken,
+                    expiration = parse_expiration(Expiration)
+                },
+                {ok, Creds}
+        end
+    catch
+        _:_Reason ->
+            %% Do not include the exception reason in the error tuple -- it may
+            %% contain fragments of the response body (credential material, P0 R6).
+            {error, json_decode_failed}
+    end.
+
+%% @doc Sanitize container credential error reasons for safe logging.
+%%      Strips inner terms that could contain response body fragments or
+%%      credential material (P0 R6). Only the error category atom is logged.
+%% @end
+sanitize_container_error({json_decode_failed, _}) -> json_decode_failed;
+sanitize_container_error({http_error, Status, _Phrase}) -> {http_error, Status};
+sanitize_container_error({transport_error, Reason}) -> {transport_error, Reason};
+sanitize_container_error(response_body_too_large) -> response_body_too_large;
+sanitize_container_error(missing_credential_fields) -> missing_credential_fields;
+sanitize_container_error({malformed_url, _}) -> malformed_url;
+sanitize_container_error(Other) when is_atom(Other) -> Other;
+sanitize_container_error(_) -> unknown_error.
+
+-spec parse_expiration(string() | undefined) -> calendar:datetime() | undefined.
+%% @doc Parse the Expiration field if present, returning undefined when absent.
+%% @end
+parse_expiration(undefined) ->
+    undefined;
+parse_expiration(Timestamp) ->
+    parse_iso8601_timestamp(Timestamp).
 
 -spec with_metadata_connection(fun((aws_lib_httpc:conn()) -> Result)) -> Result.
 %% @doc Execute a function with a shared metadata service connection
